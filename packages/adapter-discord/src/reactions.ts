@@ -254,6 +254,7 @@ export interface DiscordInboundReaction {
 	readonly emoji: DiscordReactionEmojiLike;
 	readonly message: {
 		readonly id?: string | null;
+		readonly guildId?: string | null;
 		readonly channel?: DiscordMessageOriginShape["channel"] | null;
 		readonly guild?: { readonly name?: string } | null;
 	};
@@ -309,7 +310,11 @@ export function describeInboundReaction(
 	if (!targetMessageId || !channel || !user?.id) return undefined;
 	const emoji = describeReactionEmoji(reaction.emoji);
 	if (!emoji) return undefined;
-	const origin = discordMessageOrigin({ author: { id: user.id }, channel });
+	const origin = discordMessageOrigin({
+		author: { id: user.id },
+		...(reaction.message.guildId == null ? {} : { guildId: reaction.message.guildId }),
+		channel,
+	});
 	const authorLike = {
 		id: user.id,
 		...(user.username ? { username: user.username } : {}),

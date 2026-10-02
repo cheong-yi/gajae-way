@@ -13,6 +13,8 @@ import {
 
 const bot = { id: "bot-1" };
 const silent = { error: () => {} };
+const GUILD_ID = "1510336487894286436";
+const CATEGORY_ID = "1520004470489223219";
 
 test("reacts with the allowlist unicode and never posts a message", async () => {
 	const requests: Request[] = [];
@@ -310,6 +312,50 @@ test("inbound reactions ignore our own bot and describe human adds and removes i
 	expect(describeInboundReaction(inboundReaction("👍"), { id: "bot-1" }, bot, "remove")).toBeUndefined();
 });
 
+test("reaction origins use the actual guild ID for channels and threads, never the category", () => {
+	const human = { id: "user-1" };
+	const channel = describeInboundReaction(
+		{
+			emoji: { name: "👍" },
+			message: {
+				id: "target-channel",
+				channel: { id: "channel-1", name: "general", guildId: GUILD_ID, parentId: CATEGORY_ID },
+			},
+		},
+		human,
+		bot,
+		"add",
+	);
+	expect(channel?.origin).toEqual({
+		platform: "discord",
+		kind: "channel",
+		conversationId: "channel-1",
+		boundaryId: GUILD_ID,
+	});
+	expect(channel?.origin.boundaryId).not.toBe(CATEGORY_ID);
+
+	const thread = describeInboundReaction(
+		{
+			emoji: { name: "👀" },
+			message: {
+				id: "target-thread",
+				guildId: GUILD_ID,
+				channel: { id: "thread-1", name: "thread", type: 11, parentId: "channel-1" },
+			},
+		},
+		human,
+		bot,
+		"add",
+	);
+	expect(thread?.origin).toEqual({
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+		boundaryId: GUILD_ID,
+	});
+});
+
 test("inbound reactions report a custom emoji as custom:name and drop unplaceable ones", () => {
 	const human = { id: "user-1", username: "eunji" };
 	const custom = describeInboundReaction(inboundReaction("lobster", "999"), human, bot, "add");
@@ -327,12 +373,16 @@ test("inbound reactions report a custom emoji as custom:name and drop unplaceabl
 
 test("a DM reaction is not a group engagement and keeps the reactor as peer", () => {
 	const described = describeInboundReaction(
-		{ emoji: { name: "👀" }, message: { id: "target-1", channel: { id: "dm-1", isDMBased: () => true } } },
+		{
+			emoji: { name: "👀" },
+			message: { id: "target-1", guildId: GUILD_ID, channel: { id: "dm-1", isDMBased: () => true } },
+		},
 		{ id: "user-1" },
 		bot,
 		"add",
 	);
 	expect(described?.origin).toEqual({ platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "user-1" });
+	expect(described?.origin).not.toHaveProperty("boundaryId");
 	expect(described?.engagement).toEqual({ mentioned: false, group: false, authorId: "user-1" });
 });
 

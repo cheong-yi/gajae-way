@@ -10,6 +10,8 @@ import { describeMessageEdit, ReconnectingGateway } from "../src/main";
 
 const SELF = { id: "self-bot" };
 const OPEN = { "chan-1": { engagement: "open" as const } };
+const GUILD_ID = "1510336487894286436";
+const CATEGORY_ID = "1520004470489223219";
 
 const edited = (over: Record<string, unknown> = {}) =>
 	({
@@ -30,6 +32,41 @@ test("an edited human message in an open channel becomes a chat.edit with the ne
 		engagement: { mentioned: false, group: true, authorId: "human-1", authorName: "human", authorHandle: "human" },
 		receivedAt: new Date(1_756_900_000_000).toISOString(),
 	});
+});
+
+test("edits carry the real guild boundary, never the channel category, and DMs omit it", () => {
+	const channelEdit = describeMessageEdit(
+		edited({ channel: { id: "chan-1", type: 0, guildId: GUILD_ID, parentId: CATEGORY_ID } }),
+		SELF,
+		OPEN,
+	);
+	expect(channelEdit?.origin).toEqual({
+		platform: "discord",
+		kind: "channel",
+		conversationId: "chan-1",
+		boundaryId: GUILD_ID,
+	});
+	expect(channelEdit?.origin.boundaryId).not.toBe(CATEGORY_ID);
+
+	const threadEdit = describeMessageEdit(
+		edited({
+			guildId: GUILD_ID,
+			channel: { id: "thread-1", type: 11, parentId: "chan-1" },
+		}),
+		SELF,
+		{ "thread-1": { engagement: "open" as const } },
+	);
+	expect(threadEdit?.origin).toEqual({
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "chan-1",
+		boundaryId: GUILD_ID,
+	});
+
+	const dmEdit = describeMessageEdit(edited({ channel: { id: "dm-1", type: 1, isDMBased: () => true } }), SELF, OPEN);
+	expect(dmEdit?.origin).toEqual({ platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "human-1" });
+	expect(dmEdit?.origin).not.toHaveProperty("boundaryId");
 });
 
 test("our own edited messages and edits to an empty body are not forwarded", () => {

@@ -371,3 +371,56 @@ test("the SIGHUP handler does not outlive the daemon it belongs to", async () =>
 	server = undefined;
 	expect(process.listenerCount("SIGHUP")).toBe(before);
 });
+
+test("boundary reload changes live admission and rejects malformed replacement atomically", async () => {
+	const { client, home } = await daemon({ mentionAllowlist: ["owner"] });
+	const request = async (id: string, verb: string, params?: unknown) => {
+		client.send({ v: "0.1", type: "request", id, verb, params });
+		for (let attempt = 0; attempt < 600; attempt++) {
+			const frame = client.frames.find((frame) => frame.type === "response" && frame.id === id);
+			if (frame) return frame.result;
+			await Bun.sleep(5);
+		}
+		throw new Error(`missing response ${id}`);
+	};
+	const send = (id: string) =>
+		request(id, "chat.send", {
+			origin: {
+				platform: "discord",
+				kind: "channel",
+				conversationId: "uncategorized",
+				boundaryId: "1510336487894286436",
+			},
+			text: "hello",
+			messageId: id,
+			engagement: { mentioned: true, group: true, authorId: "newcomer" },
+		});
+	try {
+		expect((await send("boundary-before"))?.engaged).toBe(false);
+		await writeConfig(home, {
+			schemaVersion: 1,
+			mentionAllowlist: ["owner"],
+			boundaries: { "discord:1510336487894286436": { engagement: "mention-open", audience: "human-only" } },
+		});
+		expect(await request("boundary-reload", "gateway.reloadConfig")).toMatchObject({
+			ok: true,
+			changed: ["boundaries"],
+			restartRequired: [],
+		});
+		expect((await send("boundary-after"))?.engaged).toBe(true);
+		await writeConfig(home, {
+			schemaVersion: 1,
+			boundaries: { "1510336487894286436": { engagement: "open" } },
+		});
+		expect((await request("boundary-invalid", "gateway.reloadConfig"))?.ok).toBe(false);
+		expect((await send("boundary-retained"))?.engaged).toBe(true);
+		await writeConfig(home, { schemaVersion: 1, mentionAllowlist: ["owner"] });
+		expect(await request("boundary-remove", "gateway.reloadConfig")).toMatchObject({
+			ok: true,
+			changed: ["boundaries"],
+		});
+		expect((await send("boundary-removed"))?.engaged).toBe(false);
+	} finally {
+		client.close();
+	}
+});

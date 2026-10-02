@@ -4,16 +4,13 @@ import { ConfigError, gatewayHome, parseConfigFile } from "./config";
 /**
  * Offline config validation (`gajaeway-gateway config check [path]`).
  *
- * Channel policy is read only at boot, so an invalid value never degrades a
- * running gateway — it stops the *next* one from starting. Observed twice in one
- * day on the resident host: a hand-edited `config.json` carried
- * an invalid engagement spelling, `parseChannels` threw `config_invalid`, and
- * launchd respawned a process that exited 1 while the Discord adapter stayed up.
- * Messages kept arriving with nothing behind them, so the bot looked slow rather
- * than dead, and it went unnoticed for hours.
+ * Channel and boundary policies are parsed at boot and on reload. An invalid
+ * reload keeps the current live config, but an invalid file prevents the next
+ * gateway boot; the Discord adapter can remain up without its gateway behind
+ * it. Offline validation catches that case before a restart.
  *
- * This check needs no socket on purpose: by the time you want it, the gateway is
- * down. It is a pre-restart gate, not a post-mortem.
+ * This check needs no socket, so it works before a restart or while the gateway
+ * is down. It is a pre-restart gate, not a post-mortem.
  */
 export interface ConfigCheckOk {
 	readonly ok: true;
@@ -21,6 +18,9 @@ export interface ConfigCheckOk {
 	readonly channels: readonly string[];
 	readonly openChannels: readonly string[];
 	readonly mentionOpenChannels: readonly string[];
+	readonly boundaries: readonly string[];
+	readonly openBoundaries: readonly string[];
+	readonly mentionOpenBoundaries: readonly string[];
 }
 
 export interface ConfigCheckFailure {
@@ -54,12 +54,16 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 	try {
 		const config = parseConfigFile(parsed);
 		const channels = Object.keys(config.channels ?? {});
+		const boundaries = Object.keys(config.boundaries ?? {});
 		return {
 			ok: true,
 			path,
 			channels,
 			openChannels: channels.filter((id) => config.channels?.[id]?.engagement === "open"),
 			mentionOpenChannels: channels.filter((id) => config.channels?.[id]?.engagement === "mention-open"),
+			boundaries,
+			openBoundaries: boundaries.filter((key) => config.boundaries?.[key]?.engagement === "open"),
+			mentionOpenBoundaries: boundaries.filter((key) => config.boundaries?.[key]?.engagement === "mention-open"),
 		};
 	} catch (error) {
 		return {
@@ -74,10 +78,13 @@ export async function checkConfigFile(path: string): Promise<ConfigCheckResult> 
 export function renderConfigCheck(result: ConfigCheckResult): string[] {
 	if (!result.ok) return [`FAIL ${result.path}`, `  ${result.code}: ${result.message}`];
 	const closed = result.channels.length - result.openChannels.length - result.mentionOpenChannels.length;
+	const closedBoundaries =
+		result.boundaries.length - result.openBoundaries.length - result.mentionOpenBoundaries.length;
 	return [
 		`OK ${result.path}`,
 		`  channels: ${result.channels.length} (open ${result.openChannels.length}, mention-open ${result.mentionOpenChannels.length}, closed/default ${closed})`,
-		"  channel policy applies at gateway start only: restart, then confirm the new pid started after this file's mtime.",
+		`  boundaries: ${result.boundaries.length} (open ${result.openBoundaries.length}, mention-open ${result.mentionOpenBoundaries.length}, closed/default ${closedBoundaries})`,
+		"  channel and boundary policy changes apply on config reload or gateway restart.",
 	];
 }
 

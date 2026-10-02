@@ -3,9 +3,11 @@ import type { OriginRef } from "@gajae-gateway/protocol";
 /** The Discord message fields needed for origin normalization; intentionally discord.js-free. */
 export interface DiscordMessageOriginShape {
 	readonly author: { readonly id: string };
+	readonly guildId?: string | null;
 	readonly channel: {
 		readonly id: string;
 		readonly parentId?: string | null;
+		readonly guildId?: string | null;
 		isDMBased?: () => boolean;
 		isThread?: () => boolean;
 		readonly type?: number | string;
@@ -16,6 +18,8 @@ export interface DiscordMessageOriginShape {
 /** Normalize a Discord message into the canonical public OriginRef. */
 export function discordMessageOrigin(message: DiscordMessageOriginShape): OriginRef {
 	const channel = message.channel;
+	const guildId = channel.guildId ?? message.guildId;
+	const boundary = guildId == null ? {} : { boundaryId: guildId };
 	if (channel.isDMBased?.() || channel.type === 1 || channel.type === "DM") {
 		return {
 			platform: "discord",
@@ -32,7 +36,13 @@ export function discordMessageOrigin(message: DiscordMessageOriginShape): Origin
 		channel.type === "THREAD"
 	) {
 		if (!channel.parentId) throw new Error(`Discord thread ${channel.id} has no parent channel id`);
-		return { platform: "discord", kind: "thread", conversationId: channel.id, parentId: channel.parentId };
+		return {
+			platform: "discord",
+			kind: "thread",
+			conversationId: channel.id,
+			parentId: channel.parentId,
+			...boundary,
+		};
 	}
-	return { platform: "discord", kind: "channel", conversationId: channel.id };
+	return { platform: "discord", kind: "channel", conversationId: channel.id, ...boundary };
 }

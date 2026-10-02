@@ -38,6 +38,8 @@ export interface OriginRef {
 	readonly conversationId: string;
 	/** Present for thread/topic origins: the parent conversation id. */
 	readonly parentId?: string;
+	/** Present for channel/thread/topic origins: the provider-neutral policy boundary id. */
+	readonly boundaryId?: string;
 	/** Present for DM origins: the platform-scoped peer id. */
 	readonly peerId?: string;
 }
@@ -75,6 +77,15 @@ export function validateOriginRef(ref: OriginRef): OriginRef {
 		requireSegment(ref.parentId, "parentId");
 	} else if (ref.parentId !== undefined) {
 		throw new OriginRefError(`${ref.kind} origin must not carry parentId`);
+	}
+	if (ref.boundaryId !== undefined) {
+		if (ref.kind !== "channel" && ref.kind !== "thread" && ref.kind !== "topic") {
+			throw new OriginRefError(`${ref.kind} origin must not carry boundaryId`);
+		}
+		if (typeof ref.boundaryId !== "string") {
+			throw new OriginRefError("invalid origin segment for boundaryId");
+		}
+		requireSegment(ref.boundaryId, "boundaryId");
 	}
 	if (ref.kind === "dm") {
 		if (!ref.peerId) throw new OriginRefError("dm origin requires peerId");

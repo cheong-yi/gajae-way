@@ -2,7 +2,9 @@ import { lstat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import {
+	CHAT_PLATFORMS,
 	type ChannelEngagementPolicy,
+	type ChatPlatform,
 	describeChatPlatforms,
 	ENGAGEMENT_AUDIENCES,
 	ENGAGEMENT_MODES,
@@ -69,6 +71,8 @@ export interface GatewayConfigFile {
 	readonly serviceTier?: GjcServiceTier;
 	readonly credentials?: Readonly<Record<string, CredentialFileReference>>;
 	readonly channels?: Readonly<Record<string, ChannelPolicy>>;
+	/** Policies inherited by chat origins carrying the matching platform boundary ID. */
+	readonly boundaries?: Readonly<Record<string, ChannelPolicy>>;
 	/** Tail liveness alarm threshold in milliseconds. It never kills a running turn. */
 	readonly stallTimeoutMs?: number;
 	/** Author ids allowed to trigger mention-gated group turns; absent/empty = anyone. */
@@ -296,47 +300,79 @@ function parseCredentials(value: unknown): Readonly<Record<string, CredentialFil
 	return credentials;
 }
 
-function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> | undefined {
+function parseChannelPolicies(
+	value: unknown,
+	field: "channels" | "boundaries",
+	validateKey?: (key: string) => void,
+): Readonly<Record<string, ChannelPolicy>> | undefined {
 	if (value === undefined) return undefined;
-	const input = requireObject(value, "channels");
-	const channels: Record<string, ChannelPolicy> = {};
-	for (const [conversationId, channel] of Object.entries(input)) {
-		const item = requireObject(channel, `channels.${conversationId}`);
+	const input = requireObject(value, field);
+	const policies: Record<string, ChannelPolicy> = {};
+	for (const [key, channel] of Object.entries(input)) {
+		validateKey?.(key);
+		const item = requireObject(channel, `${field}.${key}`);
 		if (item.engagement !== undefined && !ENGAGEMENT_GATES.includes(item.engagement as EngagementGate))
 			throw new ConfigError(
 				"config_invalid",
-				`channels.${conversationId}.engagement must be one of ${ENGAGEMENT_GATES.join(", ")}`,
+				`${field}.${key}.engagement must be one of ${ENGAGEMENT_GATES.join(", ")}`,
 			);
 		if (item.audience !== undefined && !ENGAGEMENT_AUDIENCES.includes(item.audience as EngagementAudience))
 			throw new ConfigError(
 				"config_invalid",
-				`channels.${conversationId}.audience must be one of ${ENGAGEMENT_AUDIENCES.join(", ")}`,
+				`${field}.${key}.audience must be one of ${ENGAGEMENT_AUDIENCES.join(", ")}`,
 			);
 		for (const removed of ["debounceMs", "settleWindowMs"] as const)
 			if (item[removed] !== undefined)
 				throw new ConfigError(
 					"config_invalid",
-					`channels.${conversationId}.${removed} was removed: every message is steered or sent immediately; delete it from the configuration`,
+					`${field}.${key}.${removed} was removed: every message is steered or sent immediately; delete it from the configuration`,
 				);
 		const known = ["engagement", "audience", "botAudienceMaxConsecutiveTurns", "botAudienceMaxTurnsPerWindow"] as const;
 		if (Object.keys(item).some((key) => !known.includes(key as (typeof known)[number])))
-			throw new ConfigError("config_invalid", `channels.${conversationId} contains an unknown field`);
+			throw new ConfigError("config_invalid", `${field}.${key} contains an unknown field`);
 		const maxConsecutiveTurns = parsePositiveTurnCount(
 			item.botAudienceMaxConsecutiveTurns,
-			`channels.${conversationId}.botAudienceMaxConsecutiveTurns`,
+			`${field}.${key}.botAudienceMaxConsecutiveTurns`,
 		);
 		const maxTurnsPerWindow = parsePositiveTurnCount(
 			item.botAudienceMaxTurnsPerWindow,
-			`channels.${conversationId}.botAudienceMaxTurnsPerWindow`,
+			`${field}.${key}.botAudienceMaxTurnsPerWindow`,
 		);
-		channels[conversationId] = {
+		policies[key] = {
 			...(item.engagement === undefined ? {} : { engagement: item.engagement as EngagementGate }),
 			...(item.audience === undefined ? {} : { audience: item.audience as EngagementAudience }),
 			...(maxConsecutiveTurns === undefined ? {} : { botAudienceMaxConsecutiveTurns: maxConsecutiveTurns }),
 			...(maxTurnsPerWindow === undefined ? {} : { botAudienceMaxTurnsPerWindow: maxTurnsPerWindow }),
 		};
 	}
-	return channels;
+	return policies;
+}
+
+function parseChannels(value: unknown): Readonly<Record<string, ChannelPolicy>> | undefined {
+	return parseChannelPolicies(value, "channels");
+}
+
+function validateBoundaryKey(key: string): void {
+	const separator = key.indexOf(":");
+	const platform = separator < 0 ? "" : key.slice(0, separator);
+	const boundaryId = separator < 0 ? "" : key.slice(separator + 1);
+	if (!CHAT_PLATFORMS.includes(platform as ChatPlatform))
+		throw new ConfigError(
+			"config_invalid",
+			`boundaries.${key} must start with a chat platform (${CHAT_PLATFORMS.join(", ")}) followed by ':'`,
+		);
+	try {
+		validateOriginRef({ platform: platform as ChatPlatform, kind: "channel", conversationId: boundaryId });
+	} catch (error) {
+		throw new ConfigError(
+			"config_invalid",
+			`boundaries.${key} has an invalid boundary ID: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+function parseBoundaries(value: unknown): Readonly<Record<string, ChannelPolicy>> | undefined {
+	return parseChannelPolicies(value, "boundaries", validateBoundaryKey);
 }
 
 /** Turn budgets are whole positive counts; 0 would mean "never admit", which `audience` already expresses. */
@@ -570,6 +606,7 @@ export function parseConfigFile(value: unknown): GatewayConfigFile {
 		...(optionalString(input.dbPath, "dbPath") ? { dbPath: optionalString(input.dbPath, "dbPath") } : {}),
 		...(parseCredentials(input.credentials) ? { credentials: parseCredentials(input.credentials) } : {}),
 		...(parseChannels(input.channels) ? { channels: parseChannels(input.channels) } : {}),
+		...(parseBoundaries(input.boundaries) ? { boundaries: parseBoundaries(input.boundaries) } : {}),
 		...(input.webhook === undefined ? {} : { webhook: parseWebhook(input.webhook) }),
 		...(input.watcherRoots === undefined ? {} : { watcherRoots: parseStringArray(input.watcherRoots, "watcherRoots") }),
 		...(input.scriptRoot === undefined ? {} : { scriptRoot: optionalString(input.scriptRoot, "scriptRoot") }),
@@ -691,13 +728,14 @@ export async function reloadConfig(current: GatewayConfig, overrides: ConfigOver
 
 /**
  * Fields genuinely re-read at runtime: `mentionAllowlist` (server.ts chat dispatch +
- * engagement/policy.ts), channels (engagement gates), `botAudience` (bot budgets,
+ * engagement/policy.ts), channels and boundaries (engagement gates), `botAudience` (bot budgets,
  * resolved per inbound message) and `stallTimeoutMs` (tail liveness alarms). Each
  * applies to the next actor event.
  */
 export const RELOADABLE_FIELDS = [
 	"mentionAllowlist",
 	"channels",
+	"boundaries",
 	"stallTimeoutMs",
 	"dmPolicy",
 	"botAudience",

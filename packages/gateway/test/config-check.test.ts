@@ -58,6 +58,55 @@ test("every defined engagement gate passes the offline preflight", async () => {
 	}
 });
 
+test("qualified boundaries are validated and included in offline policy reporting", async () => {
+	const path = await configFile(
+		JSON.stringify({
+			schemaVersion: CONFIG_SCHEMA_VERSION,
+			channels: { legacyChannelId: { engagement: "open" } },
+			boundaries: {
+				"discord:1510336487894286436": { engagement: "mention-open" },
+				"telegram:group_1": { engagement: "closed", audience: "all" },
+			},
+		}),
+	);
+	const result = await checkConfigFile(path);
+	expect(result.ok).toBe(true);
+	if (!result.ok) return;
+	expect(result.channels).toEqual(["legacyChannelId"]);
+	expect(result.boundaries).toEqual(["discord:1510336487894286436", "telegram:group_1"]);
+	expect(result.openBoundaries).toEqual([]);
+	expect(result.mentionOpenBoundaries).toEqual(["discord:1510336487894286436"]);
+	expect(renderConfigCheck(result)).toContain("  boundaries: 2 (open 0, mention-open 1, closed/default 1)");
+
+	const legacy = parseConfigFile(JSON.parse(VALID));
+	expect(legacy.schemaVersion).toBe(CONFIG_SCHEMA_VERSION);
+	expect(legacy.channels).toEqual({
+		"1469222606497648690": { engagement: "open" },
+		"1508664765415690340": {},
+	});
+	expect(legacy).not.toHaveProperty("boundaries");
+});
+
+test("offline config check rejects unqualified, invalid-platform, and malformed boundary policies", async () => {
+	for (const boundaries of [
+		{ "1510336487894286436": { engagement: "open" } },
+		{ "loopback:1510336487894286436": { engagement: "open" } },
+		{ "discord:": { engagement: "open" } },
+		{ "discord:bad/id": { engagement: "open" } },
+		{ [`discord:${"x".repeat(257)}`]: { engagement: "open" } },
+		{ "discord:1510336487894286436": { engagement: "mention-only" } },
+		{ "discord:1510336487894286436": { audience: "sometimes" } },
+		{ "discord:1510336487894286436": { unknown: true } },
+		{ "discord:1510336487894286436": { botAudienceMaxTurnsPerWindow: 0 } },
+	]) {
+		const result = await checkConfigFile(
+			await configFile(JSON.stringify({ schemaVersion: CONFIG_SCHEMA_VERSION, boundaries })),
+		);
+		expect(result.ok, JSON.stringify(boundaries)).toBe(false);
+		if (!result.ok) expect(result.code).toBe("config_invalid");
+	}
+});
+
 test("a removed per-channel settle window is rejected with a migration hint", async () => {
 	const path = await configFile(
 		JSON.stringify({ schemaVersion: 1, channels: { "1": { engagement: "open", settleWindowMs: 500 } } }),

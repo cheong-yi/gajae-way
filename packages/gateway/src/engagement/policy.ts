@@ -1,5 +1,5 @@
 import { type EngagementContext, evaluateChannelEngagement, type OriginRef, originKey } from "@gajae-gateway/protocol";
-import type { GatewayConfig } from "../config";
+import type { ChannelPolicy, GatewayConfig } from "../config";
 
 /** Rolling window the runaway rate limiter measures bot admissions over. */
 export const BOT_AUDIENCE_RATE_WINDOW_MS = 60_000;
@@ -221,7 +221,7 @@ export interface EngagementDecision {
 }
 
 export function decideEngagement(
-	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId">,
+	origin: Pick<OriginRef, "platform" | "kind" | "conversationId" | "parentId" | "boundaryId">,
 	engagement: EngagementContext | undefined,
 	config: GatewayConfig,
 	/**
@@ -290,18 +290,15 @@ export function threadFollowUpEngaged(
 }
 
 /**
- * Per-origin bot budget: channel entry first, then the global default, then the
- * built-in. Only the rate limit has a built-in value; the consecutive-turn cap
- * is unlimited unless configured.
+ * Per-origin bot budget: resolved channel/parent/boundary policy first, then the
+ * global default, then the built-in. Only the rate limit has a built-in value;
+ * the consecutive-turn cap is unlimited unless configured.
  */
-export function resolveBotAudienceLimits(
-	origin: Pick<OriginRef, "platform" | "conversationId" | "parentId">,
-	config: GatewayConfig,
-): BotAudienceLimits {
-	const channel = resolveChannelPolicy(origin, config);
-	const maxConsecutiveTurns = channel?.botAudienceMaxConsecutiveTurns ?? config.botAudience?.maxConsecutiveTurns;
+export function resolveBotAudienceLimits(origin: ChannelPolicyOrigin, config: GatewayConfig): BotAudienceLimits {
+	const policy = resolveChannelPolicy(origin, config);
+	const maxConsecutiveTurns = policy?.botAudienceMaxConsecutiveTurns ?? config.botAudience?.maxConsecutiveTurns;
 	const maxTurnsPerWindow =
-		channel?.botAudienceMaxTurnsPerWindow ??
+		policy?.botAudienceMaxTurnsPerWindow ??
 		config.botAudience?.maxTurnsPerWindow ??
 		DEFAULT_BOT_AUDIENCE_TURNS_PER_WINDOW;
 	return {
@@ -310,20 +307,42 @@ export function resolveBotAudienceLimits(
 	};
 }
 
-export function resolveChannelPolicy(
-	origin: Pick<OriginRef, "platform" | "conversationId" | "parentId">,
-	config: GatewayConfig,
-) {
-	const ids = [origin.conversationId, origin.parentId].filter((id): id is string => id !== undefined);
-	for (const id of ids) {
-		const namespaced = config.channels?.[`${origin.platform}:${id}`];
-		if (namespaced) return namespaced;
+export function resolveChannelPolicy(origin: ChannelPolicyOrigin, config: GatewayConfig): ChannelPolicy | undefined {
+	const exact = channelPolicyFor(config.channels, `${origin.platform}:${origin.conversationId}`);
+	if (exact) return exact;
+	if (origin.platform === "discord") {
+		const legacyExact = channelPolicyFor(config.channels, origin.conversationId);
+		if (legacyExact) return legacyExact;
+	}
+
+	// Preserve existing thread/topic parent inheritance, including narrowed
+	// budget callers that carry a parent but omit kind. DMs never inherit.
+	if ((origin.kind === "thread" || origin.kind === "topic" || origin.kind === undefined) && origin.parentId) {
+		const parent = channelPolicyFor(config.channels, `${origin.platform}:${origin.parentId}`);
+		if (parent) return parent;
 		if (origin.platform === "discord") {
-			const legacy = config.channels?.[id];
-			if (legacy) return legacy;
+			const legacyParent = channelPolicyFor(config.channels, origin.parentId);
+			if (legacyParent) return legacyParent;
 		}
 	}
+
+	if (
+		(origin.kind === "channel" || origin.kind === "thread" || origin.kind === "topic") &&
+		origin.boundaryId !== undefined
+	) {
+		return channelPolicyFor(config.boundaries, `${origin.platform}:${origin.boundaryId}`);
+	}
 	return undefined;
+}
+
+type ChannelPolicyOrigin = Pick<OriginRef, "platform" | "conversationId" | "parentId"> &
+	Partial<Pick<OriginRef, "kind" | "boundaryId">>;
+
+function channelPolicyFor(
+	policies: Readonly<Record<string, ChannelPolicy>> | undefined,
+	key: string,
+): ChannelPolicy | undefined {
+	return policies && Object.hasOwn(policies, key) ? policies[key] : undefined;
 }
 
 function closedAuthorAuthorized(authorId: string, config: GatewayConfig): boolean {

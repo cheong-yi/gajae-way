@@ -104,8 +104,45 @@ describe("origin normalization", () => {
 			kind: "thread",
 			conversationId: "111",
 			parentId: "222",
+			boundaryId: "guild-333",
 		});
 		expect(key).toBe("discord/thread/111/parent=222");
+		expect(parseOriginKey(key)).toEqual({
+			platform: "discord",
+			kind: "thread",
+			conversationId: "111",
+			parentId: "222",
+		});
+	});
+
+	test("retains valid policy boundaries only on group origins without changing identity", () => {
+		for (const ref of [
+			{ platform: "discord", kind: "channel", conversationId: "c1", boundaryId: "guild-1" },
+			{ platform: "discord", kind: "thread", conversationId: "t1", parentId: "c1", boundaryId: "guild-1" },
+			{ platform: "telegram", kind: "topic", conversationId: "t1", parentId: "c1", boundaryId: "chat-1" },
+		] as const) {
+			const validated = validateOriginRef(ref);
+			expect(validated).toBe(ref);
+			expect(validated.boundaryId).toBe(ref.boundaryId);
+			expect(originKey(ref)).toBe(originKey({ ...ref, boundaryId: undefined }));
+		}
+	});
+
+	test("rejects invalid and non-group boundary metadata", () => {
+		const channel = { platform: "discord", kind: "channel", conversationId: "c1" } as const;
+		for (const boundaryId of ["", "bad/id", "x".repeat(257)]) {
+			expect(() => validateOriginRef({ ...channel, boundaryId })).toThrow();
+		}
+		expect(() =>
+			validateOriginRef({
+				platform: "discord",
+				kind: "dm",
+				conversationId: "d1",
+				peerId: "u1",
+				boundaryId: "g1",
+			} as never),
+		).toThrow(/boundaryId/);
+		expect(() => validateOriginRef({ ...channel, boundaryId: null } as never)).toThrow(/boundaryId/);
 	});
 
 	test("dm requires peerId; channel forbids it", () => {

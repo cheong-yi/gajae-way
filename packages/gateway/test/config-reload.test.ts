@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ConfigError, loadConfig, parseConfigFile, reloadConfig } from "../src/config";
+import { ConfigError, loadConfig, parseConfigFile, RELOADABLE_FIELDS, reloadConfig } from "../src/config";
 
 const homes: string[] = [];
 afterEach(async () => {
@@ -218,4 +218,32 @@ test("interim speech config parses non-negative integers and requires restart", 
 	expect(() => parseConfigFile({ schemaVersion: 1, interimSpeech: { maxPerTurn: 2, unknownField: true } })).toThrow(
 		"interimSpeech contains an unknown field",
 	);
+});
+
+test("qualified boundaries are optional, reload live, and leave legacy channel config intact", async () => {
+	const path = await home();
+	const channels = { legacyChannelId: { engagement: "open" } } as const;
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, channels }));
+	const current = await loadConfig({ home: path });
+	expect(current.schemaVersion).toBe(1);
+	expect(current.channels).toEqual(channels);
+	expect(current).not.toHaveProperty("boundaries");
+	expect(RELOADABLE_FIELDS).toContain("boundaries");
+
+	const boundaries = { "discord:1510336487894286436": { engagement: "mention-open", audience: "human-only" } } as const;
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, channels, boundaries }));
+	const added = await reloadConfig(current);
+	expect(added.ok).toBe(true);
+	if (!added.ok) return;
+	expect(added.changed).toEqual(["boundaries"]);
+	expect(added.restartRequired).toEqual([]);
+	expect(added.config.channels).toEqual(channels);
+	expect(added.config.boundaries).toEqual(boundaries);
+
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, channels }));
+	const removed = await reloadConfig(added.config);
+	expect(removed.ok).toBe(true);
+	if (!removed.ok) return;
+	expect(removed.changed).toEqual(["boundaries"]);
+	expect(removed.config).not.toHaveProperty("boundaries");
 });
