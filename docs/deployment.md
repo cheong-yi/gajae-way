@@ -82,6 +82,7 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
     "discord-channel-id": { "engagement": "open", "audience": "human-only" },
     "slack:C0123456789": { "engagement": "mention-open" }
   },
+  "boundaries": {"discord:1510336487894286436": {"engagement":"mention-open","audience":"human-only"}},
   "webhook": { "bind": "127.0.0.1", "port": 8080, "exposeNonLoopback": false },
   "watcherRoots": ["/Users/me/automations"],
   "scriptRoot": "/Users/me/automations",
@@ -90,7 +91,7 @@ Use `config.json` schema version 1. Every configured secret is a credential-file
 }
 ```
 
-`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, webhook, watcher roots, script root, `monitorCatchUp`, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
+`socketPath`, `dbPath`, `logVerbosity`, credentials, channels, boundaries, webhook, watcher roots, script root, `monitorCatchUp`, and `stallTimeoutMs` are optional. Socket and database paths default inside the home directory, `stallTimeoutMs` defaults to 120000 ms, and log verbosity defaults to `info`. `interimSpeech` is optional and restart-required. Mid-work assistant messages that are pure procedural narration ("let me check…", "채널 더 볼게요") or a near-repeat of the previous one are held back and logged as `gateway mid-work speech suppressed (<turn>, procedural|duplicate)`; everything else ships. `interimSpeech.maxPerTurn` caps delivered mid-work messages per turn (`0` delivers none) and `interimSpeech.minGapMs` spaces them; both are unlimited when unset. `turnTimeoutMs` is rejected because persistent-session liveness is alert-only; `settleWindowMs`, `channels.*.settleWindowMs` and `maxInboundAgeMs` are rejected because every message is steered or sent immediately and nothing expires while queued.
 
 `monitorCatchUp` bounds cron replay after downtime: `maxSlots` is the newest due slots to admit (1–1000, default 24), and `maxAgeMs` excludes slots older than the lookback (60000–604800000 ms, default 86400000 / 24 hours). Refused slots advance the durable monitor cursor, are counted and logged, and appear in `gajaeway monitors inspect <id>` as `catchUp`; the setting is restart-required.
 
@@ -146,7 +147,7 @@ A running gateway re-reads `config.json` on `SIGHUP` (`kill -HUP <pid>`) or on t
 
 The reload is fail-safe and reports exactly what it did:
 
-- `changed` — fields applied live: `mentionAllowlist`, `channels`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]` replies). Verify the next event through the path consuming the changed policy.
+- `changed` — fields applied live: `mentionAllowlist`, `channels`, `boundaries`, `stallTimeoutMs`, `dmPolicy`, `botAudience`, and `handoffTargets` (alias -> chat `OriginRef` for `[HANDOFF:<alias>]` replies). Verify the next event through the path consuming the changed policy.
 - `restartRequired` — fields bound to startup resources: `socketPath`, `dbPath`, `model`, `serviceTier`, `credentials`, `webhook`, `watcherRoots`, `scriptRoot`, `runtime`, `ownerTarget`, `monitorContextFailureRollThreshold`, `monitorCatchUp`, `work`, and `interimSpeech`. They are reported and deliberately NOT applied; restart to pick them up.
 - `ignored` — fields you edited that no code reads at all. `logVerbosity` is currently parsed but unconsumed, so editing it has no effect and no restart would give it one.
 - On a parse or validation error, or when `config.json` is missing or unreadable, the reload fails, keeps the previous configuration untouched, and returns a diagnostic. A missing file never publishes defaults over live policy, because that would drop the mention allowlist and open a mention-gated room.
@@ -163,7 +164,32 @@ The Discord adapter has a separate `$GAJAEWAY_HOME/adapter-discord.json` because
 }
 ```
 
-`engagement` selects how messages become turns: `open` admits them without addressing, `mention-open` requires a real mention or native reply to this bot, and `closed` requires both addressing and owner/allowlist authorization. `audience` independently restricts authors to `all`, `human-only`, or `bot-only`; `closed` ignores it. Omitting `audience` keeps the safe `human-only` default (humans follow the mode; bots stay on the closed gate).
+`engagement` selects how messages become turns: `open` admits them without addressing, `mention-open` requires a real mention or native reply to this bot, and `closed` requires both addressing and owner/allowlist authorization. For `open` and `mention-open`, an explicit `audience: "human-only"` excludes bots; an omitted audience preserves legacy behavior, where humans follow the mode and bots use the closed, addressed-and-authorized gate. Omission is not the same as explicit `human-only`. `closed` always ignores audience and applies its addressed-and-authorized gate to either author type.
+
+### Discord guild policy boundary
+
+Policy lookup uses own entries in this order: namespaced exact channel/thread/topic, Discord legacy exact, eligible namespaced parent, Discord legacy parent, then namespaced boundary. DMs inherit neither parent nor boundary policy.
+
+Discord thread replies quote the triggering message by default on the first reply part only; `[REPLY:<messageId>]` remains an explicit override. Discord reply targets must be canonical positive decimal snowflakes within the unsigned 64-bit range; malformed targets are omitted, not sent to Discord.
+
+For both `chat.send` and `chat.edit`, native presence requires the gateway's engaged acknowledgement and then a thread, a non-group conversation, or a mention. This does not grant engagement authorization. The adapter retains upstream `statusReactions` modes: `off`, `static`, and `gradient`. With the setting omitted, upstream defaults suppress group reactions even when thread typing is eligible; explicit `"statusReactions": "gradient"` in `adapter-discord.json` is needed for the earlier group/thread reaction gradient. That is a separately approved live configuration change, not part of this source update.
+
+`boundaries` belongs only in the gateway's `config.json`, not in `adapter-discord.json`. Its keys are platform-qualified IDs (`<platform>:<ID>`). The Discord adapter supplies the actual guild ID as optional `boundaryId` metadata on group origins; this metadata does not change origin identity and DMs do not receive or use it. The gateway selects one whole policy in order: exact channel/thread entry, immediate parent-channel entry for a thread, then `boundaries["discord:<boundaryId>"]`, then closed. The first matching entry replaces the whole policy; fields are not merged. An explicit empty `{}` or `engagement: "closed"` entry matches and suppresses parent/boundary inheritance. With no configured match, policy is closed.
+
+Use this gateway `config.json` fragment for guild `1510336487894286436`:
+
+```json
+{
+  "boundaries": {
+    "discord:1510336487894286436": {
+      "engagement": "mention-open",
+      "audience": "human-only"
+    }
+  }
+}
+```
+
+Migrate a category-scoped policy to the actual guild boundary key `discord:1510336487894286436`, not category ID `1520004470489223219`; category IDs are not policy boundaries. Keep real channel and thread overrides in `channels` as exact overrides. This requires a boundary-metadata-capable Discord adapter and gateway; deploy those versions before relying on the fragment. Discord permissions still determine which channels and messages the adapter can see. The guild policy only decides admission for visible group messages; it neither grants permissions nor enumerates channels or expands discovery/history recovery. It also applies to uncategorized channels carrying the guild boundary ID; visible channels without matching exact, parent, or boundary policy remain closed. Boundaries support live config reload. Existing DM policy and older stored origins lacking boundary metadata are unchanged; those origins continue through exact/parent lookup and otherwise remain closed.
 
 Bot-authored turns admitted by a widened audience are unlimited in sequence by default. Set `botAudience.maxConsecutiveTurns` globally, or `channels.<key>.botAudienceMaxConsecutiveTurns`, to require a human message after N consecutive bot turns. The runaway guard is the rolling-minute rate limit `botAudience.maxTurnsPerWindow` (per-channel override `botAudienceMaxTurnsPerWindow`), default 30 bot admissions per conversation per minute; it is not reset by a human message. Both declines are logged with the origin's current counts and counted in `gateway.status` (`engagement.botAudienceDeclines`, `engagement.botAudienceRateLimited`).
 
@@ -293,6 +319,7 @@ If the gate model is unreachable, both steps fail open: the turn runs and the re
 ## Troubleshooting
 
 - **Socket missing:** verify the gateway service, configured socket path, parent permissions, and service log.
+- **`persona_send_blocked … reason=model_not_selected`:** GJC explicitly refused the prompt before accepting a turn. The gateway keeps that original message durably blocked across restarts rather than replacing sessions or retrying it. `gjc-default` means model selection was omitted and delegated to the canonical GJC profile; it is not a model ID. Diagnose that profile's SDK default-selection contract without pinning a gateway model or changing provider settings merely to bypass the refusal. Repairing selection does not automatically replay the blocked message. Before separately authorizing its release, correlate the exact message, session and operation reference and verify that no acceptance, output, delivery claim or uncertain steer would be replayed. Do not repost the message or use `/new` as a retry mechanism.
 - **Every turn fails with an API error:** confirm `gjc` is on the service `PATH` and its model-key environment variables are present. If the log says a model was not found, use an explicit selector (`"model": "provider/model"`) or activate a gjc profile (`"model": { "preset": "profile-name" }`); profile default-role arrays retain gjc's native fallback-chain handling. A poisoned conversation session can be rebound with `/new`.
   Fast/priority processing is independent of the model selector: set `"serviceTier": "priority"` in gateway `config.json`. The gateway applies GJC `service_tier.set` once per persona session before its first prompt (OpenAI `service_tier=priority`; Anthropic fast speed where supported). Use `"model": { "preset": "gpt-heavy" }` to pin the model profile separately.
 - **launchd hangs:** move the working directory, state, `gjc`, and symlink targets out of TCC-protected paths; then send `/new` to sessions created under the old location.
