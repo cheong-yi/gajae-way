@@ -34,6 +34,8 @@ export type AdminServerOptions = {
 	readonly events?: GatewayEvents;
 	readonly port?: number;
 	readonly hostname?: string;
+	/** Opt in only behind a trusted Tailscale Serve proxy on an explicit loopback bind. */
+	readonly trustTailscaleLogin?: boolean;
 	readonly now?: () => Date;
 	/** Low-frequency correctness backstop; 0 disables it. */
 	readonly reconcileMs?: number;
@@ -98,6 +100,45 @@ function visibleActor(value: unknown): string {
 	return typeof value === "string" && VISIBLE_CHARACTER.test(value) ? value : "";
 }
 
+/** Go mime.QEncoding uses UTF-8 encoded words for non-ASCII identity headers. */
+function tailscaleLogin(headers: Headers): string | undefined {
+	const raw = headers.get("Tailscale-User-Login");
+	if (!raw || raw.length > 1024 || raw.includes(",")) return undefined;
+	let login = raw;
+	if (raw.includes("=?")) {
+		login = "";
+		// Go splits long UTF-8 values into adjacent encoded words. MIME ignores
+		// the separating space; each word must independently be valid UTF-8.
+		for (const word of raw.split(" ")) {
+			const match = /^=\?utf-8\?q\?([^?]+)\?=$/i.exec(word);
+			if (!match) return undefined;
+			const encoded = match[1] ?? "";
+			const bytes: number[] = [];
+			for (let i = 0; i < encoded.length; i++) {
+				const char = encoded[i];
+				if (char === "=") {
+					const hex = encoded.slice(i + 1, i + 3);
+					if (!/^[0-9a-f]{2}$/i.test(hex)) return undefined;
+					bytes.push(Number.parseInt(hex, 16));
+					i += 2;
+				} else {
+					const code = encoded.charCodeAt(i);
+					if (code < 33 || code > 126) return undefined;
+					bytes.push(char === "_" ? 32 : code);
+				}
+			}
+			try {
+				login += new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(new Uint8Array(bytes));
+			} catch {
+				return undefined;
+			}
+		}
+	}
+	// Ambiguous/malformed identities lose attribution, not mutation authorization.
+	if (!VISIBLE_CHARACTER.test(login) || /[\s\p{Cf}\p{Cc},?]/u.test(login)) return undefined;
+	return login;
+}
+
 /** The `monitor-ref` field of an operation whose confirmation names its target. */
 function targetRefField(operation: MutationOperation): string | null {
 	const field = operation.fields.find((candidate) => candidate.kind === "monitor-ref");
@@ -105,6 +146,10 @@ function targetRefField(operation: MutationOperation): string | null {
 }
 
 export function createAdminApp(options: AdminServerOptions): AdminApp {
+	const hostname = options.hostname ?? "127.0.0.1";
+	if (options.trustTailscaleLogin && hostname !== "127.0.0.1" && hostname !== "::1") {
+		throw new Error("trustTailscaleLogin requires a 127.0.0.1 or ::1 listener");
+	}
 	const auditLog = options.auditLog ?? memoryAuditLog();
 	const gate = new MutationGate({
 		audit: (entry) => auditLog.append(entry),
@@ -249,6 +294,11 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 			}
 			const operationId = String(body.operationId ?? "");
 			const actor = visibleActor(body.actor);
+			const login = options.trustTailscaleLogin ? tailscaleLogin(httpRequest.headers) : undefined;
+			const attribution =
+				login === undefined
+					? {}
+					: { actor: login, actorLabel: actor.trim() || "anonymous", actorSource: "tailscale-proxy" as const };
 			const params =
 				typeof body.params === "object" && body.params !== null ? (body.params as Record<string, unknown>) : undefined;
 
@@ -263,6 +313,7 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 					await gate.record({
 						operationId,
 						actor: actor.trim() || "anonymous",
+						...attribution,
 						decision: "rejected",
 						reason,
 						...(params === undefined ? {} : { params }),
@@ -296,6 +347,7 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 			const decision = await gate.evaluate({
 				operationId,
 				...(actor === "" ? {} : { actor }),
+				...(login === undefined ? {} : { tailscaleLogin: login }),
 				...(typeof body.confirm === "string" ? { confirm: body.confirm } : {}),
 				...(params === undefined ? {} : { params }),
 			});
@@ -311,7 +363,7 @@ export function createAdminApp(options: AdminServerOptions): AdminApp {
 					operationId: decision.operation.id,
 					receipt: {
 						headline: `✓ ${decision.operation.summary} at ${formatClockSeconds(at)}`,
-						audited: `audited: actor=${actor.trim()} · operation=${decision.operation.id} · allowed`,
+						audited: `audited: actor=${login ?? actor.trim()} · operation=${decision.operation.id} · allowed`,
 						at: at.toISOString(),
 					},
 					result,
@@ -357,7 +409,7 @@ export function startAdminServer(options: AdminServerOptions): AdminServer {
 	const port = server.port ?? options.port ?? 0;
 	return {
 		port,
-		url: `http://${options.hostname ?? "127.0.0.1"}:${port}`,
+		url: `http://${options.hostname === "::1" ? "[::1]" : (options.hostname ?? "127.0.0.1")}:${port}`,
 		stop: () => {
 			app.stop();
 			server.stop(true);

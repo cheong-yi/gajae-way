@@ -172,6 +172,9 @@ export type AuditEntry = {
 	readonly at: string;
 	readonly operationId: string;
 	readonly actor: string;
+	/** Self-typed operator label, separate from the proxy-asserted actor. */
+	readonly actorLabel?: string;
+	readonly actorSource?: "tailscale-proxy";
 	readonly decision: "allowed" | "rejected";
 	readonly reason?: string;
 	readonly params?: unknown;
@@ -182,6 +185,8 @@ export type AuditSink = (entry: AuditEntry) => void | Promise<void>;
 export type MutationRequest = {
 	readonly operationId: string;
 	readonly actor?: string;
+	/** Set only by the explicitly trusted loopback server boundary. */
+	readonly tailscaleLogin?: string;
 	/** Must equal the operation id: a deliberate, non-guessable-by-accident echo. */
 	readonly confirm?: string;
 	readonly params?: Record<string, unknown>;
@@ -255,6 +260,9 @@ export class MutationGate {
 			at: this.#now().toISOString(),
 			operationId: operation.id,
 			actor,
+			...(request.tailscaleLogin === undefined
+				? {}
+				: { actor: request.tailscaleLogin, actorLabel: actor, actorSource: "tailscale-proxy" as const }),
 			decision: "allowed",
 			...(request.params === undefined ? {} : { params: request.params }),
 		});
@@ -266,6 +274,9 @@ export class MutationGate {
 			at: this.#now().toISOString(),
 			operationId: request.operationId,
 			actor,
+			...(request.tailscaleLogin === undefined
+				? {}
+				: { actor: request.tailscaleLogin, actorLabel: actor, actorSource: "tailscale-proxy" as const }),
 			decision: "rejected",
 			reason,
 			...(request.params === undefined ? {} : { params: request.params }),

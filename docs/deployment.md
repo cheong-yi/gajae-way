@@ -200,6 +200,31 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.gajaeway.gateway.pli
 
 Run the Discord, Telegram, and Slack binaries as separate managed services after the gateway. `gajaeway services install --bin-dir DIR` writes definitions for the gateway, the Discord and Slack adapters, and the admin console; Telegram is run under your own service definition. The CLI is an on-demand client; it does not start the daemon. The definitions it writes follow the host: launchd plists in `~/Library/LaunchAgents` on macOS, systemd user units in `${XDG_CONFIG_HOME:-~/.config}/systemd/user` on Linux. `--platform darwin|linux` with `--launch-agents-dir`/`--unit-dir` generates for the other host.
 
+### Optional Tailscale console audit attribution
+
+The admin console binds `127.0.0.1` by default. Set
+`GAJAEWAY_ADMIN_TRUST_TAILSCALE_LOGIN=true` only when a trusted Tailscale Serve
+proxy fronts that listener. The default is off; `false` explicitly disables it.
+This is audit attribution, not authentication or permission to expose the console.
+The server API's `trustTailscaleLogin` option rejects any configured bind other
+than `127.0.0.1` or `::1` (including wildcard binds and hostname aliases); request
+URLs, Host, and forwarded headers cannot enable trust.
+
+With opt-in enabled, a valid `Tailscale-User-Login` becomes the audit `actor`,
+with `actorSource: "tailscale-proxy"`; the self-typed name remains separately in
+`actorLabel` and cannot override the login. This is a trusted, proxy-asserted
+Tailscale login, not cryptographic proof from a header. Local processes can forge
+the header: trust the host and the proxy, including its stripping of incoming
+identity headers. No ACL or Serve configuration is changed by this option.
+
+Missing, duplicate, oversized, or malformed identities receive no proxy
+attribution and retain the existing self-typed audit behavior, with no invented
+verified identity and no new authorization denial. Go MIME Q-encoded UTF-8
+logins are decoded; invalid encodings are not attributed. Missing headers remain
+expected for tagged/unknown clients and Funnel. The operator-name requirement,
+mutation allowlist, confirmation checks, and audit-before-dispatch behavior remain
+unchanged; non-Tailscale console use needs no new configuration.
+
 ### The adapters restart with the gateway
 
 A gateway restart does not kill an adapter. The adapter reconnects and keeps serving the previous generation: nothing dies, nothing is lost, `delivery.pending` stays 0, and the only symptom is replies arriving a beat late. The service definitions therefore bind the stack together instead of relying on an operator following a restart order.

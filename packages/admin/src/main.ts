@@ -39,6 +39,10 @@ if (usageFor(process.argv.slice(2)) !== undefined) {
 
 const socket = socketPath();
 const port = adminPort();
+const trustTailscaleLogin = process.env.GAJAEWAY_ADMIN_TRUST_TAILSCALE_LOGIN;
+if (trustTailscaleLogin !== undefined && trustTailscaleLogin !== "true" && trustTailscaleLogin !== "false") {
+	throw new Error("GAJAEWAY_ADMIN_TRUST_TAILSCALE_LOGIN must be true or false");
+}
 
 let client: GajaewayClient;
 try {
@@ -63,6 +67,7 @@ const server = startAdminServer({
 	},
 	auditLog: jsonlAuditLog(`${gajaewayHome()}/admin-audit.jsonl`),
 	port,
+	trustTailscaleLogin: trustTailscaleLogin === "true",
 });
 
 console.error(`gajaeway console on ${server.url} (gateway ${socket})`);
