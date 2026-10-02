@@ -3,17 +3,25 @@ import type { OriginRef } from "@gajae-gateway/protocol";
 import { currentConversationNotice } from "../src/server/server";
 
 const slackDm: OriginRef = { platform: "slack", kind: "dm", conversationId: "D1", peerId: "U1" };
-const slackChannel: OriginRef = { platform: "slack", kind: "channel", conversationId: "C1" };
+const discordThread: OriginRef = {
+	platform: "discord",
+	kind: "thread",
+	conversationId: "T1",
+	parentId: "C1",
+};
+const slackThread: OriginRef = { platform: "slack", kind: "thread", conversationId: "T2", parentId: "C2" };
 const loopback: OriginRef = { platform: "loopback", kind: "loopback", conversationId: "loopback" };
 
 // Live finding (slack DM, 2026-09-17): reply-threading was fully implemented but
 // never named in the session context, so threaded messages were answered at the
 // conversation root and the persona looked like it ignored the thread.
 test("a chat conversation notice names the reply-threading token", () => {
-	for (const origin of [slackDm, slackChannel]) {
+	for (const origin of [discordThread, slackThread]) {
 		const notice = currentConversationNotice(origin);
 		expect(notice).toContain("[REPLY:<message id>]");
-		expect(notice).toContain("thread's parent message id");
+		if (origin.platform === "discord")
+			expect(notice).toContain("quote the message that triggered the turn automatically");
+		else expect(notice).toContain("thread's parent message id");
 	}
 });
 

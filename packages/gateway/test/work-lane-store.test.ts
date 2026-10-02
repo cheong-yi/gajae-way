@@ -302,6 +302,20 @@ describe("work attempt durable transactions", () => {
 		expect(buildDeliveryPayload("turn", LOOPBACK_ORIGIN, "NO_REPLY", "silent")).toBeUndefined();
 	});
 
+	test("delivery payloads attach only valid Discord snowflakes while preserving Slack reply ids", () => {
+		const discord = { platform: "discord", kind: "thread", conversationId: "thread", parentId: "parent" } as const;
+		const slack = { platform: "slack", kind: "thread", conversationId: "C1:1.000", parentId: "C1" } as const;
+		expect(buildDeliveryPayload("turn", discord, "answer", "valid", "1544704223634260038")).toMatchObject({
+			replyToMessageId: "1544704223634260038",
+		});
+		for (const invalid of ["id", "lane-report-abc", "123.456", "0", "18446744073709551616"]) {
+			expect(buildDeliveryPayload("turn", discord, "answer", invalid, invalid)?.replyToMessageId).toBeUndefined();
+		}
+		expect(buildDeliveryPayload("turn", slack, "answer", "slack", "C1:1726543210.000400")).toMatchObject({
+			replyToMessageId: "C1:1726543210.000400",
+		});
+	});
+
 	test("known silence survives reopen and suppresses exactly once", async () => {
 		const f = await fixture();
 		f.database.workAttemptPrepare(f.runtime, f.record);

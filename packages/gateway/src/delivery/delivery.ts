@@ -8,6 +8,12 @@ import {
 import type { DeliveryLedger, ExpiredDeliveryRow, LedgerOutcome } from "../store/ledger";
 
 const DELIVERY_FRESHNESS_MS = 24 * 60 * 60 * 1_000;
+const DISCORD_SNOWFLAKE_MAX = (1n << 64n) - 1n;
+
+export function isDiscordSnowflake(value: string): boolean {
+	if (!/^[1-9]\d{0,19}$/.test(value)) return false;
+	return BigInt(value) <= DISCORD_SNOWFLAKE_MAX;
+}
 
 export interface DeliverySweep {
 	readonly payloads: readonly ChatMessagePayload[];
@@ -35,6 +41,10 @@ export function buildDeliveryPayload(
 ): ChatMessagePayload | undefined {
 	if (isSilentOutput(text)) return undefined;
 	originKey(origin);
+	const safeReplyToMessageId =
+		origin.platform === "discord" && replyToMessageId !== undefined && !isDiscordSnowflake(replyToMessageId)
+			? undefined
+			: replyToMessageId;
 	return {
 		turnId,
 		origin,
@@ -42,7 +52,7 @@ export function buildDeliveryPayload(
 		text,
 		final,
 		deliveryId,
-		...(replyToMessageId ? { replyToMessageId } : {}),
+		...(safeReplyToMessageId ? { replyToMessageId: safeReplyToMessageId } : {}),
 	};
 }
 

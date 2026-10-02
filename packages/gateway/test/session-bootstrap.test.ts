@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { NAVIGATION_SOURCE_MAX_BYTES } from "../src/memory/registry";
 import { buildSessionBootstrap, SESSION_BOOTSTRAP_MAX_BYTES } from "../src/persona/bootstrap";
@@ -30,10 +31,10 @@ async function setup(): Promise<GatewayConfig> {
 	};
 }
 
-async function build(config: GatewayConfig, epoch = 0) {
+async function build(config: GatewayConfig, epoch = 0, origin: OriginRef = ORIGIN) {
 	return buildSessionBootstrap({
 		home,
-		origin: ORIGIN,
+		origin,
 		epoch,
 		config,
 		engagement: {
@@ -59,6 +60,26 @@ describe("session bootstrap builder", () => {
 		expect(first.text).toContain("known-participant-ids: owner-1, owner-2");
 		expect(first.text).toContain("owner-target: configured discord/dm; same-origin=false");
 		expect(first.text).not.toContain("owner-target: discord/dm/owner");
+	});
+
+	test("resolves guild boundary gate and human-only audience without changing origin identity", async () => {
+		const base = await setup();
+		const boundaryOrigin = { ...ORIGIN, boundaryId: "1510336487894286436" };
+		const config: GatewayConfig = {
+			...base,
+			channels: {},
+			boundaries: {
+				"discord:1510336487894286436": { engagement: "mention-open", audience: "human-only" },
+			},
+		};
+		const result = await build(config, 0, boundaryOrigin);
+
+		expect(originKey(boundaryOrigin)).toBe(originKey(ORIGIN));
+		expect(result.text).toContain("origin: discord/channel/c1");
+		expect(result.text).toContain("engagement-gate: mention-open");
+		// The bootstrap carries the policy the gateway enforces: addressed human
+		// messages may trigger; bot-authored messages remain excluded.
+		expect(result.text).toContain("engagement-audience: human-only");
 	});
 
 	test("includes only the explicitly associated public-safe channel record", async () => {

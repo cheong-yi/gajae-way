@@ -339,14 +339,18 @@ export function describeMessageEdit(
 }
 
 /**
- * True when the persona was addressed: a DM, or a group message that mentions
- * it (an `open` channel promotes every human message to a mention, so it is
- * covered here too). Only addressed turns show presence - typing, the
- * "working…" post - before the reply lands; an overheard public-channel turn
- * stays invisible until it actually says something.
+ * True when an accepted turn should show Discord-native presence.
+ *
+ * The gateway has already made the engagement decision. Thread follow-ups are
+ * therefore visible even without a repeated mention, while unmentioned
+ * channel traffic remains silent. DMs and addressed channel turns are visible
+ * as before.
  */
-export function addressedTurn(engagement: Pick<EngagementContext, "group" | "mentioned">): boolean {
-	return !engagement.group || engagement.mentioned;
+export function presenceEligibleTurn(
+	origin: Pick<OriginRef, "kind">,
+	engagement: Pick<EngagementContext, "group" | "mentioned">,
+): boolean {
+	return origin.kind === "thread" || !engagement.group || engagement.mentioned;
 }
 
 /**
@@ -1813,7 +1817,7 @@ export class ReconnectingGateway {
 					// Acknowledged: drop it unless a newer edit of the same message
 					// was queued behind this one meanwhile.
 					if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
-					if (result?.engaged && addressedTurn(edit.engagement)) {
+					if (result?.engaged && presenceEligibleTurn(edit.origin, edit.engagement)) {
 						this.status?.arm(edit.origin.conversationId, edit.messageId, edit.engagement);
 						this.typing?.begin(edit.origin.conversationId);
 					}
@@ -1905,11 +1909,10 @@ export class ReconnectingGateway {
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
-				// Presence hints are shown only where the persona was ADDRESSED: a DM,
-				// an explicit mention, or an `open` channel's promotion (all three are
-				// `mentioned` by the time engagement is built). A public channel the
-				// persona merely overhears shows nothing until the reply itself lands.
-				if (result?.engaged && addressedTurn(engagement)) {
+				// An accepted thread follow-up is already engaged by the gateway and
+				// does not need another mention. DMs and addressed channel turns show
+				// presence as before; overheard channel traffic remains silent.
+				if (result?.engaged && presenceEligibleTurn(origin, engagement)) {
 					this.status?.arm(origin.conversationId, messageId, engagement);
 					this.typing?.begin(origin.conversationId);
 				}

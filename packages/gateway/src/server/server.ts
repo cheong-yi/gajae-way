@@ -2286,7 +2286,14 @@ async function createInboundTurnLifecycle(
 				.replace(/\s*\[BREAK\]\s*/g, " ")
 				.trim();
 			if (!body) continue;
-			const replyTo = replyMatch?.[1] || inboundThreadRoot;
+			// Discord thread deliveries already target the thread channel. Quote the
+			// triggering message by default so the owner can see exactly which request
+			// this answer settles; later multipart continuations stay unquoted.
+			const discordTrigger =
+				origin.platform === "discord" && origin.kind === "thread" && planned.length === 0
+					? input.turn.triggerMessageId
+					: undefined;
+			const replyTo = replyMatch?.[1] || inboundThreadRoot || discordTrigger;
 			planned.push({ body, ...(replyTo ? { replyTo } : {}) });
 		}
 		const spoken = spokenReply(
@@ -2859,7 +2866,9 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// thread (live, slack DM, 2026-09-17).
 		...(isChatPlatform(origin.platform)
 			? [
-					"Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
+					origin.platform === "discord" && origin.kind === "thread"
+						? "Discord thread replies quote the message that triggered the turn automatically. Start a reply part with [REPLY:<message id>] only to target a different message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>)."
+						: "Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
 				]
 			: []),
 		...(isChatPlatform(origin.platform)

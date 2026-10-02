@@ -77,6 +77,50 @@ async function waitFrame(frames: any[], id: string): Promise<void> {
 	expect(frames.some((frame) => frame.id === id)).toBe(true);
 }
 
+async function chatRequest(
+	client: Awaited<ReturnType<typeof connect>>,
+	id: string,
+	verb: "chat.send" | "chat.edit",
+	params: unknown,
+): Promise<unknown> {
+	client.send({ v: "0.1", type: "request", id, verb, params });
+	await waitFrame(client.frames, id);
+	return client.frames.find((frame) => frame.id === id);
+}
+
+const DISCORD_GUILD_BOUNDARY = "1510336487894286436";
+
+async function startGuildBoundaryServer() {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-guild-boundary-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+		boundaries: {
+			[`discord:${DISCORD_GUILD_BOUNDARY}`]: { engagement: "mention-open", audience: "human-only" },
+		},
+		channels: {
+			"discord:override-channel": { engagement: "closed" },
+			"discord:edit-closed": { engagement: "closed" },
+		},
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({
+		onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
+		onSend: (input, scripted) => scripted.complete(input.opRef, "guild policy reply"),
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	return { client, config, database, sessionPort };
+}
+
 async function startDeliveryServer(
 	options: { ownerTarget?: GatewayConfig["ownerTarget"]; deliverySweepIntervalMs?: number } = {},
 ) {
@@ -745,6 +789,147 @@ test("a mention-less /new at the channel root remains refused", async () => {
 		result: { turnId: null, engaged: false },
 	});
 	expect(database.getSessionRecord("slack/channel/C2")).toBeUndefined();
+	client.close();
+});
+
+test("Discord guild boundaries admit addressed human chat and keep unrelated, overridden, and missing origins closed", async () => {
+	const { client, database, sessionPort } = await startGuildBoundaryServer();
+	const origin = (conversationId: string, boundaryId?: string) => ({
+		platform: "discord" as const,
+		kind: "channel" as const,
+		conversationId,
+		...(boundaryId ? { boundaryId } : {}),
+	});
+	const addressedOrigin = origin("guild-addressed", DISCORD_GUILD_BOUNDARY);
+	const addressed = await chatRequest(client, "guild-addressed", "chat.send", {
+		origin: addressedOrigin,
+		text: "Please answer this guild question.",
+		messageId: "guild-addressed-message",
+		engagement: { mentioned: true, group: true, authorId: "outsider" },
+	});
+	expect(addressed).toMatchObject({ type: "response", result: { engaged: true } });
+	for (let attempt = 0; attempt < 400 && sessionPort.sends.length < 1; attempt++) await Bun.sleep(5);
+	expect(sessionPort.sends).toHaveLength(1);
+	const addressedKey = originKey(addressedOrigin);
+	const storedInbound = database.inboundTurnRow(sessionPort.sends[0]!.opRef);
+	expect(storedInbound?.origin_key).toBe(addressedKey);
+	expect(JSON.parse(storedInbound!.origin_ref_json)).toEqual(addressedOrigin);
+	expect(originKey({ platform: "discord", kind: "channel", conversationId: "guild-addressed" })).toBe(addressedKey);
+	const preamble = sessionPort.sends[0]!.systemPreamble ?? "";
+	expect(preamble).toContain("engagement-gate: mention-open");
+	expect(preamble).toContain("engagement-audience: human-only");
+
+	const refused = [
+		{
+			id: "guild-unaddressed",
+			origin: origin("guild-unaddressed", DISCORD_GUILD_BOUNDARY),
+			text: "Unaddressed human conversation stays context only.",
+			engagement: { mentioned: false, group: true, authorId: "outsider" },
+		},
+		{
+			id: "guild-bot",
+			origin: origin("guild-bot", DISCORD_GUILD_BOUNDARY),
+			text: "A bot cannot enter this human-only guild turn.",
+			engagement: { mentioned: true, group: true, authorId: "other-bot", authorIsBot: true },
+		},
+		{
+			id: "guild-exact-override",
+			origin: origin("override-channel", DISCORD_GUILD_BOUNDARY),
+			text: "The exact closed policy wins over the open guild boundary.",
+			engagement: { mentioned: true, group: true, authorId: "outsider" },
+		},
+		{
+			id: "guild-unrelated-boundary",
+			origin: origin("unrelated-boundary-channel", "999999999999999999"),
+			text: "An unrelated boundary does not inherit this guild policy.",
+			engagement: { mentioned: true, group: true, authorId: "outsider" },
+		},
+		{
+			id: "guild-missing-boundary",
+			origin: origin("missing-boundary-channel"),
+			text: "A missing boundary stays on the closed default.",
+			engagement: { mentioned: true, group: true, authorId: "outsider" },
+		},
+	] as const;
+	for (const item of refused) {
+		const response = await chatRequest(client, item.id, "chat.send", {
+			origin: item.origin,
+			text: item.text,
+			messageId: `${item.id}-message`,
+			engagement: item.engagement,
+		});
+		expect(response).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
+		expect(database.contextUnread(originKey(item.origin)).map((row) => row.body)).toContain(item.text);
+		expect(database.inboundPendingOldest(originKey(item.origin))).toBeUndefined();
+		expect(database.getSessionRecord(originKey(item.origin))).toBeUndefined();
+		expect(sessionPort.sends).toHaveLength(1);
+	}
+
+	const invalidBoundary = await chatRequest(client, "invalid-boundary", "chat.send", {
+		origin: origin("invalid-boundary-channel", "not a valid segment"),
+		text: "Invalid wire metadata must be rejected.",
+		messageId: "invalid-boundary-message",
+		engagement: { mentioned: true, group: true, authorId: "outsider" },
+	});
+	expect(invalidBoundary).toMatchObject({ type: "error", error: { code: "invalid_params" } });
+	client.close();
+});
+
+test("chat.edit resolves guild boundaries for admission and refuses an exact closed override", async () => {
+	const { client, database, sessionPort } = await startGuildBoundaryServer();
+	const admittedOrigin = {
+		platform: "discord" as const,
+		kind: "channel" as const,
+		conversationId: "edit-admit",
+		boundaryId: DISCORD_GUILD_BOUNDARY,
+	};
+	const admittedKey = originKey(admittedOrigin);
+	const seed = await chatRequest(client, "edit-admit-seed", "chat.send", {
+		origin: admittedOrigin,
+		text: "The original message is context only.",
+		messageId: "edit-admit-original",
+		engagement: { mentioned: false, group: true, authorId: "outsider" },
+	});
+	expect(seed).toMatchObject({ type: "response", result: { engaged: false } });
+	const admittedEdit = await chatRequest(client, "edit-admitted", "chat.edit", {
+		origin: admittedOrigin,
+		messageId: "edit-admit-original",
+		text: "The edited message now addresses the persona.",
+		engagement: { mentioned: true, group: true, authorId: "outsider" },
+	});
+	expect(admittedEdit).toMatchObject({ type: "response", result: { engaged: true } });
+	for (let attempt = 0; attempt < 400 && sessionPort.sends.length < 1; attempt++) await Bun.sleep(5);
+	expect(sessionPort.sends).toHaveLength(1);
+	const editRow = database.inboundTurnRow(sessionPort.sends[0]!.opRef);
+	expect(editRow?.body).toContain("[MESSAGE POINTER: edit-admit-original]");
+	expect(editRow?.origin_key).toBe(admittedKey);
+	expect(JSON.parse(editRow!.origin_ref_json)).toEqual(admittedOrigin);
+
+	const refusedOrigin = {
+		platform: "discord" as const,
+		kind: "channel" as const,
+		conversationId: "edit-closed",
+		boundaryId: DISCORD_GUILD_BOUNDARY,
+	};
+	const refusedKey = originKey(refusedOrigin);
+	const refusedSeed = await chatRequest(client, "edit-closed-seed", "chat.send", {
+		origin: refusedOrigin,
+		text: "The closed override has a known source message.",
+		messageId: "edit-closed-original",
+		engagement: { mentioned: false, group: true, authorId: "outsider" },
+	});
+	expect(refusedSeed).toMatchObject({ type: "response", result: { engaged: false } });
+	const refusedEdit = await chatRequest(client, "edit-refused", "chat.edit", {
+		origin: refusedOrigin,
+		messageId: "edit-closed-original",
+		text: "Even addressed, the exact closed override refuses this edit.",
+		engagement: { mentioned: true, group: true, authorId: "outsider" },
+	});
+	expect(refusedEdit).toMatchObject({ type: "response", result: { turnId: null, engaged: false } });
+	expect(database.contextUnread(refusedKey).find((row) => row.message_id === "edit-closed-original")?.body).toBe(
+		"Even addressed, the exact closed override refuses this edit.",
+	);
+	expect(sessionPort.sends).toHaveLength(1);
 	client.close();
 });
 
@@ -1445,7 +1630,8 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const database = await GatewayDatabase.open(config.dbPath);
 	const sessionPort = sessionPortFromResponder({
 		bind: (key, epoch) => bindWorkFixture(key, epoch),
-		respond: async () => "[REPLY:msg-42] threaded answer\n[BREAK]\nplain follow-up",
+		respond: async () =>
+			"[REPLY:1544704223634260038] threaded answer\n[BREAK]\nplain follow-up\n[BREAK]\n[REPLY:not-a-snowflake] malformed target",
 	});
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
@@ -1465,14 +1651,71 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 		},
 	});
 	for (let attempt = 0; attempt < 400; attempt++) {
-		if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length >= 2) break;
+		if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length >= 3) break;
 		await Bun.sleep(5);
 	}
 	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
-	expect(messages).toHaveLength(2);
-	expect(messages[0].payload).toMatchObject({ text: "threaded answer", replyToMessageId: "msg-42" });
+	expect(messages).toHaveLength(3);
+	expect(messages[0].payload).toMatchObject({
+		text: "threaded answer",
+		replyToMessageId: "1544704223634260038",
+	});
 	expect(messages[1].payload.text).toBe("plain follow-up");
 	expect(messages[1].payload.replyToMessageId).toBeUndefined();
+	expect(messages[2].payload.text).toBe("malformed target");
+	expect(messages[2].payload.replyToMessageId).toBeUndefined();
+	client.close();
+});
+
+test("Discord thread replies quote only numeric snowflake triggers by default", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		channels: { thread: { engagement: "open" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => bindWorkFixture(key, epoch),
+		respond: async () => "exact answer",
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	await waitFor(client.frames, 1);
+	client.send({
+		v: "0.1",
+		type: "request",
+		id: "thread",
+		verb: "chat.send",
+		params: {
+			origin: {
+				platform: "discord",
+				kind: "thread",
+				conversationId: "thread",
+				parentId: "parent",
+				boundaryId: "guild",
+			},
+			text: "hello",
+			messageId: "1544704223634260038",
+			engagement: { mentioned: true, group: true, authorId: "p1" },
+		},
+	});
+	for (let attempt = 0; attempt < 400; attempt++) {
+		if (client.frames.some((frame) => frame.type === "event" && frame.event === "chat.message")) break;
+		await Bun.sleep(5);
+	}
+	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+	expect(messages).toHaveLength(1);
+	expect(messages[0].payload).toMatchObject({
+		text: "exact answer",
+		replyToMessageId: "1544704223634260038",
+	});
 	client.close();
 });
 

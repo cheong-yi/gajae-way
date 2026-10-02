@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DiscordInboundMessage } from "../src/main";
-import { decideInbound, LruSet, monitorFailureDecision, ReconnectingGateway } from "../src/main";
+import { decideInbound, LruSet, monitorFailureDecision, ReconnectingGateway, WorkingStatus } from "../src/main";
 import {
 	classifyRecoveryFailure,
 	loadRecoveryCursors,
@@ -30,6 +30,8 @@ import {
 } from "../src/recovery";
 
 const bot = { id: "bot-9" };
+const GUILD_ID = "1510336487894286436";
+const CATEGORY_ID = "1520004470489223219";
 
 /** Full cursor-store state from just its watermarks. */
 function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorState {
@@ -566,6 +568,68 @@ function settle(ms = 10): Promise<void> {
 }
 
 const channelOrigin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+
+test("recovery forwards the actual guild boundary and never substitutes a channel category", async () => {
+	const cursorPath = join(home, "guild-boundary-recovery", "recovery-cursor.json");
+	const missed = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		channel: { id: "channel-1", name: "general", type: 0, guildId: GUILD_ID, parentId: CATEGORY_ID },
+	});
+	const sends: Array<{ verb: string; params: unknown }> = [];
+	const gateway = wiredGateway(
+		fakeChannel([missed]),
+		{
+			request: async (verb: string, params?: unknown) => {
+				sends.push({ verb, params });
+				return {};
+			},
+		},
+		cursorPath,
+	);
+
+	await gateway.recoverMissedMessages();
+
+	const send = sends.find(({ verb }) => verb === "chat.send");
+	expect(send).toBeDefined();
+	expect((send?.params as { origin: unknown }).origin).toEqual({
+		platform: "discord",
+		kind: "channel",
+		conversationId: "channel-1",
+		boundaryId: GUILD_ID,
+	});
+	expect((send?.params as { origin: { boundaryId: string } }).origin.boundaryId).not.toBe(CATEGORY_ID);
+});
+
+test("recovery keeps the message guild boundary for an explicitly configured thread", async () => {
+	const cursorPath = join(home, "guild-boundary-thread-recovery", "recovery-cursor.json");
+	const missed = message(snowflakeFromTimestamp(Date.now() - 60_000), {
+		guildId: GUILD_ID,
+		channel: { id: "thread-1", name: "thread", type: 11, parentId: "channel-1" },
+	});
+	const sends: Array<{ verb: string; params: unknown }> = [];
+	const gateway = wiredGateway(
+		fakeChannel([missed]),
+		{
+			request: async (verb: string, params?: unknown) => {
+				sends.push({ verb, params });
+				return {};
+			},
+		},
+		cursorPath,
+		{ "thread-1": {} },
+	);
+
+	await gateway.recoverMissedMessages();
+
+	const send = sends.find(({ verb }) => verb === "chat.send");
+	expect((send?.params as { origin: unknown }).origin).toEqual({
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+		boundaryId: GUILD_ID,
+	});
+	expect((send?.params as { origin: { boundaryId: string } }).origin.boundaryId).not.toBe(CATEGORY_ID);
+});
 
 test("live sends never advance the recovery watermark past an unrecovered gap", async () => {
 	const cursorPath = join(home, "live-vs-recovery", "recovery-cursor.json");
@@ -1337,37 +1401,76 @@ test("a live chat.send the gateway rejects is logged with its message and channe
 	}
 });
 
-test("typing begins only for addressed turns: an overheard public-channel turn stays invisible until it replies", async () => {
+test("accepted thread follow-ups arm presence and typing while overheard channels stay silent", async () => {
 	const cursorPath = join(home, "typing-addressed", "recovery-cursor.json");
 	const began: string[] = [];
+	const armed: Array<[string, string]> = [];
 	const typing = { begin: (id: string) => void began.push(id), refresh: () => {}, end: () => {} };
-	const client = { request: async () => ({ engaged: true }) };
+	const status = new WorkingStatus({ channels: { fetch: async () => fakeChannel([]) } });
+	status.arm = (conversationId: string, messageId: string) => void armed.push([conversationId, messageId]);
+	let engaged = true;
+	const client = { request: async () => ({ engaged }) };
 	const gateway = new ReconnectingGateway(
 		"socket",
 		{ channels: { fetch: async () => fakeChannel([]) } },
 		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
 		typing,
-		undefined,
+		status,
 		cursorPath,
 		() => bot,
 		{ ...client, onChatMessage: () => () => {} } as never,
 		async () => {},
 	);
 	const channelOrigin = { platform: "discord", kind: "channel", conversationId: "channel-1" } as const;
+	const threadOrigin = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+	} as const;
 	const dmOrigin = { platform: "discord", kind: "dm", conversationId: "dm-1" } as const;
-	// Overheard: engaged (a closed channel where the gateway still ran a turn), not mentioned.
+	// The gateway may accept an unmentioned channel turn for context; that must
+	// not leak presence into overheard channel traffic.
 	await gateway.requestInbound("m-1", channelOrigin, "just chatting", {
 		group: true,
 		mentioned: false,
 		authorId: "u",
 	} as never);
 	expect(began).toEqual([]);
-	// Mentioned in a group, and a DM: both addressed.
+	expect(armed).toEqual([]);
+	// Thread follow-up engagement has already been accepted by the gateway.
+	await gateway.requestInbound("m-thread", threadOrigin, "follow-up", {
+		group: true,
+		mentioned: false,
+		authorId: "u",
+	} as never);
+	// Mentioned channels and DMs remain visible.
 	await gateway.requestInbound("m-2", channelOrigin, "@bot hey", {
 		group: true,
 		mentioned: true,
 		authorId: "u",
 	} as never);
 	await gateway.requestInbound("m-3", dmOrigin, "hi", { group: false, mentioned: false, authorId: "u" } as never);
-	expect(began).toEqual(["channel-1", "dm-1"]);
+	expect(began).toEqual(["thread-1", "channel-1", "dm-1"]);
+	expect(armed).toEqual([
+		["thread-1", "m-thread"],
+		["channel-1", "m-2"],
+		["dm-1", "m-3"],
+	]);
+	const followUp = { group: true, mentioned: false, authorId: "u" } as const;
+	engaged = false;
+	await gateway.requestInbound("denied-thread", threadOrigin, "not authorized", followUp);
+	gateway.sendEdit("denied-edit", threadOrigin, "not authorized", followUp);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(armed).toHaveLength(3);
+	expect(began).toHaveLength(3);
+	engaged = true;
+	gateway.sendEdit("accepted-edit", threadOrigin, "accepted follow-up", followUp);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(armed.at(-1)).toEqual(["thread-1", "accepted-edit"]);
+	expect(began.at(-1)).toBe("thread-1");
+	gateway.sendEdit("overheard-edit", channelOrigin, "overheard", followUp);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	expect(armed).toHaveLength(4);
+	expect(began).toHaveLength(4);
 });

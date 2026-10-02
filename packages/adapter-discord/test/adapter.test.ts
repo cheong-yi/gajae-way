@@ -6,7 +6,6 @@ import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/pro
 import { PRESENCE_MIN_SWAP_MS } from "@gajae-gateway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
-	addressedTurn,
 	chunkDiscordMessage,
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
@@ -16,6 +15,7 @@ import {
 	handleSlashCommand,
 	isPresenceReaction,
 	LruSet,
+	presenceEligibleTurn,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
@@ -115,25 +115,54 @@ test("accepts and validates statusReactions configuration option", async () => {
 });
 
 test("maps guild channels, threads, and DMs to canonical Discord origins", () => {
-	expect(discordMessageOrigin({ author, channel: { id: "channel-1" } })).toEqual({
+	expect(
+		discordMessageOrigin({
+			author,
+			channel: { id: "channel-1", guildId: "guild-1", parentId: "category-1" },
+		}),
+	).toEqual({
 		platform: "discord",
 		kind: "channel",
 		conversationId: "channel-1",
+		boundaryId: "guild-1",
 	});
 	expect(
-		discordMessageOrigin({ author, channel: { id: "thread-1", parentId: "channel-1", isThread: () => true } }),
+		discordMessageOrigin({
+			author,
+			channel: { id: "thread-1", guildId: "guild-1", parentId: "channel-1", isThread: () => true },
+		}),
 	).toEqual({
 		platform: "discord",
 		kind: "thread",
 		conversationId: "thread-1",
 		parentId: "channel-1",
+		boundaryId: "guild-1",
 	});
+	expect(
+		discordMessageOrigin({
+			author,
+			guildId: "guild-from-message",
+			channel: { id: "uncategorized-channel" },
+		}),
+	).toMatchObject({
+		kind: "channel",
+		conversationId: "uncategorized-channel",
+		boundaryId: "guild-from-message",
+	});
+	expect(discordMessageOrigin({ author, channel: { id: "legacy-channel" } })).not.toHaveProperty("boundaryId");
 	expect(discordMessageOrigin({ author, channel: { id: "dm-1", isDMBased: () => true } })).toEqual({
 		platform: "discord",
 		kind: "dm",
 		conversationId: "dm-1",
 		peerId: "author-1",
 	});
+	expect(
+		discordMessageOrigin({
+			author,
+			guildId: "must-not-leak",
+			channel: { id: "dm-2", guildId: "must-not-leak", type: 1 },
+		}),
+	).not.toHaveProperty("boundaryId");
 });
 
 test("derives engagement from Discord mentions and recognizes DMs as non-group", () => {
@@ -521,7 +550,6 @@ test("working status is a reaction gradient on the triggering message and clears
 		outputTokens: 210,
 		activity: { kind: "tool", label: "bash" },
 	});
-	// Phase ⏳→🔧, one minute, one tool: a remove and three adds; nothing posted.
 	expect(removed).toEqual(["⏳:bot-1"]);
 	expect(reacted).toEqual(["⏳", "🔧", "🕐", "1️⃣"]);
 	// Inside the window: coalesced.
@@ -730,10 +758,11 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 	expect(replied).toContain("not authorized");
 });
 
-test("presence is shown only where the persona was addressed: DM, mention, or open-channel promotion", () => {
-	expect(addressedTurn({ group: false, mentioned: false })).toBe(true); // DM
-	expect(addressedTurn({ group: true, mentioned: true })).toBe(true); // mention, or open promotion
-	expect(addressedTurn({ group: true, mentioned: false })).toBe(false); // overheard public channel
+test("presence eligibility includes accepted thread follow-ups but excludes overheard channels", () => {
+	expect(presenceEligibleTurn({ kind: "dm" }, { group: false, mentioned: false })).toBe(true);
+	expect(presenceEligibleTurn({ kind: "channel" }, { group: true, mentioned: true })).toBe(true);
+	expect(presenceEligibleTurn({ kind: "channel" }, { group: true, mentioned: false })).toBe(false);
+	expect(presenceEligibleTurn({ kind: "thread" }, { group: true, mentioned: false })).toBe(true);
 });
 
 test("an unaddressed public-channel turn shows no presence until it is armed; clear disarms", async () => {
