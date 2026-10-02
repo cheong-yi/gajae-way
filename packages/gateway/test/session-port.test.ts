@@ -5,8 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
-import { BrokerSessionPort, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
-import { TailRunner } from "../src/orchestrator/tail-runner";
+import { BrokerSessionPort, ModelNotSelectedError, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
+import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import {
 	attachTestBrokerOwnership,
@@ -216,6 +216,41 @@ test("AC-K rendered SDK prompt is notice + blank line + task; broker SessionPort
 	expect(relay.streams).toHaveLength(1);
 	expect(relay.streams[0]!.closed).toBe(true);
 });
+
+for (const [label, model, expected] of [
+	["default", undefined, {}],
+	["explicit", "provider/model", { modelId: "provider/model" }],
+	["preset", { preset: "selected-profile" }, { modelPreset: "selected-profile" }],
+] as const) {
+	test(`session creation preserves ${label} model semantics without post-create selection`, async () => {
+		home = await mkdtemp(join(tmpdir(), "gajaeway-default-bootstrap-"));
+		database = await GatewayDatabase.open(join(home, "gateway.db"));
+		const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+		const calls: string[][] = [];
+		const port = new BrokerSessionPort({
+			database,
+			authority,
+			instanceId: "instance-default",
+			tailRunner: new TailRunner({ stream: noRelay, repo: "/tmp/repo" }),
+			cli: async (args) => {
+				calls.push([...args]);
+				if (args.includes("session.create"))
+					return {
+						exitCode: 0,
+						stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-default" } }),
+						stderr: "",
+					};
+				throw new Error(`unexpected bootstrap command ${args.join(" ")}`);
+			},
+		});
+		const binding = await port.bind({ originKey: "default-origin", epoch: 0, repo: "/tmp/repo", model });
+		const create = calls.find((args) => args.includes("session.create"))!;
+		const input = JSON.parse(create[create.indexOf("--json-input") + 1]!);
+		expect(input).toEqual({ cwd: "/tmp/repo", readinessTimeoutMs: 60_000, ...expected });
+		expect(binding.startupModelApplied === true).toBe(model !== undefined);
+		expect(calls.some((args) => args.includes("model.set") || args.includes("model.profile.set"))).toBe(false);
+	});
+}
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
@@ -1056,6 +1091,48 @@ test("a relay that dies before the steer reply is ambiguity, never a definitive 
 	expect(failure).toBeInstanceOf(Error);
 	expect((failure as { details?: { refused?: boolean } }).details?.refused).toBeUndefined();
 	expect(isDefinitiveSteerRejection(failure)).toBe(false);
+});
+
+test("send distinguishes an explicit model refusal from a transport error with the same code", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "sdk-1",
+		repo,
+		originKey: "model-refusal",
+		epoch: 0,
+	});
+	const refusalRelay = scriptedRelay((request) => {
+		if (request.operation !== "turn.prompt") throw new Error(`unexpected request ${request.operation}`);
+		return { ok: false, error: { code: "model_not_selected", message: "The requested model is unavailable." } };
+	});
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: async () => {
+			throw new Error("unexpected CLI command");
+		},
+		instanceId: "instance-1",
+		tailRunner: new TailRunner({ stream: refusalRelay.spawn, repo }),
+	});
+	const refusal = await port
+		.send({ sessionId: "sdk-1", repo, text: "prompt", opRef: "gw-p-model-refusal" })
+		.catch((error: unknown) => error);
+	expect(refusal).toBeInstanceOf(ModelNotSelectedError);
+	expect(refusal).toMatchObject({ opRef: "gw-p-model-refusal", code: "model_not_selected" });
+	expect(refusalRelay.requests.filter((request) => request.operation === "turn.prompt")).toHaveLength(1);
+
+	const transportError = new GjcCliError("relay failed", 0, "", { code: "model_not_selected" });
+	const transportRelay = {
+		control: async () => {
+			throw transportError;
+		},
+	} as unknown as TailHandle;
+	await expect(
+		port.send({ sessionId: "sdk-1", repo, text: "prompt", opRef: "gw-p-model-transport", relay: transportRelay }),
+	).rejects.toBe(transportError);
 });
 
 test("send waits out a `busy` refusal and resends under the same op-ref once the turn is free", async () => {
