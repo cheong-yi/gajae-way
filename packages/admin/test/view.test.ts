@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { TurnTracker } from "../src/turns";
+import { TURN_STALL_MS, TurnTracker } from "../src/turns";
 import { buildMonitorConsequence, buildSnapshot, type ConsoleSnapshot } from "../src/view";
 import { FIXED_NOW, MONITOR, MONITOR_SCHEDULE, monitorEvent, SESSIONS, STATUS } from "./fixture";
 
@@ -25,11 +25,14 @@ function stub(overrides: Record<string, unknown | (() => never)> = {}): Stub {
 	};
 }
 
-function snapshot(overrides?: Record<string, unknown | (() => never)>): Promise<ConsoleSnapshot> {
+function snapshot(
+	overrides?: Record<string, unknown | (() => never)>,
+	turns = new TurnTracker(() => FIXED_NOW.getTime()),
+): Promise<ConsoleSnapshot> {
 	const backend = stub(overrides);
 	return buildSnapshot({
 		request: backend.request,
-		turns: new TurnTracker(() => FIXED_NOW.getTime()),
+		turns,
 		now: () => FIXED_NOW,
 	});
 }
@@ -39,8 +42,9 @@ describe("status bar", () => {
 		const state = await snapshot();
 		expect(state.status.fields).toMatchObject({
 			alive: "alive 4d 6h",
-			sessions: "2 sessions",
+			sessions: "2 saved sessions",
 			working: "idle",
+			stalled: "no stalled turns",
 			attention: "nothing needs you",
 			delivery: "deliveries clear",
 			context: "3 unread · 287 expired · 12 truncated",
@@ -144,7 +148,66 @@ describe("panels", () => {
 	test("an empty session list reads as a sentence", async () => {
 		const state = await snapshot({ "session.list": { sessions: [] } });
 		expect(state.sessions.state).toBe("empty");
-		expect(state.sessions.note).toBe("No session has been opened yet.");
+		expect(state.sessions.note).toBe("No saved session history is available.");
+	});
+
+	test("saved-session census is separate from mixed row hints and turn liveness", async () => {
+		let now = FIXED_NOW.getTime();
+		const turns = new TurnTracker(() => now);
+		turns.progress({
+			turnId: "stalled-view",
+			origin: { platform: "discord", kind: "channel", conversationId: "room" },
+			elapsedMs: 60_000,
+			toolCalls: 2,
+			outputTokens: 20,
+		});
+		now += TURN_STALL_MS + 1;
+		turns.progress({
+			turnId: "running-view",
+			origin: { platform: "discord", kind: "channel", conversationId: "room" },
+			elapsedMs: 1000,
+			toolCalls: 0,
+			outputTokens: 0,
+		});
+		const state = await snapshot(
+			{
+				"gateway.status": { ...STATUS, sessions: { active: 3 } },
+				// session.list rows are history, not a broker-liveness census.
+				"session.list": {
+					sessions: SESSIONS.sessions.map((session, index) => ({ ...session, bound: index === 0 })),
+				},
+			},
+			turns,
+		);
+		expect(state.status.fields.sessions).toBe("3 saved sessions");
+		expect(state.sessions.rows).toHaveLength(2);
+		expect(state.sessions.note).toContain("not a process-liveness signal");
+		expect(state.status.fields.working).toBe("1 working");
+		expect(state.status.fields.stalled).toBe("1 stalled");
+		expect(state.live.note).toContain("not confirmed ended");
+		expect(state.live.note).toContain("does not stop work or erase durable history");
+	});
+
+	test("session.list failure does not relabel the database census as bound sessions", async () => {
+		const state = await snapshot({
+			"session.list": () => {
+				throw new Error("session history unavailable");
+			},
+		});
+		expect(state.status.fields.sessions).toBe("2 saved sessions");
+		expect(state.sessions.state).toBe("error");
+		expect(state.sessions.note).toBe("session history unavailable");
+	});
+
+	test("status API failure makes the saved-session census unknown without hiding listed history", async () => {
+		const state = await snapshot({
+			"gateway.status": () => {
+				throw new Error("gateway socket closed");
+			},
+		});
+		expect(state.status.fields.sessions).toBe("saved sessions unknown");
+		expect(state.sessions.state).toBe("ready");
+		expect(state.sessions.rows).toHaveLength(2);
 	});
 
 	test("the conversation panel is blocked and names the gap rather than inventing data", async () => {

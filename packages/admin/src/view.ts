@@ -303,7 +303,8 @@ function statusRow(
 	status: GatewayStatusResult | null,
 	statusError: string | null,
 	sessionCount: number | null,
-	working: number,
+	running: number,
+	stalled: number,
 	attention: readonly AttentionItem[],
 	now: Date,
 ): RowView {
@@ -341,8 +342,9 @@ function statusRow(
 					? `alive ${formatDuration(now.getTime() - startedAt.getTime())}`
 					: "alive"
 				: "gateway unreachable",
-			sessions: sessionCount === null ? "sessions unknown" : pluralise(sessionCount, "session"),
-			working: working === 0 ? "idle" : `${formatCount(working)} working`,
+			sessions: sessionCount === null ? "saved sessions unknown" : pluralise(sessionCount, "saved session"),
+			working: running === 0 ? "idle" : `${formatCount(running)} working`,
+			stalled: stalled === 0 ? "no stalled turns" : `${formatCount(stalled)} stalled`,
 			attention: attention.length === 0 ? "nothing needs you" : `⚠ ${pluralise(attention.length, "item")} needs you`,
 			delivery: deliveryLabel,
 			context: contextLabel,
@@ -360,7 +362,8 @@ function statusRow(
 				: engagement.botAudienceDeclines === 0 && engagement.botAudienceRateLimited === 0
 					? "ok"
 					: "warn",
-			working: working === 0 ? "muted" : "active",
+			working: running === 0 ? "muted" : "active",
+			stalled: stalled === 0 ? "muted" : "warn",
 		},
 	};
 }
@@ -467,8 +470,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		status: statusRow(
 			status.value,
 			status.error,
-			sessions.value === null ? null : sessionList.length,
-			deps.turns.activeCount,
+			status.value?.sessions?.active ?? null,
+			deps.turns.runningCount,
+			deps.turns.stalledCount,
 			attention,
 			now,
 		),
@@ -480,7 +484,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		},
 		live: {
 			state: turnRows.length === 0 ? "empty" : "ready",
-			note: "No turn is running. Work that finished more than ten minutes ago has moved to history.",
+			note: "Running turns have recent heartbeats; stalled turns are unresolved, not confirmed ended. Stalled rows leave this console after ten minutes without a heartbeat; this does not stop work or erase durable history.",
 			rows: turnRows,
 			gaps: LIVE_GAPS,
 		},
@@ -493,7 +497,12 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<ConsoleSnapshot
 		sessions: {
 			state:
 				(sessions.error ?? projectedSessions.error) ? "error" : projectedSessions.rows.length === 0 ? "empty" : "ready",
-			note: sessions.error ?? projectedSessions.error ?? "No session has been opened yet.",
+			note:
+				sessions.error ??
+				projectedSessions.error ??
+				(projectedSessions.rows.length === 0
+					? "No saved session history is available."
+					: "Saved session history; listed sessions are not a process-liveness signal."),
 			rows: projectedSessions.rows,
 			gaps: SESSION_GAPS,
 		},

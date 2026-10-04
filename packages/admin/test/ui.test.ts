@@ -133,7 +133,13 @@ describe("panels", () => {
 		expect(surface).toContain("weekdays 08:30");
 		expect(surface).toContain("discord channel · 1493…5762");
 		// The status bar is a sticky header above main, and it is server-rendered too.
-		expect(document.slice(0, document.indexOf("<main>"))).toContain("alive 4d 6h");
+		const status = document.slice(0, document.indexOf("<main>"));
+		expect(status).toContain("alive 4d 6h");
+		expect(status).toContain("2 saved sessions");
+		expect(status).toContain("no stalled turns");
+		expect(surface).toContain('<h2 class="panel__title">Saved session history</h2>');
+		expect(surface).toContain("not a process-liveness signal");
+		expect(surface).toContain("not confirmed ended");
 	});
 
 	test("every reconciled panel ships the row markup once, as a template", async () => {

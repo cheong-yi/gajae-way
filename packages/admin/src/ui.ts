@@ -199,7 +199,7 @@ function statusBar(snapshot: ConsoleSnapshot, ctx: Ctx): string {
 	const chip = (name: string) => cell(row, name, "chip", ctx);
 	return `<header class="bar" id="statusbar" data-tone="${escapeHtml(row.tone)}" data-state="${escapeHtml(row.state ?? "")}">
 <p class="bar__chips">
-${chip("alive")}${chip("sessions")}${chip("working")}${chip("attention")}${chip("delivery")}${chip("profile")}
+${chip("alive")}${chip("sessions")}${chip("working")}${chip("stalled")}${chip("attention")}${chip("delivery")}${chip("profile")}
 </p>
 <p class="bar__stream" id="stream-state" data-tone="ok">${escapeHtml(row.fields.stream ?? "")}</p>
 </header>`;
@@ -992,14 +992,14 @@ export function renderIndex(
 ${statusBar(snapshot, ctx)}
 <main>
 ${panelSection("attention", "Attention", snapshot.attention, ctx, "What needs a human. Ordered by severity, computed on the server so there is only ever one threshold.")}
-${panelSection("live", "Live work", snapshot.live, ctx, `Turns in flight, against the gateway's ${formatDuration(TURN_CEILING_MS)} ceiling. A row with no progress for ${formatDuration(TURN_STALL_MS)} stops claiming to be alive.`)}
+${panelSection("live", "Live work", snapshot.live, ctx, `Recent heartbeats count as working; no progress for ${formatDuration(TURN_STALL_MS)} is shown as stalled, not ended. Turns are observed only after this console connects, against the gateway's ${formatDuration(TURN_CEILING_MS)} ceiling.`)}
 <section class="panel" id="panel-conversation" data-state="${escapeHtml(snapshot.conversation.state)}">
 <header class="panel__head"><h2 class="panel__title">Conversation</h2><span class="panel__count"></span></header>
 <p class="panel__sub">What it said, whether it stayed silent, and whether the reply landed.</p>
 <p class="panel__note" data-state="blocked">${escapeHtml(snapshot.conversation.note)}</p>
 ${gapsBlock(snapshot.conversation)}
 </section>
-${panelSection("sessions", "Sessions", snapshot.sessions, ctx, "One conversational origin, one isolated session.")}
+${panelSection("sessions", "Saved session history", snapshot.sessions, ctx, "One conversational origin, one isolated session. Saved session rows do not establish current process liveness.")}
 ${panelSection("monitors", "Monitors", snapshot.monitors, ctx, "What fires on its own, when it fires next, and how its last event ended.")}
 ${operationsPanel(operations, mutationsEnabled, ctx)}
 </main>

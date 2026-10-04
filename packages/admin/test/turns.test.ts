@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { OriginRef } from "@gajae-gateway/protocol";
-import { type TrackedTurn, TURN_RETENTION_MS, TURN_STALL_MS, TurnTracker } from "../src/turns";
+import {
+	type TrackedTurn,
+	TURN_RETENTION_MS,
+	TURN_STALL_MS,
+	TURN_STALLED_RETENTION_MS,
+	TurnTracker,
+} from "../src/turns";
 
 const ORIGIN: OriginRef = { platform: "discord", kind: "channel", conversationId: "1493635653441945762" };
 
@@ -31,7 +37,8 @@ describe("TurnTracker", () => {
 		expect(turn?.toolCalls).toBe(3);
 		expect(turn?.outputTokens).toBe(120);
 		expect(tracker.stateOf(only(tracker))).toBe("running");
-		expect(tracker.activeCount).toBe(1);
+		expect(tracker.runningCount).toBe(1);
+		expect(tracker.stalledCount).toBe(0);
 	});
 
 	test("the start time is derived from the reported elapsed, not from first sight", () => {
@@ -51,7 +58,8 @@ describe("TurnTracker", () => {
 		const turn = only(tracker);
 		expect(tracker.stateOf(turn)).toBe("stalled");
 		expect(turn.toolCalls).toBe(14);
-		expect(tracker.activeCount).toBe(1);
+		expect(tracker.runningCount).toBe(0);
+		expect(tracker.stalledCount).toBe(1);
 	});
 
 	test("only a final message terminates a turn", () => {
@@ -62,7 +70,8 @@ describe("TurnTracker", () => {
 		expect(tracker.stateOf(only(tracker))).toBe("running");
 		expect(tracker.final({ turnId: "t1", origin: ORIGIN, role: "assistant", text: "hi", final: true })).toBe(true);
 		expect(tracker.stateOf(only(tracker))).toBe("finished");
-		expect(tracker.activeCount).toBe(0);
+		expect(tracker.runningCount).toBe(0);
+		expect(tracker.stalledCount).toBe(0);
 	});
 
 	test("a silence token is a distinct outcome from a reply", () => {
@@ -97,6 +106,22 @@ describe("TurnTracker", () => {
 		expect(only(tracker)).toMatchObject({ observed: true, toolCalls: 6, outputTokens: 900 });
 	});
 
+	test("late progress and duplicate finals cannot resurrect or rewrite a confirmed outcome", () => {
+		const time = clock();
+		const tracker = new TurnTracker(time.now);
+		tracker.progress({ turnId: "t1", origin: ORIGIN, elapsedMs: 15_000, toolCalls: 4, outputTokens: 80 });
+		tracker.final({ turnId: "t1", origin: ORIGIN, role: "assistant", text: "[turn failed] boom", final: true });
+		time.advance(1000);
+		expect(tracker.progress({ turnId: "t1", origin: ORIGIN, elapsedMs: 16_000, toolCalls: 9, outputTokens: 200 })).toBe(
+			false,
+		);
+		expect(tracker.final({ turnId: "t1", origin: ORIGIN, role: "assistant", text: "late reply", final: true })).toBe(
+			false,
+		);
+		expect(only(tracker)).toMatchObject({ outcome: "failed", toolCalls: 4, outputTokens: 80 });
+		expect(only(tracker).finishedAt).toBe(time.now() - 1000);
+	});
+
 	test("finished turns persist for ten minutes and then leave", () => {
 		const time = clock();
 		const tracker = new TurnTracker(time.now);
@@ -107,6 +132,38 @@ describe("TurnTracker", () => {
 		time.advance(1);
 		expect(tracker.prune()).toBe(true);
 		expect(tracker.list()).toHaveLength(0);
+	});
+
+	test("stalled rows expire from console retention without being represented as finished", () => {
+		const time = clock();
+		const tracker = new TurnTracker(time.now);
+		tracker.progress({ turnId: "stuck", origin: ORIGIN, elapsedMs: 1000, toolCalls: 2, outputTokens: 20 });
+		time.advance(TURN_STALLED_RETENTION_MS);
+		expect(tracker.prune()).toBe(false);
+		time.advance(1);
+		expect(tracker.stateOf(only(tracker))).toBe("stalled");
+		expect(tracker.prune()).toBe(true);
+		expect(tracker.list()).toHaveLength(0);
+		expect(tracker.runningCount).toBe(0);
+		expect(tracker.stalledCount).toBe(0);
+	});
+
+	test("continuing heartbeats keep a long-running turn visible and working", () => {
+		const time = clock();
+		const tracker = new TurnTracker(time.now);
+		tracker.progress({ turnId: "long", origin: ORIGIN, elapsedMs: 1000, toolCalls: 1, outputTokens: 5 });
+		time.advance(TURN_STALLED_RETENTION_MS - 1);
+		tracker.progress({
+			turnId: "long",
+			origin: ORIGIN,
+			elapsedMs: TURN_STALLED_RETENTION_MS,
+			toolCalls: 20,
+			outputTokens: 500,
+		});
+		expect(tracker.prune()).toBe(false);
+		expect(only(tracker).toolCalls).toBe(20);
+		expect(tracker.runningCount).toBe(1);
+		expect(tracker.stalledCount).toBe(0);
 	});
 
 	test("live turns sort oldest first and finished turns newest first, after them", () => {
@@ -125,6 +182,7 @@ describe("TurnTracker", () => {
 		tracker.progress({ turnId: "t1", origin: ORIGIN, elapsedMs: 1000, toolCalls: 1, outputTokens: 1 });
 		tracker.clear();
 		expect(tracker.list()).toHaveLength(0);
-		expect(tracker.activeCount).toBe(0);
+		expect(tracker.runningCount).toBe(0);
+		expect(tracker.stalledCount).toBe(0);
 	});
 });

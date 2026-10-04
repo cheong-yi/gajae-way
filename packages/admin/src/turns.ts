@@ -26,6 +26,8 @@ export const TURN_CEILING_MS = 300_000;
 export const TURN_STALL_MS = 45_000;
 /** How long a finished turn stays on the Live work panel. */
 export const TURN_RETENTION_MS = 600_000;
+/** How long a stalled turn stays visible after its last heartbeat. */
+export const TURN_STALLED_RETENTION_MS = 600_000;
 
 export type TurnState = "running" | "stalled" | "finished";
 
@@ -69,6 +71,8 @@ export class TurnTracker {
 	progress(payload: ChatProgressPayload): boolean {
 		const at = this.#now();
 		const existing = this.#turns.get(payload.turnId);
+		// A late heartbeat cannot reverse an authoritative terminal event.
+		if (existing?.finishedAt !== undefined) return false;
 		this.#turns.set(payload.turnId, {
 			turnId: payload.turnId,
 			origin: payload.origin,
@@ -92,6 +96,9 @@ export class TurnTracker {
 		if (!message.final) return false;
 		const at = this.#now();
 		const existing = this.#turns.get(message.turnId);
+		// Duplicate/late terminal events must not rewrite the recorded outcome or
+		// extend its display retention window.
+		if (existing?.finishedAt !== undefined) return false;
 		this.#turns.set(message.turnId, {
 			turnId: message.turnId,
 			origin: message.origin,
@@ -109,12 +116,14 @@ export class TurnTracker {
 		return true;
 	}
 
-	/** Drop finished turns past the retention window. Returns true when something was dropped. */
+	/** Drop only console rows past their display window; this never settles work or alters durable history. */
 	prune(): boolean {
 		const at = this.#now();
 		let dropped = false;
 		for (const [turnId, turn] of this.#turns) {
-			if (turn.finishedAt !== undefined && at - turn.finishedAt > TURN_RETENTION_MS) {
+			const finishedExpired = turn.finishedAt !== undefined && at - turn.finishedAt > TURN_RETENTION_MS;
+			const stalledExpired = turn.finishedAt === undefined && at - turn.lastEventAt > TURN_STALLED_RETENTION_MS;
+			if (finishedExpired || stalledExpired) {
 				this.#turns.delete(turnId);
 				dropped = true;
 			}
@@ -142,9 +151,17 @@ export class TurnTracker {
 		return [...live, ...done];
 	}
 
-	get activeCount(): number {
+	/** Turns with recent heartbeats; stalled observations are excluded. */
+	get runningCount(): number {
 		let count = 0;
-		for (const turn of this.#turns.values()) if (turn.finishedAt === undefined) count += 1;
+		for (const turn of this.#turns.values()) if (this.stateOf(turn) === "running") count += 1;
+		return count;
+	}
+
+	/** Turns with no heartbeat beyond the liveness threshold, still unresolved. */
+	get stalledCount(): number {
+		let count = 0;
+		for (const turn of this.#turns.values()) if (this.stateOf(turn) === "stalled") count += 1;
 		return count;
 	}
 }
