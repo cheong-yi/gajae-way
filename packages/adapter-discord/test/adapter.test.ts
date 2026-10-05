@@ -218,8 +218,45 @@ test("LRU idempotency accepts each id once and evicts least recent ids", () => {
 });
 
 test("chunks Discord messages at the 2000 character limit", () => {
+	expect(chunkDiscordMessage("")).toEqual([""]);
 	const chunks = chunkDiscordMessage("x".repeat(4_001));
 	expect(chunks.map((chunk) => chunk.length)).toEqual([2_000, 2_000, 1]);
+});
+
+test("keeps valid Discord timestamp tags whole when chunking", () => {
+	const styles = ["", ":t", ":T", ":d", ":D", ":f", ":F", ":R"];
+	for (const style of styles) {
+		const tag = `<t:1767225600${style}>`;
+		const text = `${"x".repeat(1_998)}${tag}tail`;
+		const chunks = chunkDiscordMessage(text);
+		expect(chunks.join("")).toBe(text);
+		expect(chunks.every((chunk) => chunk.length <= 2_000)).toBe(true);
+		expect(chunks[0]).toBe("x".repeat(1_998));
+		expect(chunks[1]?.startsWith(tag)).toBe(true);
+	}
+
+	const endsAtBoundary = `${"x".repeat(1_993)}<t:0:f>tail`;
+	expect(chunkDiscordMessage(endsAtBoundary)[0]).toBe(`${"x".repeat(1_993)}<t:0:f>`);
+	const adjacent = `${"x".repeat(1_996)}<t:1><t:2:F>tail`;
+	const adjacentChunks = chunkDiscordMessage(adjacent);
+	expect(adjacentChunks.join("")).toBe(adjacent);
+	expect(adjacentChunks[0]).toBe("x".repeat(1_996));
+
+	const earlierTag = `<t:0>${"x".repeat(1_992)}`;
+	const laterTag = `${earlierTag}<t:1767225600:f>tail`;
+	const laterChunks = chunkDiscordMessage(laterTag);
+	expect(laterChunks[0]).toBe(earlierTag);
+	expect(laterChunks[1]).toBe("<t:1767225600:f>tail");
+	expect(laterChunks.join("")).toBe(laterTag);
+});
+
+test("leaves malformed and incomplete timestamp-like text unchanged", () => {
+	for (const suffix of ["<t:1767225600:z>tail", "<t:1767225600:f", "<t:not-an-epoch:f>"]) {
+		const text = `${"x".repeat(1_998)}${suffix}`;
+		const chunks = chunkDiscordMessage(text);
+		expect(chunks.join("")).toBe(text);
+		expect(chunks.every((chunk) => chunk.length <= 2_000)).toBe(true);
+	}
 });
 
 test("settles a delivery after sending all chunks", async () => {

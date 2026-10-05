@@ -409,8 +409,21 @@ export async function transcribeIfVoice(
 export function chunkDiscordMessage(text: string): string[] {
 	if (text.length === 0) return [""];
 	const chunks: string[] = [];
-	for (let offset = 0; offset < text.length; offset += DISCORD_MESSAGE_LIMIT) {
-		chunks.push(text.slice(offset, offset + DISCORD_MESSAGE_LIMIT));
+	const timestampPattern = /<t:(-?\d{1,16})(?::[tTdDfFR])?>/g;
+	for (let offset = 0; offset < text.length; ) {
+		let end = Math.min(offset + DISCORD_MESSAGE_LIMIT, text.length);
+		// A recognized tag is at most 23 characters; inspect only this chunk and its boundary.
+		const window = text.slice(offset, end + 23);
+		for (const timestamp of window.matchAll(timestampPattern)) {
+			const start = offset + timestamp.index;
+			if (start >= end) break;
+			if (start + timestamp[0].length > end && Number.isSafeInteger(Number(timestamp[1])) && start > offset) {
+				end = start;
+				break;
+			}
+		}
+		chunks.push(text.slice(offset, end));
+		offset = end;
 	}
 	return chunks;
 }

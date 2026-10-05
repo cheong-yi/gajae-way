@@ -2871,6 +2871,11 @@ export function currentConversationNotice(origin: OriginRef): string {
 						: "Threaded replies: start a reply part with [REPLY:<message id>] to answer that specific message; the token is routing metadata and never appears in the delivered text. Message ids are in each incoming message header (msg:<id>). When the message you are answering is itself inside a thread, target the thread's parent message id so your answer lands in that thread instead of the conversation root.",
 				]
 			: []),
+		...(origin.platform === "discord"
+			? [
+					"For event times with a known timezone, use `<t:UNIX:f>` (integer Unix epoch seconds) for viewer-local date and time; verify conversion with a tool when needed. Never guess a timezone or epoch. Do not convert ordinary durations or ambiguous dates. Preserve exact quoted evidence, code, and commands.",
+				]
+			: []),
 		...(isChatPlatform(origin.platform)
 			? [
 					"Handoffs: when the work belongs to another conversation, make the FIRST line of your final reply [HANDOFF:<target>] (a configured handoff alias or an origin such as discord:<channel id>) and write below it what that conversation's session needs to know and do. That session answers there; this conversation only gets a pointer. A handoff grants the other session nothing it does not already have, chains stop after 2 hops, and a target already in the chain is refused.",

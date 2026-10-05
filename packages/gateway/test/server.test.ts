@@ -9,7 +9,7 @@ import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
-import { type GatewayServer, startUnixServer } from "../src/server/server";
+import { currentConversationNotice, type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
 import { ACK_TIMEOUT_MS, DeliveryLedger } from "../src/store/ledger";
 import {
@@ -28,6 +28,17 @@ afterEach(async () => {
 	workSessionIds.clear();
 	if (directory) await rm(directory, { recursive: true, force: true });
 	directory = "";
+});
+
+test("Discord event-time guidance is platform-only and uses viewer-local timestamps", () => {
+	const discord = currentConversationNotice({ platform: "discord", kind: "dm", conversationId: "c", peerId: "p" });
+	const loopback = currentConversationNotice({ platform: "loopback", kind: "loopback", conversationId: "loopback" });
+	expect(discord).toContain("<t:UNIX:f>");
+	expect(discord).toContain("integer Unix epoch seconds");
+	expect(discord).toContain("Never guess a timezone or epoch");
+	expect(discord).toContain("Do not convert ordinary durations or ambiguous dates");
+	expect(discord).not.toBe(loopback);
+	expect(loopback).not.toContain("<t:UNIX:f>");
 });
 
 async function connect(
@@ -2349,7 +2360,7 @@ test("a fresh session's first turn carries recent conversation history, a later 
 			originKey: key,
 			authorId: "owner",
 			authorName: "bellman",
-			body: `earlier message ${i}`,
+			body: i === 2 ? "earlier message 2 at <t:1767225600:f>" : `earlier message ${i}`,
 			receivedAt: new Date(Date.now() - 60_000 * (4 - i)).toISOString(),
 		});
 	database.contextRecord({
@@ -2383,6 +2394,7 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	for (let attempt = 0; attempt < 400 && turns.length === 0; attempt++) await Bun.sleep(10);
 	expect(turns[0]).toContain("[Recent conversation history");
 	expect(turns[0]).toContain("earlier message 2");
+	expect(turns[0]).toContain("earlier message 2 at <t:1767225600:f>");
 	// A replayed attachment keeps its label but never its url: the model must not
 	// re-fetch a days-old screenshot and treat it as the current message.
 	expect(turns[0]).toContain("[image · shot.png · 20.1 KB · past attachment; not part of this message, do not fetch]");
