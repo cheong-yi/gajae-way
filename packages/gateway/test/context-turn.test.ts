@@ -534,3 +534,130 @@ test("gateway startup prunes old consumed context even when the database was qui
 	inspected.close();
 	client.close();
 });
+
+function unreadBlock(text: string): string {
+	const start = text.indexOf("[Unread messages in this conversation since your last reply]");
+	if (start < 0) return "";
+	const end = text.indexOf("\n\n", start);
+	return text.slice(start, end < 0 ? undefined : end);
+}
+
+test("issue #409: /new carries the messages of turns that failed after the last answer", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			if (text.includes("will fail")) throw new Error("intentional failure");
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+	const reset = async (id: string) => {
+		send(client, id, "/new");
+		await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === id));
+	};
+
+	send(client, "msg1", "message one - answered");
+	await waitUntil(() => texts.length === 1);
+	await reset("reset-1");
+	send(client, "msg2", "message two - will fail");
+	await waitUntil(() => texts.length === 2);
+	await waitUntil(() => client.frames.some((frame) => JSON.stringify(frame).includes("[turn failed]")));
+	await reset("reset-2");
+	send(client, "msg3", "message three - after reset");
+	await waitUntil(() => texts.length === 3);
+
+	const unread = unreadBlock(texts[2]!);
+	expect(unread).toContain("message two - will fail");
+	expect(unread).not.toContain("message one - answered");
+	expect(texts[2]).not.toContain("expired outside floor");
+	client.close();
+});
+
+test("issue #409: /new after every turn was answered carries nothing", async () => {
+	const gatewayConfig = await config();
+	const database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			return "ok";
+		},
+	});
+	const { client } = await start(gatewayConfig, database, sessionPort);
+
+	send(client, "msg1", "message one");
+	await waitUntil(() => texts.length === 1);
+	send(client, "reset-command", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
+	send(client, "msg2", "message two - after reset");
+	await waitUntil(() => texts.length === 2);
+
+	expect(unreadBlock(texts[1]!)).toBe("");
+	client.close();
+});
+
+test("reset carry boundary: the fresh prompt carries the failed ask once and never unrelated pre-reset context", async () => {
+	const gatewayConfig = await config();
+	let database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	const texts: string[] = [];
+	let attempts = 0;
+	const sessionPort = sessionPortFromScript({
+		bind: async (key, epoch) => ({ sessionId: `session-${key}-${epoch}` }),
+		respond: async (_session, text) => {
+			texts.push(text);
+			if (attempts++ === 0) throw new Error("intentional failure");
+			return "ok";
+		},
+	});
+	let { client } = await start(gatewayConfig, database, sessionPort);
+
+	send(client, "ask-a", "failed owner ask A");
+	await waitUntil(() => texts.length === 1);
+	await waitUntil(() => client.frames.some((frame) => JSON.stringify(frame).includes("[turn failed]")));
+	// Carry needs the durable failed-trigger state, not just the failure notice.
+	await waitUntil(() => {
+		const raw = new Database(gatewayConfig.dbPath, { readonly: true });
+		const marker = raw.query("SELECT 1 FROM meta WHERE key LIKE 'turn-failed:%'").get();
+		const done = raw
+			.query<{ one: number }, []>("SELECT 1 AS one FROM inbound_messages WHERE message_id = 'ask-a' AND state = 'done'")
+			.get();
+		raw.close();
+		return Boolean(marker && done);
+	});
+
+	database.contextRecord({
+		messageId: "unrelated-b",
+		originKey: ORIGIN_KEY,
+		authorId: "author-b",
+		authorName: "bystander",
+		body: "unrelated chatter B",
+	});
+
+	send(client, "reset-command", "/new");
+	await waitUntil(() => client.frames.some((frame) => frame.type === "response" && frame.id === "reset-command"));
+	client.close();
+	await server?.stop();
+	server = undefined;
+
+	database = await GatewayDatabase.open(gatewayConfig.dbPath);
+	({ client } = await start(gatewayConfig, database, sessionPort));
+	send(client, "ask-c", "next owner ask C");
+	await waitUntil(() => texts.length === 2);
+	const prompt = texts[1]!;
+	expect(prompt.split("failed owner ask A").length - 1).toBe(1);
+	expect(unreadBlock(prompt)).toContain("failed owner ask A");
+	expect(prompt).not.toContain("unrelated chatter B");
+	expect(database.contextDiagnostics(ORIGIN_KEY).floorAt).toBeString();
+
+	send(client, "ask-d", "next owner ask D");
+	await waitUntil(() => texts.length === 3);
+	expect(texts[2]).not.toContain("failed owner ask A");
+	expect(texts[2]).not.toContain("unrelated chatter B");
+	await waitUntil(() => database.contextUnread(ORIGIN_KEY).length === 0);
+	client.close();
+});

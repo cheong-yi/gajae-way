@@ -8,6 +8,7 @@ import {
 	CONVERSATION_DIFF_MAX_AGE_MS,
 	CONVERSATION_DIFF_MAX_ROWS,
 	GatewayDatabase,
+	RETENTION_BATCH_ROWS,
 } from "../src/store/db";
 
 const ORIGIN_KEY = "discord/channel/context-diff";
@@ -198,4 +199,163 @@ test("recentInbound reads people's messages oldest-first and consumes nothing", 
 	// A reset floor hides everything before it.
 	db.contextSetFloor(ORIGIN_KEY, new Date(NOW.getTime() - 1_500).toISOString());
 	expect(db.recentInbound(ORIGIN_KEY, 10, since).length).toBe(0);
+});
+
+test("batched DELETE processes many consumed rows correctly", async () => {
+	const db = await open();
+	const now = new Date();
+
+	// Create more than RETENTION_BATCH_ROWS rows to test batching in the DELETE phase.
+	// These are older than CONVERSATION_DIFF_MAX_AGE_MS so they'll be expired,
+	// and older than CONVERSATION_CONTEXT_RETENTION_MS so they'll be deleted in batches.
+	const staleCount = RETENTION_BATCH_ROWS * 2 + 100;
+	const staleTimestamp = new Date(now.getTime() - CONVERSATION_CONTEXT_RETENTION_MS - 60_000).toISOString();
+	for (let i = 0; i < staleCount; i++) {
+		record(db, `stale-${String(i).padStart(5, "0")}`, `will-be-deleted-${i}`, staleTimestamp);
+	}
+
+	// Create row that is old enough to expire but not old enough to delete.
+	// Must be > 6 hours old (to expire) but < 7 days old (to not be deleted).
+	const expiredButKeptTimestamp = new Date(
+		now.getTime() - CONVERSATION_DIFF_MAX_AGE_MS - 60_000, // 6 hours + 1 min
+	).toISOString();
+	record(db, "expired-kept", "gets expired but stays within retention", expiredButKeptTimestamp);
+
+	// Call contextMaintain
+	const result = db.contextMaintain(now);
+
+	// All stale rows (older than 7 days) should be deleted
+	expect(result.deleted).toBe(staleCount);
+	// Rows expired include both stale and expired-kept
+	expect(result.expired).toBe(staleCount + 1);
+
+	// contextUnread returns only unconsumed rows (consumed_at IS NULL)
+	// All our rows are either deleted or expired (consumed_at IS NOT NULL)
+	const remaining = db.contextUnread(ORIGIN_KEY);
+	expect(remaining.length).toBe(0);
+
+	// Raw query should show 1 row: the expired-kept row (expired but not deleted)
+	const raw = new Database(join(directory, "gateway.db"), { readonly: true });
+	const count = raw.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM conversation_context").get()?.n;
+	const consumed = raw
+		.query<{ message_id: string }, []>("SELECT message_id FROM conversation_context WHERE consumed_at IS NOT NULL")
+		.all();
+	raw.close();
+	expect(count).toBe(1);
+	expect(consumed[0]?.message_id).toBe("expired-kept");
+});
+
+/** A real failed association: queued trigger, bound, accepted, completed as turn_failed, then marked for /new carry. */
+function recordFailedAsk(db: GatewayDatabase, messageId: string, opRef: string, receivedAt: string): void {
+	db.contextRecord({
+		messageId,
+		originKey: ORIGIN_KEY,
+		authorId: "author-owner",
+		authorName: "owner",
+		body: `failed ask ${messageId}`,
+		receivedAt,
+	});
+	db.inboundEnqueue({
+		messageId,
+		originKey: ORIGIN_KEY,
+		originRefJson: JSON.stringify({ platform: "discord", kind: "channel", conversationId: "context-diff" }),
+		body: `failed ask ${messageId}`,
+		receivedAt,
+	});
+	db.inboundBindTurn({
+		messageId,
+		originKey: ORIGIN_KEY,
+		epoch: 0,
+		opRef,
+		sessionId: "session-0",
+		dispatchedAt: receivedAt,
+	});
+	db.inboundTurnAccept(opRef);
+	expect(db.inboundTurnComplete(opRef, "turn_failed")).toBe(1);
+	db.markTurnFailed(ORIGIN_KEY, opRef, receivedAt);
+}
+
+test("reset carry boundary keeps the true floor and carries only the failed ask across it", async () => {
+	const db = await open();
+	const path = join(directory, "gateway.db");
+	const floor = NOW.toISOString();
+	recordFailedAsk(db, "ask-a", "gw-p-ask-a", new Date(NOW.getTime() - 3_000).toISOString());
+	record(db, "unrelated-b", "unrelated chatter B", new Date(NOW.getTime() - 2_000).toISOString());
+	db.withTransaction(() => db.contextSetFloor(ORIGIN_KEY, floor));
+	db.close();
+	database = undefined;
+
+	const restarted = await GatewayDatabase.open(path);
+	database = restarted;
+	expect(restarted.contextFloorAt(ORIGIN_KEY)).toBe(floor);
+	const state = new Database(path, { readonly: true });
+	const floorRow = state
+		.query<{ floor_at: string; floor_row_id: number }, [string]>(
+			"SELECT floor_at, floor_row_id FROM conversation_context_state WHERE origin_key = ?",
+		)
+		.get(ORIGIN_KEY);
+	state.close();
+	expect(floorRow?.floor_at).toBe(floor);
+	expect(floorRow?.floor_row_id).toBe(2);
+
+	const since = new Date(NOW.getTime() - 60_000).toISOString();
+	expect(restarted.recentConversation(ORIGIN_KEY, "context-diff", 50, since)).toEqual([]);
+	expect(restarted.recentInbound(ORIGIN_KEY, 50, since)).toEqual([]);
+
+	record(restarted, "trigger-c", "new trigger C", new Date(NOW.getTime() + 1_000).toISOString());
+	const window = restarted.contextWindow(ORIGIN_KEY, "trigger-c", new Date(NOW.getTime() + 1_000));
+	expect(window.rows.map((row) => row.message_id)).toEqual(["ask-a"]);
+	expect(window.diagnostics.floorAt).toBe(floor);
+
+	restarted.contextCommitWindow(ORIGIN_KEY, [...window.selectedMessageIds, "trigger-c"], window.omissionRevision);
+	expect(restarted.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).toEqual([]);
+	record(restarted, "trigger-d", "later trigger D", new Date(NOW.getTime() + 2_000).toISOString());
+	const next = restarted.contextWindow(ORIGIN_KEY, "trigger-d", new Date(NOW.getTime() + 2_000));
+	expect(next.rows.map((row) => row.message_id)).toEqual([]);
+});
+
+test("reset carry boundary expires late pre-reset rows and enforces the count limit on carry", async () => {
+	const db = await open();
+	const floor = NOW.toISOString();
+	recordFailedAsk(db, "ask-a", "gw-p-ask-a", new Date(NOW.getTime() - 3_000).toISOString());
+	record(db, "unrelated-b", "unrelated chatter B", new Date(NOW.getTime() - 2_000).toISOString());
+	db.withTransaction(() => db.contextSetFloor(ORIGIN_KEY, floor));
+
+	record(
+		db,
+		"late-pre-reset",
+		"recorded after reset, stamped before it",
+		new Date(NOW.getTime() - 1_000).toISOString(),
+	);
+	record(db, "fresh-d", "post reset D", new Date(NOW.getTime() + 1_000).toISOString());
+	record(db, "fresh-e", "post reset E", new Date(NOW.getTime() + 2_000).toISOString());
+	record(db, "trigger-f", "trigger F", new Date(NOW.getTime() + 3_000).toISOString());
+
+	const window = db.contextWindow(ORIGIN_KEY, "trigger-f", new Date(NOW.getTime() + 3_000), 2);
+	expect(window.rows.map((row) => row.message_id)).toEqual(["fresh-d", "fresh-e"]);
+	// unrelated-b expired at reset, the late pre-reset-stamped row expired at the window.
+	expect(window.expiredCount).toBe(2);
+	expect(window.truncatedCount).toBe(1);
+	expect(db.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).not.toContain("ask-a");
+
+	db.contextCommitWindow(ORIGIN_KEY, [...window.selectedMessageIds, "trigger-f"], window.omissionRevision);
+	expect(db.contextWindow(ORIGIN_KEY, "trigger-g", new Date(NOW.getTime() + 4_000), 2).rows).toEqual([]);
+});
+
+test("reset carry boundary applies the age bound to carried rows", async () => {
+	const db = await open();
+	const floor = NOW.toISOString();
+	recordFailedAsk(db, "ask-a", "gw-p-ask-a", new Date(NOW.getTime() - 3_000).toISOString());
+	db.withTransaction(() => db.contextSetFloor(ORIGIN_KEY, floor));
+	record(db, "fresh-d", "post reset D", new Date(NOW.getTime() + 29_500).toISOString());
+	record(db, "trigger-e", "trigger E", new Date(NOW.getTime() + 30_000).toISOString());
+
+	const now = new Date(NOW.getTime() + 30_000);
+	const generous = db.contextWindow(ORIGIN_KEY, "trigger-e", now, CONVERSATION_DIFF_MAX_ROWS, 60_000);
+	expect(generous.rows.map((row) => row.message_id)).toEqual(["ask-a", "fresh-d"]);
+
+	const strict = db.contextWindow(ORIGIN_KEY, "trigger-e", now, CONVERSATION_DIFF_MAX_ROWS, 1_000);
+	expect(strict.rows.map((row) => row.message_id)).toEqual(["fresh-d"]);
+	expect(strict.expiredCount).toBe(1);
+	expect(db.contextUnread(ORIGIN_KEY).map((row) => row.message_id)).not.toContain("ask-a");
 });

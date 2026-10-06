@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { dirname, isAbsolute, normalize } from "node:path";
 import {
@@ -49,6 +50,21 @@ export class BrokerAuthorityError extends Error {
 	) {
 		super(`broker authority: ${code}`);
 		this.name = "BrokerAuthorityError";
+	}
+}
+
+/**
+ * Two spellings of one directory are the same repo. Bindings recorded before the
+ * persona workspace was canonicalized carry the symlink path, while the runtime now
+ * asks with the resolved one; comparing resolved paths keeps those rows owned
+ * without rewriting immutable broker provenance.
+ */
+function sameRepo(recorded: string, requested: string): boolean {
+	if (recorded === requested) return true;
+	try {
+		return realpathSync(recorded) === realpathSync(requested);
+	} catch {
+		return false;
 	}
 }
 
@@ -564,6 +580,11 @@ export interface InboundMessageRow {
 /** Why a closed turn has no terminal delivery; recorded as `{"none": reason}`. */
 export type TerminalUnlinkedReason = "silent" | "loopback" | "turn_failed" | "retired" | "no_delivery";
 
+/** Meta key prefix of the per-origin failed-turn markers that `/new` carries over (#409). */
+function failedTurnKeyPrefix(originKey: string): string {
+	return `turn-failed:${originKey}:`;
+}
+
 /** Delivery ids that answered a turn, from its `terminal_delivery_id` JSON; empty for a sentinel or NULL. */
 export function terminalDeliveryIds(json: string | null): string[] {
 	if (!json) return [];
@@ -596,7 +617,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 31;
+const LATEST_SCHEMA_VERSION = 32;
 
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
@@ -974,7 +995,7 @@ export class GatewayDatabase {
 				previous &&
 				(previous.origin_key !== binding.originKey ||
 					previous.epoch !== binding.epoch ||
-					previous.repo !== binding.repo)
+					!sameRepo(previous.repo, binding.repo))
 			)
 				throw new BrokerAuthorityError("unowned_session");
 			const current = this.getSessionRecord(binding.originKey);
@@ -1001,7 +1022,7 @@ export class GatewayDatabase {
 				"SELECT origin_key, epoch, repo FROM broker_owned_bindings WHERE authority_key = ? AND session_id = ?",
 			)
 			.get(brokerAuthorityKey(authority), sessionId);
-		if (!row || row.repo !== repo) throw new BrokerAuthorityError("unowned_session");
+		if (!row || !sameRepo(row.repo, repo)) throw new BrokerAuthorityError("unowned_session");
 		return { sessionId, originKey: row.origin_key, epoch: row.epoch, repo: row.repo, authority };
 	}
 
@@ -1200,6 +1221,28 @@ export class GatewayDatabase {
 			)
 			.get(laneKey);
 		return row ? this.workAttemptGet(row.op_ref) : undefined;
+	}
+
+	/**
+	 * Gets the job ID for a given work attempt opRef (issue #407).
+	 */
+	workAttemptJobId(opRef: string): string | undefined {
+		const row = this.#database
+			.query<{ job_id: string }, [string]>("SELECT job_id FROM work_attempt_runtime WHERE op_ref = ?")
+			.get(opRef);
+		return row?.job_id;
+	}
+
+	/**
+	 * Quarantines an invalid work attempt to exclude it from future recovery sweeps (issue #407).
+	 * Called during recovery when an attempt fails validation.
+	 */
+	workAttemptQuarantineInvalid(jobId: string): void {
+		this.#database
+			.query(
+				"INSERT INTO broker_quarantine(kind, subject_id, cutover_id) VALUES (?, ?, ?) ON CONFLICT(kind, subject_id) DO NOTHING",
+			)
+			.run("work", jobId, "recovery-auto-quarantine");
 	}
 
 	#laneReportGetInside(reportId: string): LaneReportRow | undefined {
@@ -2939,7 +2982,7 @@ export class GatewayDatabase {
 		body: string;
 		receivedAt?: string;
 	}): void {
-		const inserted = this.#database
+		this.#database
 			.query(
 				"INSERT INTO conversation_context (message_id, origin_key, author_id, author_name, body, received_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(message_id) DO NOTHING",
 			)
@@ -2951,7 +2994,6 @@ export class GatewayDatabase {
 				row.body,
 				row.receivedAt ?? new Date().toISOString(),
 			);
-		if (inserted.changes > 0) this.contextMaintain();
 	}
 
 	/**
@@ -2990,9 +3032,16 @@ export class GatewayDatabase {
 				expired += group.count;
 			}
 			const deleteCutoff = new Date(now.getTime() - retentionMs).toISOString();
-			const deleted = this.#database
-				.query("DELETE FROM conversation_context WHERE consumed_at IS NOT NULL AND received_at < ?")
-				.run(deleteCutoff).changes;
+			let deleted = 0;
+			while (true) {
+				const batch = this.#database
+					.query(
+						"DELETE FROM conversation_context WHERE rowid IN (SELECT rowid FROM conversation_context WHERE consumed_at IS NOT NULL AND received_at < ? LIMIT ?)",
+					)
+					.run(deleteCutoff, RETENTION_BATCH_ROWS).changes;
+				deleted += batch;
+				if (batch < RETENTION_BATCH_ROWS) break;
+			}
 			return { expired, deleted };
 		});
 	}
@@ -3143,57 +3192,49 @@ export class GatewayDatabase {
 				.filter((value): value is string => value !== undefined && value !== null)
 				.sort()
 				.at(-1) as string;
-			const expired = this.#contextAggregate(
-				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND (received_at < ? OR rowid <= ?)",
-				[originKey, triggerMessageId, effectiveFloor, floorRowId],
-			);
+			// One eligibility rule for selection, truncation and expiry: unread, not
+			// the current trigger, inside the age bound, and either a carried
+			// survivor at or below the true reset floor (#413) or at/after the
+			// effective floor. A row stamped before the floor but recorded after
+			// reset carries a post-reset rowid, so it is not carry: it expires.
+			const eligible =
+				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND (rowid <= ? OR received_at >= ?)";
+			const eligibleParams: (string | number)[] = [originKey, triggerMessageId, ageFloor, floorRowId, effectiveFloor];
+			const expireWhere =
+				"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND (received_at < ? OR (rowid > ? AND received_at < ?))";
+			const expireParams: (string | number)[] = [originKey, triggerMessageId, ageFloor, floorRowId, effectiveFloor];
+			const expired = this.#contextAggregate(expireWhere, expireParams);
 			if (expired.count > 0) {
 				this.#database
-					.query(
-						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND (received_at < ? OR rowid <= ?)",
-					)
-					.run(now.toISOString(), originKey, triggerMessageId, effectiveFloor, floorRowId);
+					.query(`UPDATE conversation_context SET consumed_at = ? WHERE ${expireWhere}`)
+					.run(now.toISOString(), ...expireParams);
 			}
 
 			const newest = this.#database
-				.query<ConversationContextRow & { row_id: number }, [string, string, string, number, number]>(
-					"SELECT rowid AS row_id, message_id, author_id, author_name, body, received_at FROM conversation_context WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND rowid > ? ORDER BY received_at DESC, message_id DESC, rowid DESC LIMIT ?",
+				.query<ConversationContextRow & { row_id: number }, (string | number)[]>(
+					`SELECT rowid AS row_id, message_id, author_id, author_name, body, received_at FROM conversation_context WHERE ${eligible} ORDER BY received_at DESC, message_id DESC, rowid DESC LIMIT ?`,
 				)
-				.all(originKey, triggerMessageId, effectiveFloor, floorRowId, limit);
+				.all(...eligibleParams, limit);
 			const boundary = newest[newest.length - 1];
-			const truncated = boundary
-				? this.#contextAggregate(
-						"origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND (received_at < ? OR (received_at = ? AND message_id < ?) OR (received_at = ? AND message_id = ? AND rowid < ?))",
-						[
-							originKey,
-							triggerMessageId,
-							effectiveFloor,
-							boundary.received_at,
-							boundary.received_at,
-							boundary.message_id,
-							boundary.received_at,
-							boundary.message_id,
-							boundary.row_id,
-						],
-					)
-				: { count: 0, oldest: null, newest: null };
-			if (boundary && truncated.count > 0) {
-				this.#database
-					.query(
-						"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND message_id <> ? AND received_at >= ? AND (received_at < ? OR (received_at = ? AND message_id < ?) OR (received_at = ? AND message_id = ? AND rowid < ?))",
-					)
-					.run(
-						now.toISOString(),
-						originKey,
-						triggerMessageId,
-						effectiveFloor,
+			const olderThanBoundary =
+				"AND (received_at < ? OR (received_at = ? AND message_id < ?) OR (received_at = ? AND message_id = ? AND rowid < ?))";
+			const boundaryParams: (string | number)[] = boundary
+				? [
 						boundary.received_at,
 						boundary.received_at,
 						boundary.message_id,
 						boundary.received_at,
 						boundary.message_id,
 						boundary.row_id,
-					);
+					]
+				: [];
+			const truncated = boundary
+				? this.#contextAggregate(`${eligible} ${olderThanBoundary}`, [...eligibleParams, ...boundaryParams])
+				: { count: 0, oldest: null, newest: null };
+			if (boundary && truncated.count > 0) {
+				this.#database
+					.query(`UPDATE conversation_context SET consumed_at = ? WHERE ${eligible} ${olderThanBoundary}`)
+					.run(now.toISOString(), ...eligibleParams, ...boundaryParams);
 			}
 			this.#recordContextOmissions(originKey, expired, truncated, now.toISOString());
 			const pending = this.#pendingContextEvidence(originKey);
@@ -3215,30 +3256,84 @@ export class GatewayDatabase {
 		});
 	}
 
-	/** Establishes a durable reset floor and expires every pre-floor unread row. */
+	/** Records that a turn ended in failure, so a later `/new` can carry its unanswered messages (#409). */
+	markTurnFailed(originKey: string, opRef: string, at = new Date().toISOString()): void {
+		this.metaSet(`${failedTurnKeyPrefix(originKey)}${opRef}`, at);
+	}
+
+	/**
+	 * Establishes a durable reset floor and expires every pre-floor unread row,
+	 * except the unanswered tail: the messages of turns that failed after the
+	 * origin's last answered turn (each trigger plus the messages steered into
+	 * it), within the unread relevance window. A `/new` issued because turns kept
+	 * failing must not erase the asks those turns never answered (#409). Carried
+	 * rows are made unread again (a `[turn failed]` notice is not an answer), but
+	 * the floor stays true: `floor_at` is the reset timestamp and `floor_row_id`
+	 * the newest row present at reset. Only contextWindow treats a surviving
+	 * unread row at or below that rowid as carry; ordinary history readers keep
+	 * the strict boundary (#413). Failure markers for the origin are consumed
+	 * here.
+	 */
 	contextSetFloor(originKey: string, floorAt = new Date().toISOString()): void {
-		const floorRowId =
+		const maxRowId =
 			this.#database
 				.query<{ row_id: number }, [string]>(
 					"SELECT COALESCE(MAX(rowid), 0) AS row_id FROM conversation_context WHERE origin_key = ?",
 				)
 				.get(originKey)?.row_id ?? 0;
-		const expired = this.#contextAggregate(
-			"origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)",
-			[originKey, floorAt, floorRowId],
-		);
+		const carriedIds = this.#unansweredTailRowIds(originKey, floorAt);
+		const keep = carriedIds.length > 0 ? ` AND rowid NOT IN (${carriedIds.map(() => "?").join(",")})` : "";
+		const expireWhere = `origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)${keep}`;
+		const expireParams = [originKey, floorAt, maxRowId, ...carriedIds];
+		const expired = this.#contextAggregate(expireWhere, expireParams);
 		if (expired.count > 0)
 			this.#database
+				.query(`UPDATE conversation_context SET consumed_at = ? WHERE ${expireWhere}`)
+				.run(floorAt, ...expireParams);
+		if (carriedIds.length > 0)
+			this.#database
 				.query(
-					"UPDATE conversation_context SET consumed_at = ? WHERE origin_key = ? AND consumed_at IS NULL AND (received_at < ? OR rowid <= ?)",
+					`UPDATE conversation_context SET consumed_at = NULL WHERE rowid IN (${carriedIds.map(() => "?").join(",")})`,
 				)
-				.run(floorAt, originKey, floorAt, floorRowId);
+				.run(...carriedIds);
+		const prefix = failedTurnKeyPrefix(originKey);
+		this.#database.query("DELETE FROM meta WHERE key >= ? AND key < ?").run(prefix, `${prefix}\uffff`);
 		this.#database
 			.query(
 				"INSERT INTO conversation_context_state (origin_key, floor_at, floor_row_id) VALUES (?, ?, ?) ON CONFLICT(origin_key) DO UPDATE SET floor_at = excluded.floor_at, floor_row_id = excluded.floor_row_id",
 			)
-			.run(originKey, floorAt, floorRowId);
+			.run(originKey, floorAt, maxRowId);
 		this.#recordContextOmissions(originKey, expired, { count: 0, oldest: null, newest: null }, floorAt);
+	}
+
+	/** Context rowids (ascending) of failed turns after the last answered turn, inside the relevance window. */
+	#unansweredTailRowIds(originKey: string, floorAt: string): number[] {
+		const prefix = failedTurnKeyPrefix(originKey);
+		const failedOps = new Set(
+			this.#database
+				.query<{ key: string }, [string, string]>("SELECT key FROM meta WHERE key >= ? AND key < ?")
+				.all(prefix, `${prefix}\uffff`)
+				.map((row) => row.key.slice(prefix.length)),
+		);
+		if (failedOps.size === 0) return [];
+		const relevanceCutoff = new Date(Date.parse(floorAt) - CONVERSATION_DIFF_MAX_AGE_MS).toISOString();
+		const triggers = this.#database
+			.query<{ turn_op_ref: string }, [string, string, string]>(
+				"SELECT turn_op_ref FROM inbound_messages WHERE origin_key = ? AND turn_role = 'trigger' AND state = 'done' AND turn_op_ref IS NOT NULL AND received_at >= ? AND received_at < ? ORDER BY received_at, rowid",
+			)
+			.all(originKey, relevanceCutoff, floorAt);
+		const carryOps: string[] = [];
+		for (const { turn_op_ref: opRef } of triggers) {
+			if (failedOps.has(opRef)) carryOps.push(opRef);
+			else carryOps.length = 0;
+		}
+		if (carryOps.length === 0) return [];
+		return this.#database
+			.query<{ row_id: number }, (string | number)[]>(
+				`SELECT c.rowid AS row_id FROM conversation_context c WHERE c.origin_key = ? AND c.received_at >= ? AND c.received_at < ? AND c.message_id IN (SELECT message_id FROM inbound_messages WHERE origin_key = ? AND turn_op_ref IN (${carryOps.map(() => "?").join(",")})) ORDER BY c.rowid`,
+			)
+			.all(originKey, relevanceCutoff, floorAt, originKey, ...carryOps)
+			.map((row) => row.row_id);
 	}
 
 	/** Commits a successful/duplicate-safe turn cursor and acknowledges its omission notice atomically. */
@@ -5293,6 +5388,18 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(31, new Date().toISOString());
+			});
+		}
+		if (current < 32) {
+			// Issue #367: Add index to conversation_context (consumed_at, received_at) to support
+			// efficient batched retention DELETE and unconsumed GROUP BY scan in contextMaintain().
+			this.withTransaction(() => {
+				this.#database.exec(
+					"CREATE INDEX IF NOT EXISTS conversation_context_retention ON conversation_context (consumed_at, received_at)",
+				);
+				this.#database
+					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(32, new Date().toISOString());
 			});
 		}
 	}

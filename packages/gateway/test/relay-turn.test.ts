@@ -19,7 +19,8 @@ class FakeRelay implements SessionRelayStream {
 	closed = false;
 	#push: (line: string | null) => void = () => {};
 	#queue: Array<string | null> = [];
-	#waiters: Array<(line: string | null) => void> = [];
+	#waiters: Array<{ resolve: (line: string | null) => void; reject: (error: unknown) => void }> = [];
+	#failure: { readonly error: unknown } | undefined;
 
 	constructor(
 		readonly connectionId = "connection:1",
@@ -27,14 +28,17 @@ class FakeRelay implements SessionRelayStream {
 	) {
 		this.#push = (line) => {
 			const waiter = this.#waiters.shift();
-			if (waiter) waiter(line);
+			if (waiter) waiter.resolve(line);
 			else this.#queue.push(line);
 		};
 		const next = () =>
-			new Promise<string | null>((resolve) => {
-				const queued = this.#queue.shift();
-				if (queued !== undefined) resolve(queued);
-				else this.#waiters.push(resolve);
+			new Promise<string | null>((resolve, reject) => {
+				if (this.#failure) reject(this.#failure.error);
+				else {
+					const queued = this.#queue.shift();
+					if (queued !== undefined) resolve(queued);
+					else this.#waiters.push({ resolve, reject });
+				}
 			});
 		this.lines = {
 			[Symbol.asyncIterator]: () => ({
@@ -66,6 +70,11 @@ class FakeRelay implements SessionRelayStream {
 	/** The relay process ends (host hangup / crash). */
 	end(): void {
 		this.#push(null);
+	}
+	/** The host's line reader fails: `lines` rejects instead of ending. */
+	fail(error: unknown): void {
+		this.#failure = { error };
+		this.#waiters.shift()?.reject(error);
 	}
 
 	close(): void {
@@ -586,3 +595,95 @@ test("a gjc 0.16 textual refusal ('[Uncaught Exception] Error: endpoint_stale: â
 	expect(error).toBeInstanceOf(RelayRefusedError);
 	expect((error as RelayRefusedError).code).toBe("session_unavailable");
 });
+
+test("stream ending without hello fails fast (#410)", async () => {
+	const relay = new FakeRelay("connection:1", { hello: false });
+	const runner$1 = runner(() => relay, { helloTimeoutMs: 5_000 });
+	const attach = runner$1.attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
+	// End the stream without sending hello - should fail fast
+	relay.end();
+	const started = Date.now();
+	const error = await attach.catch((e: unknown) => e);
+	const elapsed = Date.now() - started;
+	expect(error).toBeInstanceOf(Error);
+	const message = (error as Error).message;
+	expect(message).toMatch(/host hello did not arrive after \d+ms \(stream_ended\)/);
+	// Should fail much faster than the hello timeout (5 seconds)
+	expect(elapsed).toBeLessThan(1_000);
+}, 10_000);
+
+test("an iterator that rejects before hello rejects attach with the host's own failure, closes, and releases its slot", async () => {
+	const original = new Error("host pipe broke");
+	const unhandled: unknown[] = [];
+	const onUnhandled = (reason: unknown) => {
+		unhandled.push(reason);
+	};
+	process.on("unhandledRejection", onUnhandled);
+	try {
+		const rejecting = new FakeRelay("connection:1", { hello: false });
+		let spawns = 0;
+		const tail = runner(() => (spawns++ === 0 ? rejecting : new FakeRelay()), {
+			helloTimeoutMs: 5_000,
+			maxTailProcesses: 1,
+		});
+		const attach = tail.attach({ sessionId: "s1", brokerGeneration: 1, repo: "/tmp/repo" });
+		rejecting.fail(original);
+		const started = Date.now();
+		const error = await attach.catch((e: unknown) => e);
+		const elapsed = Date.now() - started;
+		expect(error).toBe(original);
+		expect(elapsed).toBeLessThan(1_000);
+		expect(rejecting.closed).toBe(true);
+		// The slot the failed attach held must have been released.
+		const reopened = await tail.attach({ sessionId: "s2", brokerGeneration: 1, repo: "/tmp/repo" });
+		await reopened.close();
+		await Bun.sleep(20);
+		expect(unhandled).toEqual([]);
+	} finally {
+		process.off("unhandledRejection", onUnhandled);
+	}
+}, 10_000);
+
+test("a throw inside line processing before hello rejects attach with that same failure", async () => {
+	const fault = new Error("diagnostic sink exploded");
+	const relay = new FakeRelay("connection:1", { hello: false });
+	const attach = runner(() => relay, { helloTimeoutMs: 5_000 }).attach({
+		sessionId: "s1",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onDiagnostic: () => {
+			throw fault;
+		},
+	});
+	relay.host({ type: "event", kind: "mystery_frame", payload: {} });
+	const error = await attach.catch((e: unknown) => e);
+	expect(error).toBe(fault);
+	expect(relay.closed).toBe(true);
+}, 10_000);
+
+test("an iterator that rejects after hello reports the original failure, cleans up, and reopens", async () => {
+	const original = new Error("host pipe broke mid-turn");
+	const diagnostics: string[] = [];
+	const relays: FakeRelay[] = [];
+	const handle = await runner(
+		() => {
+			const relay = new FakeRelay(`connection:${relays.length + 1}`);
+			relays.push(relay);
+			return relay;
+		},
+		{ helloTimeoutMs: 5_000 },
+	).attach({
+		sessionId: "s1",
+		brokerGeneration: 1,
+		repo: "/tmp/repo",
+		onDiagnostic: (message) => {
+			diagnostics.push(message);
+		},
+	});
+	relays[0]!.fail(original);
+	await Bun.sleep(20);
+	expect(diagnostics).toContain(`tail_stream_error session=s1 detail=${original.message}`);
+	expect(relays[0]!.closed).toBe(true);
+	expect(relays.length).toBeGreaterThan(1);
+	await handle.close();
+}, 10_000);
