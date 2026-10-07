@@ -370,6 +370,8 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 	test("legacy schema is backed up before migrations 22-30 and authority adoption", async () => {
 		const f = await fixture();
 		const legacy = new Database(f.path);
+		// Subtract only v33 fixture objects before rewinding receipts; missing objects are fixture errors.
+		legacy.exec("DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks;");
 		for (const table of [
 			"inbound_messages",
 			"lane_jobs",
@@ -399,7 +401,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		if (report.mode !== "apply") throw new Error("wrong mode");
 		expect(report.census.schema).toBe(21);
 		expect(report.backup.schema).toBe(21);
-		expect(report.targetSchema).toBe(32);
+		expect(report.targetSchema).toBe(33);
 		const backup = new Database(f.backup, { readonly: true });
 		try {
 			expect(backup.query("SELECT MAX(version) AS version FROM schema_migrations").get()).toEqual({ version: 21 });
@@ -409,7 +411,7 @@ describe("offline authority command with kernel-exclusive gateway ownership", ()
 		}
 		const database = await GatewayDatabase.open(f.path);
 		try {
-			expect(database.schemaVersion).toBe(32);
+			expect(database.schemaVersion).toBe(33);
 			expect(database.inspectBrokerAuthority().authority).toEqual(report.targetAuthority);
 		} finally {
 			database.close();

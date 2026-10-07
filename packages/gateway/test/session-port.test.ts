@@ -1,11 +1,18 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CliRunner, GjcCliError } from "@gajae-gateway/subsession";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
-import { BrokerSessionPort, ModelNotSelectedError, SessionRequestTimeoutError } from "../src/orchestrator/session-port";
+import {
+	BrokerSessionPort,
+	isSessionBusy,
+	ModelNotSelectedError,
+	PromptNotSubmittedError,
+	SessionRequestTimeoutError,
+	type SessionSteerStatusResult,
+} from "../src/orchestrator/session-port";
 import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, GatewayDatabase } from "../src/store/db";
 import {
@@ -13,6 +20,7 @@ import {
 	createOwnedSessionFixture,
 	initializeTestBrokerAuthority,
 	noRelay,
+	type ScriptedRelayReply,
 	ScriptedSessionPort,
 	scriptedRelay,
 } from "./session-port.fake";
@@ -736,7 +744,11 @@ test("close uses the global lifecycle route: the per-session control route prohi
 				stderr: "",
 			};
 		if (args.includes("session.close"))
-			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-1" } }), stderr: "" };
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, operation: "session.close", result: { sessionId: "sdk-1" } }),
+				stderr: "",
+			};
 		throw new Error(`unexpected command ${args.join(" ")}`);
 	};
 	const port = new BrokerSessionPort({
@@ -757,8 +769,177 @@ test("close uses the global lifecycle route: the per-session control route prohi
 	const args = calls[0]!;
 	expect(args.slice(0, 4)).toEqual(["sdk", "session", "raw", "global"]);
 	expect(args).toContain("session.close");
-	expect(args[args.indexOf("--idempotency-key") + 1]).toMatch(/^gw-close-instance-1-sdk-1-\d+$/);
+	expect(args[args.indexOf("--idempotency-key") + 1]).toMatch(/^gw-close-[0-9a-f-]{36}$/);
 	expect(JSON.parse(args[args.indexOf("--json-input") + 1]!)).toEqual({ sessionId: "sdk-1" });
+});
+
+const closeSessionId = "2adfca12-b752-45ae-835a-4f419125338a";
+// Exact v0.18.7 f2bba356: broker/lifecycle.ts ordinary waitForClose result,
+// lifecycle/service.ts:1244 success wrapper, cli/session-cli.ts:2358-2371,
+// 2548-2551 raw global serialization. No closed boolean exists on this path.
+const ordinaryClose = {
+	ok: true,
+	operation: "session.close",
+	result: { sessionId: closeSessionId },
+};
+
+async function closeFixture(cli: CliRunner) {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-close-contract-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const db = database;
+	const authority = initializeTestBrokerAuthority(db, join(home, "agent"));
+	const target = { sessionId: closeSessionId, repo: join(home, "workspace") };
+	await createOwnedSessionFixture(db, authority, { ...target, originKey: "work/closure", epoch: 0 });
+	const port = new BrokerSessionPort({
+		database: db,
+		authority,
+		cli,
+		instanceId: "closure-contract",
+		now: () => 7,
+		tailRunner: new TailRunner({ stream: noRelay, repo: target.repo }),
+	});
+	return { db, authority, target, port };
+}
+
+for (const note of [undefined, "", "Host required SIGTERM"]) {
+	test(`ordinary source-backed close accepts optional note ${JSON.stringify(note)} and retains binding`, async () => {
+		const f = await closeFixture(async () => ({
+			exitCode: 0,
+			stdout: JSON.stringify({
+				...ordinaryClose,
+				result: { sessionId: closeSessionId, ...(note === undefined ? {} : { note }) },
+			}),
+			stderr: "",
+		}));
+		await f.port.close(f.target);
+		expect(f.db.getSessionRecord("work/closure")).toMatchObject({ sessionId: closeSessionId, epoch: 0 });
+		expect(f.db.assertOwnedSession(closeSessionId, f.target.repo, f.authority)).toMatchObject({
+			originKey: "work/closure",
+			epoch: 0,
+		});
+	});
+}
+
+for (const [name, body] of Object.entries({
+	missingResult: { ok: true, operation: "session.close" },
+	falseResult: { ...ordinaryClose, result: false },
+	arrayResult: { ...ordinaryClose, result: [ordinaryClose.result] },
+	wrongSession: { ...ordinaryClose, result: { sessionId: "other" } },
+	wrongOperation: { ...ordinaryClose, operation: "session.delete" },
+	missingOperation: { ok: true, result: ordinaryClose.result },
+	falseOk: { ...ordinaryClose, ok: false },
+	truthyOk: { ...ordinaryClose, ok: "true" },
+	nullEnvelope: null,
+	invalidNote: { ...ordinaryClose, result: { sessionId: closeSessionId, note: null } },
+	closedFalse: { ...ordinaryClose, result: { sessionId: closeSessionId, closed: false } },
+	inventedClosedTrue: { ...ordinaryClose, result: { sessionId: closeSessionId, closed: true } },
+	unrelatedDto: { ...ordinaryClose, result: { accepted: true } },
+	contradictoryError: { ...ordinaryClose, error: { code: "terminal_uncertain" } },
+	unknownCertainty: { ...ordinaryClose, certainty: "unknown" },
+	truncated: { ...ordinaryClose, truncated: true },
+	replay: { ...ordinaryClose, replayed: true },
+	resultReplay: { ...ordinaryClose, result: { sessionId: closeSessionId, replayed: true } },
+	retired: { ...ordinaryClose, result: { sessionId: closeSessionId, retired: true, heartbeatSilenceMs: 5000 } },
+	spawnChild: { ...ordinaryClose, result: { sessionId: closeSessionId, code: "spawn_child_closed" } },
+	reused: { ...ordinaryClose, result: { sessionId: closeSessionId, reused: true } },
+})) {
+	test(`close holds ${name} without deleting original binding`, async () => {
+		const f = await closeFixture(async () => ({ exitCode: 0, stdout: JSON.stringify(body), stderr: "" }));
+		await expect(f.port.close(f.target)).rejects.toBeInstanceOf(GjcCliError);
+		expect(f.db.getSessionRecord("work/closure")).toMatchObject({ sessionId: closeSessionId, epoch: 0 });
+		expect(f.db.assertOwnedSession(closeSessionId, f.target.repo, f.authority).epoch).toBe(0);
+	});
+}
+
+test("close uses distinct request identities at the same clock and refuses a historical replay", async () => {
+	const keys: string[] = [];
+	const f = await closeFixture(async (args) => {
+		keys.push(args[args.indexOf("--idempotency-key") + 1]!);
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify(keys.length === 1 ? ordinaryClose : { ...ordinaryClose, replayed: true }),
+			stderr: "",
+		};
+	});
+	await f.port.close(f.target);
+	await expect(f.port.close(f.target)).rejects.toBeInstanceOf(GjcCliError);
+	expect(new Set(keys).size).toBe(2);
+});
+
+test("close rejects ownership changed during await even though historical ownership remains", async () => {
+	let acknowledge!: () => void;
+	const pending = new Promise<void>((resolve) => { acknowledge = resolve; });
+	const f = await closeFixture(async () => {
+		await pending;
+		return { exitCode: 0, stdout: JSON.stringify(ordinaryClose), stderr: "" };
+	});
+	const closing = f.port.close(f.target);
+	f.db.rebindEpoch("work/closure");
+	acknowledge();
+	await expect(closing).rejects.toBeInstanceOf(BrokerAuthorityError);
+	expect(f.db.assertOwnedSession(closeSessionId, f.target.repo, f.authority).epoch).toBe(0);
+	expect(f.db.getSessionRecord("work/closure")?.epoch).toBe(1);
+});
+
+test("close refuses historical-only ownership before transport", async () => {
+	let calls = 0;
+	const f = await closeFixture(async () => {
+		calls++;
+		return { exitCode: 0, stdout: JSON.stringify(ordinaryClose), stderr: "" };
+	});
+	f.db.rebindEpoch("work/closure");
+	await expect(f.port.close(f.target)).rejects.toBeInstanceOf(BrokerAuthorityError);
+	expect(calls).toBe(0);
+});
+
+test("close propagates transport failure without erasing original ownership", async () => {
+	const failure = new Error("transport lost after dispatch");
+	const f = await closeFixture(async () => { throw failure; });
+	await expect(f.port.close(f.target)).rejects.toBe(failure);
+	expect(f.db.getSessionRecord("work/closure")?.sessionId).toBe(closeSessionId);
+});
+
+for (const response of [
+	{ exitCode: 0, stdout: '{"ok":true,"operation":"session.close","result":', stderr: "" },
+	{ exitCode: 1, stdout: JSON.stringify(ordinaryClose), stderr: "transport failed" },
+]) {
+	test(`close rejects incomplete transport receipt ${response.exitCode}`, async () => {
+		const f = await closeFixture(async () => response);
+		await expect(f.port.close(f.target)).rejects.toBeInstanceOf(GjcCliError);
+		expect(f.db.getSessionRecord("work/closure")?.sessionId).toBe(closeSessionId);
+	});
+}
+
+test("close retains original request correlation when caller mutates input during await", async () => {
+	let acknowledge!: () => void;
+	const pending = new Promise<void>((resolve) => { acknowledge = resolve; });
+	const f = await closeFixture(async () => {
+		await pending;
+		return { exitCode: 0, stdout: JSON.stringify({ ...ordinaryClose, result: { sessionId: "replacement" } }), stderr: "" };
+	});
+	const closing = f.port.close(f.target);
+	f.target.sessionId = "replacement";
+	acknowledge();
+	await expect(closing).rejects.toBeInstanceOf(GjcCliError);
+	expect(f.db.getSessionRecord("work/closure")?.sessionId).toBe(closeSessionId);
+});
+
+test("close rejects broker authority changed during transport", async () => {
+	let changeAuthority!: () => void;
+	const f = await closeFixture(async () => {
+		changeAuthority();
+		return { exitCode: 0, stdout: JSON.stringify(ordinaryClose), stderr: "" };
+	});
+	const assertion = spyOn(f.db, "assertBrokerAuthority");
+	changeAuthority = () => {
+		assertion.mockImplementation(() => { throw new BrokerAuthorityError("authority_mismatch"); });
+	};
+	try {
+		await expect(f.port.close(f.target)).rejects.toBeInstanceOf(BrokerAuthorityError);
+		expect(f.db.getSessionRecord("work/closure")?.sessionId).toBe(closeSessionId);
+	} finally {
+		assertion.mockRestore();
+	}
 });
 
 test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any SDK surface", async () => {
@@ -792,6 +973,7 @@ test("foreign live and saved sessions and wrong-repo owned UUIDs never reach any
 			() => port.resume({ ...target, originKey: "foreign", epoch: 0 }),
 			() => port.send({ ...target, text: "must not send", opRef: "gw-foreign" }),
 			() => port.steer({ ...target, text: "must not steer", clientRef: "gw-steer" }),
+			() => port.lookupSteerStatus({ ...target, clientRef: "gw-steer" }),
 			() => port.setModel({ ...target, selection: "model" }),
 			() => port.setModel({ ...target, selection: { preset: "profile" } }),
 			() => port.setServiceTier({ ...target, tier: "default" }),
@@ -1025,7 +1207,8 @@ test("owned SDK reads and controls ignore unrelated corrupt lane history without
 	expect(calls).toHaveLength(2);
 });
 for (const fixture of [
-	{ reply: { ok: false, error: { code: "busy" } }, refused: true },
+	{ reply: { ok: false, error: { code: "busy" } }, refused: false },
+	{ reply: { ok: false, error: { code: "busy", message: "Host is busy", outcomeCertainty: "not-applied" } }, refused: true },
 	{ reply: { ok: false, error: { code: "session_unavailable" } }, refused: false },
 	{ reply: { ok: true, result: { accepted: false, status: "rejected", error: { code: "busy" } } }, refused: false },
 	{
@@ -1033,7 +1216,7 @@ for (const fixture of [
 			ok: true,
 			result: { accepted: false, status: "rejected", clientRef: "expected-ref", error: { code: "busy" } },
 		},
-		refused: true,
+		refused: false,
 	},
 	{
 		reply: {
@@ -1047,6 +1230,41 @@ for (const fixture of [
 	{ reply: { ok: true, result: { accepted: true, status: "rejected", clientRef: "expected-ref" } }, refused: false },
 	{
 		reply: { ok: true, result: { accepted: true, status: "accepted", clientRef: "expected-ref", ok: false } },
+		refused: false,
+	},
+	{
+		reply: {
+			ok: true,
+			result: { accepted: false, status: "rejected", clientRef: "expected-ref", error: { code: "busy", outcomeCertainty: "unknown" } },
+		},
+		refused: false,
+	},
+	{
+		reply: {
+			ok: true,
+			result: { accepted: true, clientRef: "expected-ref", error: { code: "busy" } },
+		},
+		refused: false,
+	},
+	{
+		reply: {
+			ok: true,
+			result: { accepted: false, status: "rejected", clientRef: "expected-ref", error: { code: "busy" }, truncated: true },
+		},
+		refused: false,
+	},
+	{
+		reply: {
+			ok: true,
+			result: { accepted: false, status: "rejected", clientRef: "expected-ref", error: { code: "busy" }, terminalAt: "later" },
+		},
+		refused: false,
+	},
+	{
+		reply: {
+			ok: true,
+			result: { accepted: true, clientRef: "expected-ref", commandId: "command" },
+		},
 		refused: false,
 	},
 	{ reply: { ok: true, result: {} }, refused: false },
@@ -1091,6 +1309,308 @@ for (const fixture of [
 		);
 	});
 
+async function steerStatusFixture(respond: Parameters<typeof scriptedRelay>[0]) {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-steer-status-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const target = { sessionId: "steer-owned", repo: join(home, "workspace"), clientRef: "original-steer" };
+	await createOwnedSessionFixture(database, authority, { ...target, originKey: "steer-status", epoch: 0 });
+	const relay = scriptedRelay(respond);
+	const cliCalls: string[][] = [];
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: async (args) => {
+			cliCalls.push([...args]);
+			throw new Error("steer status must not fall back to CLI or send");
+		},
+		instanceId: "steer-status",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo: target.repo, requestTimeoutMs: 50 }),
+	});
+	return { port, target, relay, cliCalls, authority, db: database };
+}
+
+const originalSteerReceipt = {
+	clientRef: "original-steer",
+	commandId: "original-command",
+	turnId: "original-turn",
+	status: "accepted",
+	acceptedAt: 1_700_000_000_000,
+};
+
+test("Q31 nested rejection preserves unknown certainty as unavailable, never a definitive refusal", async () => {
+	let error: unknown = { code: "busy", message: "refused" };
+	const { port, target, relay, cliCalls } = await steerStatusFixture(() => ({
+		ok: true, result: { ...originalSteerReceipt, status: "rejected", error },
+	}));
+	expect(await port.lookupSteerStatus(target)).toEqual({
+		status: "rejected", clientRef: target.clientRef, acceptedAt: originalSteerReceipt.acceptedAt, errorCode: "busy",
+	});
+	const invalid = [
+		{ code: "busy", outcomeCertainty: "unknown" },
+		{ code: "busy", message: "uncertain", outcomeCertainty: "unknown" },
+		{ code: "busy", message: "contradiction", outcomeCertainty: "applied" },
+		{ code: "busy", message: "unsupported", outcomeCertainty: "not-applied" },
+		{ code: "busy", message: "contradiction", accepted: true },
+		{ code: "busy", message: "contradiction", ok: true },
+		{ code: "busy", message: "partial", truncated: true },
+		{ code: "busy", message: "partial", complete: false },
+		{ code: "busy", message: "extra proof", proof: "settled" },
+		{ code: "busy", message: 1 },
+		{ code: "busy" },
+	];
+	for (error of invalid) {
+		expect(await port.lookupSteerStatus(target)).toEqual({
+			status: "unavailable", clientRef: target.clientRef, code: "invalid_evidence",
+		});
+	}
+	expect(relay.requests).toHaveLength(invalid.length + 1);
+	expect(relay.requests.every((request) => request.type === "query_request" && request.operation === "turn.steer_status")).toBe(true);
+	expect(cliCalls).toEqual([]);
+});
+
+for (const fixture of [
+	{
+		name: "accepted",
+		result: originalSteerReceipt,
+		expected: { status: "accepted", clientRef: "original-steer", acceptedAt: originalSteerReceipt.acceptedAt },
+	},
+	{
+		name: "rejected",
+		result: {
+			...originalSteerReceipt,
+			status: "rejected",
+			terminalAt: originalSteerReceipt.acceptedAt + 10,
+			error: { code: "steer_refused", message: "private runtime diagnostic" },
+		},
+		expected: {
+			status: "rejected",
+			clientRef: "original-steer",
+			acceptedAt: originalSteerReceipt.acceptedAt,
+			terminalAt: originalSteerReceipt.acceptedAt + 10,
+			errorCode: "steer_refused",
+		},
+	},
+	{
+		name: "restart uncertainty",
+		result: {
+			...originalSteerReceipt,
+			status: "uncertain",
+			terminalAt: originalSteerReceipt.acceptedAt + 20,
+			error: { code: "process_restart_uncertain", message: "private runtime diagnostic" },
+		},
+		expected: {
+			status: "uncertain",
+			clientRef: "original-steer",
+			acceptedAt: originalSteerReceipt.acceptedAt,
+			terminalAt: originalSteerReceipt.acceptedAt + 20,
+			errorCode: "process_restart_uncertain",
+		},
+	},
+	{
+		name: "dispatch uncertainty",
+		result: {
+			...originalSteerReceipt,
+			status: "uncertain",
+			error: { code: "delivery_uncertain", message: "private runtime diagnostic" },
+		},
+		expected: {
+			status: "uncertain",
+			clientRef: "original-steer",
+			acceptedAt: originalSteerReceipt.acceptedAt,
+			errorCode: "delivery_uncertain",
+		},
+	},
+	{
+		name: "unknown original reference",
+		result: { clientRef: "original-steer", status: "unknown" },
+		expected: { status: "unknown", clientRef: "original-steer" },
+	},
+	{
+		// Exact-release lookup with an object selector can omit clientRef for absence.
+		name: "unknown without echoed selector",
+		result: { status: "unknown" },
+		expected: { status: "unknown", clientRef: "original-steer" },
+	},
+] satisfies readonly { name: string; result: unknown; expected: SessionSteerStatusResult }[]) {
+	test(`steer status reads original receipt without controls: ${fixture.name}`, async () => {
+		const { port, target, relay, cliCalls } = await steerStatusFixture(() => ({ ok: true, result: fixture.result }));
+		expect(await port.lookupSteerStatus(target)).toEqual(fixture.expected);
+		expect(relay.requests).toEqual([
+			{ type: "query_request", operation: "turn.steer_status", input: { clientRef: target.clientRef } },
+		]);
+		expect(cliCalls).toEqual([]);
+		expect(relay.streams).toHaveLength(1);
+		expect(relay.streams[0]!.sessionId).toBe(target.sessionId);
+		expect(relay.streams[0]!.closed).toBe(true);
+	});
+}
+
+for (const [name, result, code] of [
+	["wrong reference", { ...originalSteerReceipt, clientRef: "other" }, "identity_mismatch"],
+	["missing reference", { status: "accepted", acceptedAt: 1 }, "identity_mismatch"],
+	["wrong unknown reference", { status: "unknown", clientRef: "other" }, "identity_mismatch"],
+	["prompt terminal", { ...originalSteerReceipt, status: "terminal_ok" }, "invalid_evidence"],
+	["missing status", { clientRef: "original-steer", accepted: true }, "invalid_evidence"],
+	["contradictory acceptance", { ...originalSteerReceipt, accepted: false }, "invalid_evidence"],
+	["contradictory rejection", { ...originalSteerReceipt, status: "rejected", accepted: true }, "invalid_evidence"],
+	["contradictory uncertainty", { ...originalSteerReceipt, status: "uncertain", accepted: true }, "invalid_evidence"],
+	["nested refusal", { ...originalSteerReceipt, ok: false }, "invalid_evidence"],
+	["unknown with acceptance", { status: "unknown", accepted: true }, "invalid_evidence"],
+	["foreign session field", { ...originalSteerReceipt, sessionId: "other-session" }, "invalid_evidence"],
+	["prompt kind", { ...originalSteerReceipt, kind: "prompt" }, "invalid_evidence"],
+	["torn SDK identity", { ...originalSteerReceipt, turnId: null }, "invalid_evidence"],
+	["oversized SDK identity", { ...originalSteerReceipt, turnId: "x".repeat(129) }, "invalid_evidence"],
+	["missing timestamp", { ...originalSteerReceipt, acceptedAt: undefined }, "invalid_evidence"],
+	["string timestamp", { ...originalSteerReceipt, acceptedAt: "1700000000000" }, "invalid_evidence"],
+	["negative timestamp", { ...originalSteerReceipt, acceptedAt: -1 }, "invalid_evidence"],
+	["fractional timestamp", { ...originalSteerReceipt, acceptedAt: 1.5 }, "invalid_evidence"],
+	["unsafe timestamp", { ...originalSteerReceipt, acceptedAt: Number.MAX_SAFE_INTEGER + 1 }, "invalid_evidence"],
+	["out of date range", { ...originalSteerReceipt, acceptedAt: 8_640_000_000_000_001 }, "invalid_evidence"],
+	["nonfinite timestamp", { ...originalSteerReceipt, acceptedAt: Number.NaN }, "invalid_evidence"],
+	["accepted terminal timestamp", { ...originalSteerReceipt, terminalAt: originalSteerReceipt.acceptedAt }, "invalid_evidence"],
+	["backwards terminal timestamp", { ...originalSteerReceipt, status: "rejected", terminalAt: 1 }, "invalid_evidence"],
+	["malformed terminal timestamp", { ...originalSteerReceipt, status: "uncertain", terminalAt: "later" }, "invalid_evidence"],
+	["accepted error", { ...originalSteerReceipt, error: { code: "steer_refused" } }, "invalid_evidence"],
+	["malformed error", { ...originalSteerReceipt, status: "rejected", error: "refused" }, "invalid_evidence"],
+	["unsafe error code", { ...originalSteerReceipt, status: "rejected", error: { code: "private\ntext" } }, "invalid_evidence"],
+	["oversized error code", { ...originalSteerReceipt, status: "uncertain", error: { code: "x".repeat(65) } }, "invalid_evidence"],
+	["missing result", undefined, "invalid_evidence"],
+	["array result", [], "invalid_evidence"],
+] as const) {
+	test(`steer status holds malformed evidence: ${name}`, async () => {
+		const { port, target, relay, cliCalls } = await steerStatusFixture(() => ({ ok: true, result }));
+		expect(await port.lookupSteerStatus(target)).toEqual({ status: "unavailable", clientRef: target.clientRef, code });
+		expect(relay.requests).toEqual([
+			{ type: "query_request", operation: "turn.steer_status", input: { clientRef: target.clientRef } },
+		]);
+		expect(relay.streams[0]!.closed).toBe(true);
+		expect(cliCalls).toEqual([]);
+	});
+}
+
+test("steer status validates canonical clientRef before opening a relay and accepts the 128-character boundary", async () => {
+	const { port, target, relay, cliCalls } = await steerStatusFixture((request) => ({
+		ok: true,
+		result: { ...originalSteerReceipt, clientRef: request.input.clientRef },
+	}));
+	for (const clientRef of ["", " ", "\t\n", " original-steer", "original-steer ", "x".repeat(129)]) {
+		await expect(port.lookupSteerStatus({ ...target, clientRef })).rejects.toThrow("steer clientRef");
+	}
+	expect(relay.streams).toHaveLength(0);
+	const clientRef = "x".repeat(128);
+	expect(await port.lookupSteerStatus({ ...target, clientRef })).toEqual({
+		status: "accepted", clientRef, acceptedAt: originalSteerReceipt.acceptedAt,
+	});
+	expect(relay.requests).toEqual([{ type: "query_request", operation: "turn.steer_status", input: { clientRef } }]);
+	expect(cliCalls).toEqual([]);
+});
+
+for (const code of ["unavailable", "invalid_request", "session_unavailable", "steer_refused"]) {
+	test(`steer status query refusal is not original steering rejection: ${code}`, async () => {
+		const { port, target, relay, cliCalls } = await steerStatusFixture(() => ({
+			ok: false, error: { code, message: "private runtime diagnostic" },
+		}));
+		expect(await port.lookupSteerStatus(target)).toEqual({
+			status: "unavailable",
+			clientRef: target.clientRef,
+			code: code === "unavailable" ? "query_unavailable" : "query_refused",
+			errorCode: code,
+		});
+		expect(relay.requests).toEqual([
+			{ type: "query_request", operation: "turn.steer_status", input: { clientRef: target.clientRef } },
+		]);
+		expect(relay.streams[0]!.closed).toBe(true);
+		expect(cliCalls).toEqual([]);
+	});
+}
+
+test("steer status preserves caller relay lifetime and refuses another owned session's relay", async () => {
+	const { port, target, relay, cliCalls, db, authority } = await steerStatusFixture(() => ({
+		ok: true, result: originalSteerReceipt,
+	}));
+	const handle = await port.attachTail({ ...target, brokerGeneration: 0 });
+	try {
+		expect((await port.lookupSteerStatus({ ...target, relay: handle })).status).toBe("accepted");
+		expect(relay.streams[0]!.closed).toBe(false);
+		await createOwnedSessionFixture(db, authority, {
+			sessionId: "other-owned", repo: target.repo, originKey: "other-steer-status", epoch: 0,
+		});
+		expect(await port.lookupSteerStatus({ ...target, sessionId: "other-owned", relay: handle })).toEqual({
+			status: "unavailable", clientRef: target.clientRef, code: "identity_mismatch",
+		});
+		expect(relay.requests).toEqual([
+			{ type: "query_request", operation: "turn.steer_status", input: { clientRef: target.clientRef } },
+		]);
+		expect(relay.streams[0]!.closed).toBe(false);
+		expect(cliCalls).toEqual([]);
+	} finally {
+		await handle.close();
+	}
+});
+
+for (const supplied of [false, true]) {
+	test(`steer status transport loss stays unavailable without retry (supplied relay: ${supplied})`, async () => {
+		const { port, target, relay, cliCalls } = await steerStatusFixture(() => new Promise(() => {}));
+		const handle = supplied ? await port.attachTail({ ...target, brokerGeneration: 0 }) : undefined;
+		try {
+			expect(await port.lookupSteerStatus({ ...target, relay: handle })).toEqual({
+				status: "unavailable", clientRef: target.clientRef, code: "transport_error",
+			});
+			expect(relay.requests).toEqual([
+				{ type: "query_request", operation: "turn.steer_status", input: { clientRef: target.clientRef } },
+			]);
+			expect(relay.streams[0]!.closed).toBe(!supplied);
+			expect(cliCalls).toEqual([]);
+		} finally {
+			await handle?.close();
+		}
+	});
+}
+
+test("steer status attach failure stays unavailable without fallback execution", async () => {
+	const { target, db, authority, cliCalls } = await steerStatusFixture(() => ({ ok: true, result: originalSteerReceipt }));
+	const port = new BrokerSessionPort({
+		database: db, authority, instanceId: "attach-failure",
+		cli: async (args) => {
+			cliCalls.push([...args]);
+			throw new Error("no fallback");
+		},
+		tailRunner: new TailRunner({ stream: noRelay, repo: target.repo }),
+	});
+	expect(await port.lookupSteerStatus(target)).toEqual({
+		status: "unavailable", clientRef: target.clientRef, code: "transport_error",
+	});
+	expect(cliCalls).toEqual([]);
+});
+
+for (const reply of ["accepted", "refused"] as const) {
+	test(`steer status fences authority invalidation during ${reply} query await`, async () => {
+		let invalidate!: () => void;
+		const { port, target, relay, cliCalls, db, authority } = await steerStatusFixture(async () => {
+			await Promise.resolve();
+			invalidate();
+			return reply === "accepted"
+				? { ok: true, result: originalSteerReceipt }
+				: { ok: false, error: { code: "unavailable" } };
+		});
+		invalidate = () => {
+			const canonicalAgentDir = join(home, "other-agent");
+			db.cutoverBrokerAuthority({
+				expectedAuthority: authority,
+				targetAuthority: { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` },
+				evidence: "steer status await fixture",
+			});
+		};
+		await expect(port.lookupSteerStatus(target)).rejects.toBeInstanceOf(BrokerAuthorityError);
+		expect(relay.requests).toEqual([
+			{ type: "query_request", operation: "turn.steer_status", input: { clientRef: target.clientRef } },
+		]);
+		expect(relay.streams[0]!.closed).toBe(true);
+		expect(cliCalls).toEqual([]);
+	});
+}
+
 test("a relay that dies before the steer reply is ambiguity, never a definitive rejection", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
 	database = await GatewayDatabase.open(join(home, "gateway.db"));
@@ -1118,6 +1638,316 @@ test("a relay that dies before the steer reply is ambiguity, never a definitive 
 	expect(failure).toBeInstanceOf(Error);
 	expect((failure as { details?: { refused?: boolean } }).details?.refused).toBeUndefined();
 	expect(isDefinitiveSteerRejection(failure)).toBe(false);
+});
+
+async function promptReceiptFixture(respond: Parameters<typeof scriptedRelay>[0], cli?: CliRunner) {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-prompt-receipt-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const target = { sessionId: "prompt-owned", repo: join(home, "workspace"), opRef: "original-prompt", text: "work" };
+	await createOwnedSessionFixture(database, authority, { ...target, originKey: "prompt-receipt", epoch: 0 });
+	const relay = scriptedRelay(respond);
+	const port = new BrokerSessionPort({
+		database,
+		authority,
+		cli: cli ?? (async () => { throw new Error("prompt must not fall back to CLI"); }),
+		instanceId: "prompt-receipt",
+		tailRunner: new TailRunner({ stream: relay.spawn, repo: target.repo, requestTimeoutMs: 50 }),
+		now: () => 1_800_000_000_000,
+		sleep: async () => { throw new Error("uncertain prompt must not retry"); },
+	});
+	return { port, target, relay, authority, db: database };
+}
+
+// Exact v0.18.7 prompt acknowledgement: status/acceptedAt belong to reconciliation,
+// not this DTO. Invocation IDs are learned here, not manufactured by the gateway.
+const originalPromptReceipt = {
+	accepted: true,
+	clientRef: "original-prompt",
+	commandId: "original-command",
+	turnId: "original-turn",
+};
+
+for (const supplied of [false, true]) {
+	test(`send retains canonical prompt identity without requiring status or SDK time (supplied=${supplied})`, async () => {
+		const { port, target, relay } = await promptReceiptFixture(() => ({ ok: true, result: originalPromptReceipt }));
+		const handle = supplied ? await port.attachTail({ ...target, brokerGeneration: 0 }) : undefined;
+		try {
+			expect(await port.send({ ...target, relay: handle })).toEqual({
+				sessionId: target.sessionId,
+				operationRef: originalPromptReceipt.clientRef,
+				commandId: originalPromptReceipt.commandId,
+				turnId: originalPromptReceipt.turnId,
+				acceptedAt: new Date(1_800_000_000_000).toISOString(),
+				taskKey: "gateway",
+			});
+			expect(relay.requests).toEqual([
+				{ type: "control_request", operation: "turn.prompt", input: { text: target.text, clientRef: target.opRef } },
+			]);
+			expect(relay.streams[0]!.closed).toBe(!supplied);
+		} finally {
+			await handle?.close();
+		}
+	});
+}
+
+for (const [name, result] of [
+	["empty", {}],
+	["missing result", undefined],
+	["null", null],
+	["array", [originalPromptReceipt]],
+	["missing clientRef", { accepted: true, commandId: "c", turnId: "t" }],
+	["wrong clientRef", { ...originalPromptReceipt, clientRef: "another-prompt" }],
+	["missing acceptance", { clientRef: "original-prompt", commandId: "c", turnId: "t" }],
+	["false acceptance", { ...originalPromptReceipt, accepted: false }],
+	["truthy acceptance", { ...originalPromptReceipt, accepted: "true" }],
+	["missing commandId", { accepted: true, clientRef: "original-prompt", turnId: "t" }],
+	["missing turnId", { accepted: true, clientRef: "original-prompt", commandId: "c" }],
+	["empty commandId", { ...originalPromptReceipt, commandId: "" }],
+	["blank turnId", { ...originalPromptReceipt, turnId: " " }],
+	["numeric commandId", { ...originalPromptReceipt, commandId: 42 }],
+	["numeric turnId", { ...originalPromptReceipt, turnId: 42 }],
+	["unknown status", { ...originalPromptReceipt, status: "unknown" }],
+	["rejected status", { ...originalPromptReceipt, status: "rejected" }],
+	["status instead of acceptance", { clientRef: "original-prompt", commandId: "c", turnId: "t", status: "accepted" }],
+	["false inner ok", { ...originalPromptReceipt, ok: false }],
+	["inner error", { ...originalPromptReceipt, error: { code: "busy" } }],
+	["foreign session", { ...originalPromptReceipt, sessionId: "foreign" }],
+	["undocumented wrapper", { receipt: originalPromptReceipt }],
+] as const) {
+	test(`send holds ${name} acknowledgement without accepted promotion or replay`, async () => {
+		const { port, target, relay } = await promptReceiptFixture(() => ({ ok: true, result }));
+		let accepted = 0;
+		const failure = await port.send(target).then(
+			() => { accepted++; },
+			(error: unknown) => error,
+		);
+		expect(accepted).toBe(0);
+		expect(failure).toBeInstanceOf(GjcCliError);
+		expect(failure).toMatchObject({ details: { code: "prompt_receipt_uncertain", outcomeCertainty: "unknown" } });
+		expect(isSessionBusy(failure)).toBe(false);
+		expect(failure).not.toBeInstanceOf(ModelNotSelectedError);
+		expect(isDefinitiveSteerRejection(failure)).toBe(false);
+		expect(relay.requests).toHaveLength(1);
+		expect(relay.streams[0]!.closed).toBe(true);
+	});
+}
+
+for (const reply of [
+	{ ok: true, result: originalPromptReceipt, error: { code: "busy" } },
+	{ ok: false, result: originalPromptReceipt, error: { code: "busy" } },
+	{ ok: false, result: {}, error: { code: "model_not_selected" } },
+	{ ok: false, error: {} },
+	{ ok: true, result: originalPromptReceipt, page: {} },
+]) {
+	test(`send rejects contradictory or missing acknowledgement envelope ${JSON.stringify(reply)}`, async () => {
+		const { port, target, relay } = await promptReceiptFixture(() => reply as ScriptedRelayReply);
+		const failure = await port.send(target).catch((error: unknown) => error);
+		expect(failure).toMatchObject({ details: { code: "prompt_receipt_uncertain", outcomeCertainty: "unknown" } });
+		expect(isSessionBusy(failure)).toBe(false);
+		expect(failure).not.toBeInstanceOf(ModelNotSelectedError);
+		expect(relay.requests).toHaveLength(1);
+	});
+}
+
+for (const reply of [
+	{ result: originalPromptReceipt },
+	{ ok: "true", result: originalPromptReceipt },
+	{ ok: false, accepted: true, error: { code: "busy" } },
+	{ ok: false, error: { code: "busy", outcomeCertainty: "unknown" } },
+	{ ok: false, error: { code: "busy", accepted: true } },
+	{ ok: true, result: originalPromptReceipt, error: "busy" },
+	{ ok: false, error: { code: "busy" }, page: false },
+	{ ok: true, result: originalPromptReceipt, truncated: true },
+	null,
+]) {
+	test(`send holds malformed supplied-handle replies ${JSON.stringify(reply)}`, async () => {
+		const { port, target } = await promptReceiptFixture(() => { throw new Error("unexpected stream control"); });
+		let controls = 0;
+		const handle = {
+			sessionId: target.sessionId,
+			control: async () => { controls++; return reply; },
+		} as unknown as TailHandle;
+		const failure = await port.send({ ...target, relay: handle }).catch((error: unknown) => error);
+		expect(failure).toMatchObject({ details: { code: "prompt_receipt_uncertain", outcomeCertainty: "unknown" } });
+		expect(isSessionBusy(failure)).toBe(false);
+		expect(controls).toBe(1);
+	});
+}
+
+for (const when of ["before", "after"] as const) {
+	test(`send fences a foreign relay session ${when} control await`, async () => {
+		const { port, target } = await promptReceiptFixture(() => { throw new Error("unexpected stream control"); });
+		let controls = 0;
+		let relaySessionId = when === "before" ? "foreign" : target.sessionId;
+		const handle = {
+			get sessionId() { return relaySessionId; },
+			control: async () => {
+				controls++;
+				await Promise.resolve();
+				relaySessionId = "foreign";
+				return { ok: true, result: originalPromptReceipt };
+			},
+		} as unknown as TailHandle;
+		await expect(port.send({ ...target, relay: handle })).rejects.toMatchObject({
+			details: { code: "prompt_receipt_uncertain", outcomeCertainty: "unknown" },
+		});
+		expect(controls).toBe(when === "before" ? 0 : 1);
+	});
+}
+
+for (const kind of ["authority", "ownership", "epoch"] as const) {
+	for (const ok of [true, false]) {
+		const scenario = kind === "epoch" ? "synthetic epoch evidence" :
+			kind === "ownership" ? "ownership retirement via authority cutover" : "authority";
+		test(`send fences ${scenario} invalidation during control await (ok=${ok})`, async () => {
+			let entered!: () => void;
+			let release!: (reply: ScriptedRelayReply) => void;
+			const controlEntered = new Promise<void>((resolve) => { entered = resolve; });
+			const response = new Promise<ScriptedRelayReply>((resolve) => { release = resolve; });
+			const reply: ScriptedRelayReply = ok
+				? { ok: true, result: originalPromptReceipt }
+				: { ok: false, error: { code: "busy" } };
+			const { port, target, relay, db, authority } = await promptReceiptFixture(() => {
+				entered();
+				return response;
+			});
+			const assertOwnedSession = db.assertOwnedSession.bind(db);
+			let ownershipQuery: ReturnType<typeof spyOn<GatewayDatabase, "assertOwnedSession">> | undefined;
+			const sending = port.send(target).catch((error: unknown) => error);
+			try {
+				// Keep mutations and assertions on the awaited test path, not the
+				// relay's fire-and-forget response callback.
+				await Promise.race([
+					controlEntered,
+					sending.then(() => { throw new Error("send settled before entering prompt control"); }),
+				]);
+				if (kind === "epoch") {
+					// Synthetic defensive-branch evidence only: production provenance
+					// is immutable, so an in-place binding epoch change is unreachable.
+					ownershipQuery = spyOn(db, "assertOwnedSession").mockImplementation((sessionId, repo, owner) => {
+						const owned = assertOwnedSession(sessionId, repo, owner);
+						return sessionId === target.sessionId ? { ...owned, epoch: owned.epoch + 1 } : owned;
+					});
+				} else {
+					const canonicalAgentDir = join(home, "other-agent");
+					const targetAuthority = { canonicalAgentDir, identity: `gjc:${canonicalAgentDir}` };
+					db.cutoverBrokerAuthority({
+						expectedAuthority: authority,
+						targetAuthority,
+						evidence: "prompt await fixture",
+					});
+					if (kind === "ownership") {
+						// Supported retirement keeps historical provenance but removes
+						// the old session from the new authority's ownership.
+						expect(db.getSessionRecord("prompt-receipt")).toMatchObject({ sessionId: "", epoch: 1 });
+						expect(() => db.assertOwnedSession(target.sessionId, target.repo, targetAuthority))
+							.toThrow(BrokerAuthorityError);
+					}
+				}
+				release(reply);
+				const failure = await sending;
+				if (kind === "epoch") {
+					expect(failure).toMatchObject({ details: { code: "prompt_receipt_uncertain", outcomeCertainty: "unknown" } });
+					expect(ownershipQuery).toHaveBeenCalledTimes(1);
+					expect(assertOwnedSession(target.sessionId, target.repo, authority).epoch).toBe(0);
+				} else expect(failure).toBeInstanceOf(BrokerAuthorityError);
+				expect(isSessionBusy(failure)).toBe(false);
+				expect(relay.requests).toEqual([
+					{ type: "control_request", operation: "turn.prompt", input: { text: target.text, clientRef: target.opRef } },
+				]);
+				expect(relay.streams[0]!.closed).toBe(true);
+			} finally {
+				release(reply);
+				await sending;
+				ownershipQuery?.mockRestore();
+			}
+		});
+	}
+}
+
+test("send holds a torn prompt reply without a second control", async () => {
+	const { port, target, relay } = await promptReceiptFixture(() => new Promise(() => {}));
+	const failure = await port.send(target).catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(Error);
+	expect(isSessionBusy(failure)).toBe(false);
+	expect(failure).not.toBeInstanceOf(ModelNotSelectedError);
+	expect(relay.requests).toHaveLength(1);
+	expect(relay.streams[0]!.closed).toBe(true);
+});
+
+test("model preflight failure proves only this call sent no prompt, not absence of model side effects", async () => {
+	const calls: string[][] = [];
+	let modelApplied = false;
+	const { port, target, relay } = await promptReceiptFixture(
+		() => { throw new Error("preflight failure must not submit a prompt"); },
+		async (args) => {
+			calls.push([...args]);
+			expect(args).toContain("model.profile.set");
+			modelApplied = true; // The effect landed, but its receipt did not.
+			throw new Error(`model acknowledgement lost ${"x".repeat(2_000)}`);
+		},
+	);
+	const failure = await port.send({ ...target, model: { preset: "selected-model" } }).catch((error: unknown) => error);
+	expect(failure).toBeInstanceOf(PromptNotSubmittedError);
+	expect(failure).toMatchObject({ opRef: target.opRef, phase: "model_preflight" });
+	expect(String((failure as Error).cause).length).toBeLessThanOrEqual(512);
+	expect((failure as { details?: unknown }).details).toBeUndefined();
+	expect(modelApplied).toBe(true);
+	expect(calls).toHaveLength(1);
+	expect(relay.requests).toHaveLength(0);
+	expect(relay.streams).toHaveLength(0);
+});
+
+test("model preflight proof does not erase an earlier ambiguous send under the same reference", async () => {
+	const { port, target, relay } = await promptReceiptFixture(
+		() => ({ ok: true, result: {} }),
+		async () => { throw new Error("model receipt lost"); },
+	);
+	await expect(port.send(target)).rejects.toMatchObject({
+		details: { code: "prompt_receipt_uncertain", outcomeCertainty: "unknown" },
+	});
+	await expect(port.send({ ...target, model: { preset: "selected-model" } })).rejects.toMatchObject({
+		opRef: target.opRef,
+		phase: "model_preflight",
+	});
+	expect(relay.requests).toEqual([
+		{ type: "control_request", operation: "turn.prompt", input: { text: target.text, clientRef: target.opRef } },
+	]);
+});
+
+test("send waits for model preflight acknowledgement before its only prompt control", async () => {
+	const events: string[] = [];
+	let release!: () => void;
+	const preflight = new Promise<void>((resolve) => { release = resolve; });
+	const { port, target, relay } = await promptReceiptFixture(
+		() => {
+			events.push("prompt");
+			return { ok: true, result: originalPromptReceipt };
+		},
+		async () => {
+			events.push("model");
+			await preflight;
+			events.push("model-receipt");
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: true }), stderr: "" };
+		},
+	);
+	const sending = port.send({ ...target, model: { preset: "selected-model" } });
+	expect(events).toEqual(["model"]);
+	expect(relay.requests).toHaveLength(0);
+	release();
+	expect((await sending).operationRef).toBe(target.opRef);
+	expect(events).toEqual(["model", "model-receipt", "prompt"]);
+	expect(relay.requests).toHaveLength(1);
+});
+
+test("send preserves explicit client reference conflict without another control", async () => {
+	const { port, target, relay } = await promptReceiptFixture(() => ({
+		ok: false,
+		error: { code: "client_ref_conflict", message: "Client reference conflicts with an existing control" },
+	}));
+	await expect(port.send(target)).rejects.toMatchObject({ opRef: target.opRef, code: "client_ref_conflict" });
+	expect(relay.requests).toHaveLength(1);
 });
 
 test("send distinguishes an explicit model refusal from a transport error with the same code", async () => {
@@ -1153,6 +1983,7 @@ test("send distinguishes an explicit model refusal from a transport error with t
 
 	const transportError = new GjcCliError("relay failed", 0, "", { code: "model_not_selected" });
 	const transportRelay = {
+		sessionId: "sdk-1",
 		control: async () => {
 			throw transportError;
 		},
@@ -1185,7 +2016,7 @@ test("send waits out a `busy` refusal and resends under the same op-ref once the
 		sends.push(String(request.input.clientRef));
 		if (sends.length < 3)
 			return { ok: false, error: { code: "busy", message: "turn.prompt is unavailable while the agent is busy" } };
-		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true } };
+		return { ok: true, result: { commandId: "c", turnId: "t", accepted: true, clientRef: request.input.clientRef } };
 	});
 	const port = new BrokerSessionPort({
 		database,

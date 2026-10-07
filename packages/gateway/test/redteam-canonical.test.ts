@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { StatusReport } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import {
@@ -725,7 +726,7 @@ async function serverFixture(
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(
 		() => client.frames.some((frame) => frame.type === "negotiated"),
 		"gateway negotiation did not complete",
@@ -745,7 +746,7 @@ async function serverFixture(
 }
 
 function request(id: string, verb: "chat.send" | "chat.edit", params: Record<string, unknown>) {
-	return { v: "0.1", type: "request", id, verb, params };
+	return { v: PROFILE_VERSION, type: "request", id, verb, params };
 }
 
 const DM_ORIGIN = { platform: "discord", kind: "dm", conversationId: "canonical-dm", peerId: "owner" } as const;
@@ -867,7 +868,7 @@ test("C5c: an edit of context-only intake becomes a pointer turn once the open-c
 	}
 });
 
-test("C5d: malformed edits and loopback-origin edits must be rejected without an enqueue", async () => {
+test("C5d: malformed edits are rejected while a valid loopback-origin edit is accepted and steered once", async () => {
 	const fixture = await serverFixture();
 	const loopback = { platform: "loopback", kind: "loopback", conversationId: "edit-loopback" } as const;
 	const loopbackKey = "loopback/loopback/edit-loopback";
@@ -1160,6 +1161,8 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new (await import("bun:sqlite")).Database(path);
+		// Subtract only v33 fixture objects before rewinding receipts; missing objects are fixture errors.
+		raw.exec("DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks;");
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -1190,7 +1193,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 `);
 		raw.close();
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 		const count = new (await import("bun:sqlite")).Database(path, { readonly: true })
 			.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM inbound_messages")
 			.get()?.n;

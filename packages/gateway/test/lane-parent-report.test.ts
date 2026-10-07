@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type OriginRef, originKey } from "@gajae-gateway/protocol";
+import { type OriginRef, originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase, workAttemptDeliveryId } from "../src/store/db";
@@ -64,11 +64,11 @@ async function connect(socketPath: string) {
 		close: () => socket.end(),
 		async request(verb: string, params: unknown): Promise<any> {
 			const id = crypto.randomUUID();
-			client.send({ v: "0.1", type: "request", id, verb, params });
+			client.send({ v: PROFILE_VERSION, type: "request", id, verb, params });
 			return await eventually<any>(() => frames.find((frame) => frame.id === id), Boolean, `${verb} response`);
 		},
 	};
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(
 		() => frames,
 		(value) => value.some((frame) => frame.type === "negotiated"),

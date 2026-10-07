@@ -3,6 +3,7 @@ import { expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { GjcCliError } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { PersonaSessionManager, type PersonaSessionManagerOptions } from "../src/orchestrator/persona-session";
@@ -494,6 +495,8 @@ test("G7: migration 19 requeues a settled-bound trigger and ride-along member to
 	try {
 		(await GatewayDatabase.open(path)).close();
 		const raw = new Database(path);
+		// Subtract only v33 fixture objects before rewinding receipts; missing objects are fixture errors.
+		raw.exec("DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks;");
 		for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -533,7 +536,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 		expect(upgraded.inboundTurnRows("gw-p-ride").map((row) => [row.message_id, row.turn_role, row.turn_state])).toEqual(
 			[
 				["ride-trigger", "trigger", "bound"],
@@ -652,7 +655,7 @@ async function serverFixture(port: TornReplayPort): Promise<ServerFixture> {
 	attachTestBrokerOwnership(database, port, join(home, "canonical-agent"));
 	const server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await eventually(() => client.frames.length > 0, "server negotiation did not complete");
 	return {
 		home,
@@ -670,7 +673,7 @@ async function serverFixture(port: TornReplayPort): Promise<ServerFixture> {
 
 function chatSend(client: SocketClient, id: string, messageId: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",
@@ -680,7 +683,7 @@ function chatSend(client: SocketClient, id: string, messageId: string, text: str
 
 function chatEdit(client: SocketClient, id: string, messageId: string, text: string): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.edit",

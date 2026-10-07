@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, originKey, PROFILE_VERSION, type OriginRef } from "@gajae-gateway/protocol";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
@@ -94,7 +94,7 @@ async function chatRequest(
 	verb: "chat.send" | "chat.edit",
 	params: unknown,
 ): Promise<unknown> {
-	client.send({ v: "0.1", type: "request", id, verb, params });
+	client.send({ v: PROFILE_VERSION, type: "request", id, verb, params });
 	await waitFrame(client.frames, id);
 	return client.frames.find((frame) => frame.id === id);
 }
@@ -127,7 +127,7 @@ async function startGuildBoundaryServer() {
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	return { client, config, database, sessionPort };
 }
@@ -162,7 +162,7 @@ async function startDeliveryServer(
 			: { deliverySweepIntervalMs: options.deliverySweepIntervalMs }),
 	});
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	return { client, config, database };
 }
@@ -193,15 +193,15 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		onStop: () => database.close(),
 	});
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "request", id: "before", verb: "gateway.status" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "before", verb: "gateway.status" });
 	await waitFor(client.frames, 1);
 	expect(client.frames[0].error.code).toBe("negotiation_required");
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 2);
 	expect(client.frames[1].type).toBe("negotiated");
-	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(32);
+	expect(client.frames[2].result.schemaVersion).toBe(33);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.contextDiff).toEqual({
 		unread: 0,
@@ -212,7 +212,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 		floorAt: null,
 	});
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "bad-chat",
 		verb: "chat.send",
@@ -221,7 +221,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	await waitFor(client.frames, 4);
 	expect(client.frames[3].error.code).toBe("invalid_params");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "chat",
 		verb: "chat.send",
@@ -232,7 +232,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[5].payload).toMatchObject({ text: "mock reply", final: true });
 	// The turn also emits its final chat.progress; frames after the reply are
 	// matched by identity, not position.
-	client.send({ v: "0.1", type: "request", id: "shutdown", verb: "gateway.shutdown" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "shutdown", verb: "gateway.shutdown" });
 	await waitFor(client.frames, 8);
 	expect(client.frames.some((frame) => frame.event === "chat.progress" && frame.payload?.final === true)).toBe(true);
 	expect(client.frames.find((frame) => frame.id === "shutdown")).toMatchObject({
@@ -247,7 +247,7 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	const { client, database } = await startDeliveryServer({ deliverySweepIntervalMs: 100 });
 	const origin = { platform: "discord", kind: "dm", conversationId: "delivery-test", peerId: "owner" };
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "create-delivery",
 		verb: "chat.send",
@@ -262,7 +262,7 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 	expect(initial).toBeDefined();
 	const deliveryId = initial.payload.deliveryId as string;
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "first-fail",
 		verb: "delivery.fail",
@@ -274,7 +274,7 @@ test("a connected adapter receives a failed delivery again on the periodic sweep
 		attempts: 1,
 		last_error: "other",
 	});
-	client.send({ v: "0.1", type: "request", id: "status-retry", verb: "gateway.status" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "status-retry", verb: "gateway.status" });
 	await waitFrame(client.frames, "status-retry");
 	const retrying = client.frames.find((frame) => frame.id === "status-retry").result.delivery.recentPending;
 	expect(retrying).toMatchObject([{ deliveryId, state: "pending", attempts: 1, lastError: "other" }]);
@@ -306,7 +306,7 @@ test("inflight rows are not re-broadcast by the timed sweep within ack timeout",
 	const { client, database } = await startDeliveryServer({ deliverySweepIntervalMs: 50 });
 	const origin = { platform: "discord", kind: "dm", conversationId: "inflight-test", peerId: "owner" };
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "create-inflight",
 		verb: "chat.send",
@@ -364,7 +364,7 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 		const { client, database } = await startDeliveryServer({ ownerTarget });
 		const origin = { platform: "discord", kind: "dm", conversationId: "delivery-test", peerId: "owner" };
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "create-delivery",
 			verb: "chat.send",
@@ -381,7 +381,7 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 		for (let attempt = 1; attempt <= 5; attempt++) {
 			const id = `fail-${attempt}`;
 			client.send({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id,
 				verb: "delivery.fail",
@@ -408,7 +408,7 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 		expect(logLine).toContain("origin=discord/dm/delivery-test/peer=owner attempts=5 reason=adapter_failure");
 		expect(logLine).not.toContain("the single reply body");
 
-		client.send({ v: "0.1", type: "request", id: "status-expired", verb: "gateway.status" });
+		client.send({ v: PROFILE_VERSION, type: "request", id: "status-expired", verb: "gateway.status" });
 		await waitFrame(client.frames, "status-expired");
 		const status = client.frames.find((frame) => frame.id === "status-expired").result;
 		expect(status.delivery).toMatchObject({
@@ -421,7 +421,7 @@ test("expiry logs and notifies the owner once, while status exposes metadata wit
 		for (let attempt = 1; attempt <= 5; attempt++) {
 			const id = `fail-notice-${attempt}`;
 			client.send({
-				v: "0.1",
+				v: PROFILE_VERSION,
 				type: "request",
 				id,
 				verb: "delivery.fail",
@@ -478,7 +478,7 @@ test("an expired monitor delivery fails its authored events with evidence; a con
 	for (let attempt = 1; attempt <= 5; attempt++) {
 		const id = `monitor-fail-${attempt}`;
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "delivery.fail",
@@ -494,9 +494,9 @@ test("an expired monitor delivery fails its authored events with evidence; a con
 	});
 	expect(database.authoredOutput(eventId)).toBe("report");
 
-	client.send({ v: "0.1", type: "request", id: "redrive", verb: "ops.redeliver", params: { deliveryId } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "redrive", verb: "ops.redeliver", params: { deliveryId } });
 	await waitFrame(client.frames, "redrive");
-	client.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
 	await waitFrame(client.frames, "confirm");
 	expect(eventStage()).toBe("delivered");
 	client.close();
@@ -577,7 +577,7 @@ test("ops.redeliver requeues expired rows by id or since and immediately publish
 	};
 	createExpired("expired-by-id");
 	createExpired("expired-by-since");
-	client.send({ v: "0.1", type: "request", id: "status-before", verb: "gateway.status" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "status-before", verb: "gateway.status" });
 	await waitFrame(client.frames, "status-before");
 	const status = client.frames.find((frame) => frame.id === "status-before").result;
 	expect(status.delivery.expired).toBe(2);
@@ -594,7 +594,7 @@ test("ops.redeliver requeues expired rows by id or since and immediately publish
 	expect(JSON.stringify(status.delivery)).not.toContain("body for");
 
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "requeue-id",
 		verb: "ops.redeliver",
@@ -611,7 +611,7 @@ test("ops.redeliver requeues expired rows by id or since and immediately publish
 	});
 
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "requeue-since",
 		verb: "ops.redeliver",
@@ -623,7 +623,7 @@ test("ops.redeliver requeues expired rows by id or since and immediately publish
 	});
 
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "unknown-redelivery",
 		verb: "ops.redeliver",
@@ -631,7 +631,7 @@ test("ops.redeliver requeues expired rows by id or since and immediately publish
 	});
 	await waitFrame(client.frames, "unknown-redelivery");
 	expect(client.frames.find((frame) => frame.id === "unknown-redelivery").error.code).toBe("invalid_params");
-	client.send({ v: "0.1", type: "request", id: "bad-since", verb: "ops.redeliver", params: { since: "not-a-time" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "bad-since", verb: "ops.redeliver", params: { since: "not-a-time" } });
 	await waitFrame(client.frames, "bad-since");
 	expect(client.frames.find((frame) => frame.id === "bad-since").error.code).toBe("invalid_params");
 	client.close();
@@ -657,17 +657,17 @@ test("unauthorized direct messages cannot invoke /new or /model", async () => {
 	const client = await connect(config.socketPath);
 	const origin = { platform: "discord", kind: "dm", conversationId: "private", peerId: "intruder" };
 	const engagement = { mentioned: false, group: false, authorId: "intruder" };
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "model",
 		verb: "chat.send",
 		params: { origin, text: "/model set forbidden", engagement },
 	});
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "new",
 		verb: "chat.send",
@@ -720,10 +720,10 @@ test("a mention-less /new inside an engaged thread is authorised", async () => {
 	expect(database.inboundTurnComplete("thread-opening-op")).toBe(1);
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "thread-new",
 		verb: "chat.send",
@@ -763,10 +763,10 @@ test("a mention-less /new at the channel root remains refused", async () => {
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
 	const origin = { platform: "slack" as const, kind: "channel" as const, conversationId: "C1" };
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "channel-new",
 		verb: "chat.send",
@@ -784,7 +784,7 @@ test("a mention-less /new at the channel root remains refused", async () => {
 	expect(database.getSessionRecord("slack/channel/C1")).toBeUndefined();
 	const closedOrigin = { platform: "slack" as const, kind: "channel" as const, conversationId: "C2" };
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "closed-channel-new",
 		verb: "chat.send",
@@ -964,10 +964,10 @@ test("a failed platform turn still delivers a visible ledgered failure notice", 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "dm",
 		verb: "chat.send",
@@ -1019,10 +1019,10 @@ test("long turns broadcast throttled chat.progress liveness events", async () =>
 		onStop: () => database.close(),
 	});
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "dm",
 		verb: "chat.send",
@@ -1087,11 +1087,11 @@ test("large memory.audit and concurrent progress remain independently parseable 
 		onStop: () => database.close(),
 	});
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
-	client.send({ v: "0.1", type: "request", id: "audit", verb: "memory.audit", params: {} });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "audit", verb: "memory.audit", params: {} });
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "progress-turn",
 		verb: "chat.send",
@@ -1153,10 +1153,10 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "turn",
 		verb: "chat.send",
@@ -1167,7 +1167,7 @@ test("shutdown quiesces an in-flight turn before final stopping frame", async ()
 		},
 	});
 	await turnEntered;
-	client.send({ v: "0.1", type: "request", id: "shutdown", verb: "gateway.shutdown" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "shutdown", verb: "gateway.shutdown" });
 	for (let attempt = 0; attempt < 400; attempt++) {
 		if (client.frames.some((frame) => frame.type === "response" && frame.id === "shutdown")) break;
 		await Bun.sleep(5);
@@ -1213,12 +1213,12 @@ test("unengaged messages before a mention arrive as the unread diff with speaker
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "channel", conversationId: "c1" };
 	const say = (id: string, text: string, authorId: string, authorName: string, mentioned: boolean) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -1279,7 +1279,7 @@ test("a DM burst is never coalesced: the first fragment is the turn and the rest
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "dm", conversationId: "d1", peerId: "owner" };
 	for (const [id, text] of [
@@ -1289,7 +1289,7 @@ test("a DM burst is never coalesced: the first fragment is the turn and the rest
 	] as const) {
 		// No messageId: the sender never recorded these in the unread-context ledger.
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -1341,12 +1341,12 @@ test("an open-channel burst from several authors: the first is the turn, later o
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "channel", conversationId: "c1" };
 	const say = (id: string, text: string, authorId: string, authorName: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -1414,10 +1414,10 @@ test("an inbound ledger write failure fails the mention closed and logs a drop n
 	try {
 		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 		const client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await waitFor(client.frames, 1);
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "mention",
 			verb: "chat.send",
@@ -1485,10 +1485,10 @@ test("a backlog left pending across an outage is answered on boot, never expired
 	try {
 		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 		const client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await waitFor(client.frames, 1);
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "f",
 			verb: "chat.send",
@@ -1542,12 +1542,12 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 		},
 	});
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "owner" };
 	// A non-owner is refused.
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "r1",
 		verb: "chat.send",
@@ -1558,7 +1558,7 @@ test("/restart is owner-only and triggers an ordered gateway stop after acknowle
 	expect(stops).toEqual([]);
 	// The owner gets an ack and the gateway stops shortly after.
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "r2",
 		verb: "chat.send",
@@ -1599,10 +1599,10 @@ test("group turns name the [SILENT] mechanism but never rule on whether the pers
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "listen",
 		verb: "chat.send",
@@ -1614,6 +1614,10 @@ test("group turns name the [SILENT] mechanism but never rule on whether the pers
 		},
 	});
 	for (let attempt = 0; attempt < 400 && preambles.length === 0; attempt++) await Bun.sleep(5);
+	await waitFrame(client.frames, "listen");
+	expect(client.frames.find((frame) => frame.id === "listen")).toMatchObject({
+		type: "response", result: { engaged: true },
+	});
 	// Speaking or not is the persona's call from its own rules/memory; the runtime
 	// only tells it how to stay quiet (live: the old "NOT addressed" stamp silenced
 	// the persona on people talking to it in an open room).
@@ -1647,10 +1651,10 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "dm",
 		verb: "chat.send",
@@ -1667,6 +1671,9 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	}
 	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(messages).toHaveLength(3);
+	expect(client.frames.find((frame) => frame.id === "dm")).toMatchObject({
+		type: "response", result: { engaged: true },
+	});
 	expect(messages[0].payload).toMatchObject({
 		text: "threaded answer",
 		replyToMessageId: "1544704223634260038",
@@ -1676,6 +1683,124 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	expect(messages[2].payload.text).toBe("malformed target");
 	expect(messages[2].payload.replyToMessageId).toBeUndefined();
 	client.close();
+});
+
+test("generic Discord discovery preserves ordinary DM replies beside corrupt and forged permanent mappings", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1, home: directory,
+		configPath: join(directory, "config.json"), socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"), logVerbosity: "info", dmPolicy: "open",
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "42" } },
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const binds: string[] = [];
+	const prompts: string[] = [];
+	const sessionPort = sessionPortFromResponder({
+		bind: (key, epoch) => {
+			binds.push(key);
+			return bindWorkFixture(key, epoch);
+		},
+		respond: async (_session, text) => {
+			prompts.push(text);
+			return "ordinary reply";
+		},
+	});
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+	const client = await connect(config.socketPath);
+	const raw = new Database(config.dbPath);
+	try {
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+		await waitFor(client.frames, 1);
+		const thread: OriginRef = {
+			platform: "discord", kind: "thread", conversationId: "1556589606403842128",
+			parentId: "1511673764574793798", boundaryId: "1510336487894286436",
+		};
+		const taskId = crypto.randomUUID();
+		const task = database.workTaskCreate({
+			taskId, opRef: "gw-persona-discovery-regression",
+			request: {
+				text: "Inspect without execution", kind: "read_only", cwd: directory,
+				coordinator: LOOPBACK_ORIGIN, surface: { thread },
+				evidence: { principalId: "owner:42", origin: thread, eventId: "assignment",
+					editId: null, evidenceAt: "2026-10-06T00:00:00.000Z", observedAt: "2026-10-06T00:00:00.000Z" },
+			},
+		}).record;
+		database.withTransaction(() => database.workTaskSurfaceInTransaction(taskId, task.version,
+			{ phase: "bound", thread, claimId: null, at: "2026-10-06T00:00:00.000Z" }));
+		const params = {
+			origin: thread, text: "Do not run a persona", messageId: "1544704223634260038",
+			engagement: { mentioned: true, group: true, authorId: "42" },
+		};
+		const forgedOrigins: OriginRef[] = [
+			{ ...thread, parentId: "999" }, { ...thread, boundaryId: "999" },
+			{ platform: "discord", kind: "channel", conversationId: thread.conversationId },
+			{ platform: "discord", kind: "dm", conversationId: thread.conversationId, peerId: "42" },
+		];
+		for (const [index, origin] of forgedOrigins.entries()) {
+			expect(await chatRequest(client, `forged-${index}`, "chat.send", { ...params, origin }))
+				.toMatchObject({ type: "error", error: { code: "invalid_params" } });
+		}
+		for (const [index, engagement] of [
+			{ ...params.engagement, authorId: "43" },
+			{ ...params.engagement, authorIsBot: true },
+		].entries()) {
+			expect(await chatRequest(client, `unauthorized-${index}`, "chat.send", { ...params, engagement }))
+				.toMatchObject({ type: "error", error: { code: "unauthorized" } });
+		}
+		expect(await chatRequest(client, "forged-source", "chat.send",
+			{ ...params, originSource: { platformCreatedAt: 0 } }))
+			.toMatchObject({ type: "error", error: { code: "invalid_params" } });
+		for (const conversationId of [thread.conversationId, "retained-thread"]) {
+			// Deliberately corrupt storage through the fixture connection only.
+			raw.exec("PRAGMA ignore_check_constraints = ON");
+			try {
+				raw.query("UPDATE work_tasks SET thread_origin_key = ?, record_json = '{broken' WHERE task_id = ?")
+					.run(originKey({ ...thread, conversationId }), taskId);
+			} finally {
+				raw.exec("PRAGMA ignore_check_constraints = OFF");
+			}
+			for (const verb of ["chat.send", "chat.edit"] as const) {
+				expect(await chatRequest(client, `corrupt-${conversationId}-${verb}`, verb,
+					{ ...params, origin: { ...thread, conversationId } }))
+					.toMatchObject({ type: "error", error: { code: "verb_failed" } });
+			}
+		}
+		// Invalid generic segments still fail at ingress, not at task discovery.
+		for (const [index, conversationId] of ["", "1/parent=2", "1%"].entries()) {
+			expect(await chatRequest(client, `invalid-segment-${index}`, "chat.send",
+				{ ...params, origin: { platform: "discord", kind: "dm", conversationId, peerId: "42" } }))
+				.toMatchObject({ type: "error" });
+		}
+		expect(binds).toEqual([]);
+		expect(prompts).toEqual([]);
+		expect(client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message")).toEqual([]);
+		expect(raw.query("SELECT COUNT(*) AS count FROM work_controls").get()).toEqual({ count: 0 });
+		expect(raw.query("SELECT COUNT(*) AS count FROM work_attempt_runtime").get()).toEqual({ count: 0 });
+
+		// Both accepted generic and canonical unmapped IDs must reach the persona,
+		// even while an independently corrupt permanent mapping remains retained.
+		for (const [index, conversationId] of ["c1", "1556589606403842999"].entries()) {
+			expect(await chatRequest(client, `ordinary-${index}`, "chat.send", {
+				origin: { platform: "discord", kind: "dm", conversationId, peerId: "42" },
+				text: `ordinary ${index}`, messageId: `ordinary-message-${index}`,
+				engagement: { mentioned: false, group: false, authorId: "42" },
+			})).toMatchObject({ type: "response", result: { engaged: true } });
+			for (let attempt = 0; attempt < 400; attempt++) {
+				if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length > index) break;
+				await Bun.sleep(5);
+			}
+			const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
+			expect(messages).toHaveLength(index + 1);
+			expect(messages[index].payload).toMatchObject({ text: "ordinary reply", origin: { conversationId } });
+		}
+		expect(prompts).toHaveLength(2);
+		expect(() => database.workTaskGet(taskId)).toThrow();
+	} finally {
+		raw.close();
+		client.close();
+	}
 });
 
 test("Discord thread replies quote only numeric snowflake triggers by default", async () => {
@@ -1697,10 +1822,10 @@ test("Discord thread replies quote only numeric snowflake triggers by default", 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "thread",
 		verb: "chat.send",
@@ -1750,10 +1875,10 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "w",
 		verb: "work.run",
@@ -1769,7 +1894,7 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	});
 	expect(sessionPort.sends[0]).toMatchObject({ text: "fix the bug", repo: "/tmp/some-repo", codingRegister: true });
 	// Invalid names are rejected before touching the SessionPort.
-	client.send({ v: "0.1", type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
 	client.close();
@@ -1795,10 +1920,10 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "w",
 		verb: "work.run",
@@ -1810,7 +1935,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	const jobId = run.result.jobId;
 	expect(jobId).toBe(`lanejob-${Buffer.from("Repo.Fix-2", "utf8").toString("hex")}`);
 
-	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "jobs", verb: "work.jobs" });
 	await waitFor(client.frames, 3);
 	const jobs = client.frames.find((frame) => frame.type === "response" && frame.id === "jobs");
 	expect(jobs.result.jobs).toHaveLength(1);
@@ -1848,7 +1973,7 @@ test("work.run records a durable lane job and work.jobs projects it (issue #10)"
 	for (const resume of [false, true]) {
 		const id = `corrupt-${resume}`;
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "work.run",
@@ -1910,10 +2035,10 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "w",
 		verb: "work.run",
@@ -1924,7 +2049,7 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	expect(run.type).toBe("response");
 	// A second lane whose worktree has since been removed (Q5: manual cleanup).
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "gone",
 		verb: "work.run",
@@ -1932,7 +2057,7 @@ test("work.jobs projects each lane's last commit, accept time and current attemp
 	});
 	await waitFrame(client.frames, "gone");
 
-	client.send({ v: "0.1", type: "request", id: "jobs", verb: "work.jobs" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "jobs", verb: "work.jobs" });
 	await waitFrame(client.frames, "jobs");
 	const jobs = client.frames.find((frame) => frame.id === "jobs").result.jobs;
 	const row = jobs.find((job: { lane_key: string }) => job.lane_key === "work-row");
@@ -1978,9 +2103,9 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
-	client.send({ v: "0.1", type: "request", id: "w", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "w", verb: "work.run", params: { name: "stall-out", text: "x" } });
 	await waitFor(client.frames, 2);
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
 	// Simulate the reconciliation outcome after repeated stalled continuations.
@@ -1996,7 +2121,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 		lane: first.lane,
 		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
 	});
-	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
 	async function waitId2(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -2008,7 +2133,7 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	expect(turns).toBe(1);
 	// resume:true is the explicit operator acknowledgement that proceeds.
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "w3",
 		verb: "work.run",
@@ -2045,12 +2170,12 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const jobId = `lanejob-${Buffer.from("stall-clear", "utf8").toString("hex")}`;
 
 	// First run succeeds (creates the job).
-	client.send({ v: "0.1", type: "request", id: "w1", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "w1", verb: "work.run", params: { name: "stall-clear", text: "x" } });
 	async function waitId3(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -2070,7 +2195,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	});
 
 	// Ordinary call: held.
-	client.send({ v: "0.1", type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
 	await waitId3("w2");
 	expect(client.frames.find((frame) => frame.id === "w2" && frame.type === "response")?.result).toMatchObject({
 		held: true,
@@ -2080,7 +2205,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 
 	// resume:true: runs AND durably clears the hold with an audit entry.
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "w3",
 		verb: "work.run",
@@ -2096,7 +2221,7 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	expect(afterResume.escalations.some((entry) => entry.includes("operator resume acknowledged"))).toBe(true);
 
 	// The NEXT ordinary call is not held by the old stalled state.
-	client.send({ v: "0.1", type: "request", id: "w4", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "w4", verb: "work.run", params: { name: "stall-clear", text: "x" } });
 	await waitId3("w4");
 	expect(client.frames.find((frame) => frame.id === "w4" && frame.type === "response")?.result).toMatchObject({
 		held: false,
@@ -2123,10 +2248,10 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "model",
 		verb: "work.run",
@@ -2142,7 +2267,7 @@ test("work.run forwards a model preset to bind and send and rejects invalid mode
 	for (const [index, model] of [{ preset: "" }, 42].entries()) {
 		const id = `invalid-model-${index}`;
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "work.run",
@@ -2178,10 +2303,10 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "first",
 		verb: "work.run",
@@ -2192,7 +2317,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	expect(first).toMatchObject({ type: "response", result: { held: false, sessionKey: "work/task/a" } });
 	const sessionId = database.getSessionRecord("work/task/a")!.sessionId;
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "full",
 		verb: "work.run",
@@ -2206,7 +2331,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	expect(sessionPort.binds).toHaveLength(1);
 	expect(sessionPort.sends).toHaveLength(1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "reuse",
 		verb: "work.run",
@@ -2219,7 +2344,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	});
 	expect(sessionPort.sends).toHaveLength(2);
 	expect(sessionPort.sends[1].sessionId).toBe(sessionId);
-	client.send({ v: "0.1", type: "request", id: "jobs-active", verb: "work.jobs" });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "jobs-active", verb: "work.jobs" });
 	await waitFor(client.frames, 5);
 	const jobs = client.frames.find((frame) => frame.id === "jobs-active");
 	expect(jobs.result.jobs).toHaveLength(1);
@@ -2228,7 +2353,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 		session_id: sessionId,
 		last_activity_at: expect.any(String),
 	});
-	client.send({ v: "0.1", type: "request", id: "retire", verb: "work.retire", params: { name: "a" } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "retire", verb: "work.retire", params: { name: "a" } });
 	await waitFor(client.frames, 6);
 	expect(client.frames.find((frame) => frame.id === "retire")).toMatchObject({
 		type: "response",
@@ -2237,7 +2362,7 @@ test("work capacity rejects new lanes, permits reuse, and work.retire frees the 
 	expect(sessionPort.closes).toEqual([{ sessionId, repo: directory }]);
 	expect(database.getSessionRecord("work/task/a")).toEqual({ sessionId: "", epoch: 1 });
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "freed",
 		verb: "work.run",
@@ -2272,10 +2397,10 @@ test("responses larger than one socket buffer arrive intact (backpressure outbox
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "big",
 		verb: "chat.send",
@@ -2314,10 +2439,10 @@ test("every turn preamble carries the attachment-scope rule", async () => {
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "a",
 		verb: "chat.send",
@@ -2374,12 +2499,12 @@ test("a fresh session's first turn carries recent conversation history, a later 
 	database.contextCommitWindow(key, ["old-1", "old-2", "old-3", "old-img"], 0);
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "dm", conversationId: "d-hist", peerId: "owner" };
 	const say = (id: string, text: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -2429,12 +2554,12 @@ test("control tokens never leak: a silence token inside a preamble silences, and
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	const origin = { platform: "discord", kind: "channel", conversationId: "c1" };
 	const say = (id: string, text: string) =>
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.send",
@@ -2482,7 +2607,7 @@ async function workSocketFixture() {
 		},
 	});
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
 	return {
 		config,
@@ -2498,7 +2623,7 @@ async function workSocketFixture() {
 test("socket work.start accepts before terminal, status/steer stay available, one completion notice", async () => {
 	const f = await workSocketFixture();
 	f.client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "start",
 		verb: "work.start",
@@ -2508,16 +2633,16 @@ test("socket work.start accepts before terminal, status/steer stay available, on
 	const receipt = f.client.frames.find((frame) => frame.id === "start").result;
 	expect(receipt.started).toBe(true);
 	expect(f.database.workAttemptGet(receipt.opRef)?.settledAt).toBeNull();
-	f.client.send({ v: "0.1", type: "request", id: "status", verb: "work.status", params: { name: "a" } });
+	f.client.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "work.status", params: { name: "a" } });
 	f.client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "steer",
 		verb: "work.steer",
 		params: { name: "a", text: "correction" },
 	});
 	f.client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "overlap",
 		verb: "work.start",
@@ -2545,17 +2670,17 @@ test("socket work.start accepts before terminal, status/steer stay available, on
 test("one socket disconnect leaves its work observable while another run waits independently", async () => {
 	const f = await workSocketFixture();
 	const second = await connect(f.config.socketPath);
-	second.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	second.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(second.frames, 1);
 	f.client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "run-a",
 		verb: "work.run",
 		params: { name: "a", text: "work", cwd: directory },
 	});
 	second.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "run-b",
 		verb: "work.run",
@@ -2564,7 +2689,7 @@ test("one socket disconnect leaves its work observable while another run waits i
 	for (let i = 0; i < 600 && f.port.sends.length < 2; i++) await Bun.sleep(5);
 	expect(f.port.sends).toHaveLength(2);
 	f.client.close();
-	second.send({ v: "0.1", type: "request", id: "observe-a", verb: "work.status", params: { name: "a" } });
+	second.send({ v: PROFILE_VERSION, type: "request", id: "observe-a", verb: "work.status", params: { name: "a" } });
 	await waitFrame(second.frames, "observe-a");
 	expect(second.frames.find((frame) => frame.id === "observe-a").result.attempt.endedAt).toBeUndefined();
 	expect(second.frames.some((frame) => frame.id === "run-b")).toBe(false);
@@ -2580,7 +2705,7 @@ test("one socket disconnect leaves its work observable while another run waits i
 test("Unix stop detaches a long run before request drain and leaves the attempt durable", async () => {
 	const f = await workSocketFixture();
 	f.client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "run",
 		verb: "work.run",
@@ -2653,10 +2778,10 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		child.stdin.flush();
 	};
 	try {
-		send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await waitFor(frames, 1);
 		send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "run",
 			verb: "work.run",
@@ -2665,13 +2790,13 @@ test("stdio stop detaches work.run before runtime request drain in an actual chi
 		let observable = false;
 		for (let i = 0; i < 100 && !observable; i++) {
 			const id = `status-${i}`;
-			send({ v: "0.1", type: "request", id, verb: "work.status", params: { name: "a" } });
+			send({ v: PROFILE_VERSION, type: "request", id, verb: "work.status", params: { name: "a" } });
 			await waitFrame(frames, id);
 			observable = frames.find((frame) => frame.id === id)?.result?.op?.status === "in_flight";
 			if (!observable) await Bun.sleep(5);
 		}
 		expect(observable).toBe(true);
-		send({ v: "0.1", type: "request", id: "shutdown", verb: "gateway.shutdown" });
+		send({ v: PROFILE_VERSION, type: "request", id: "shutdown", verb: "gateway.shutdown" });
 		let exitCode: number | undefined;
 		void child.exited.then((code) => {
 			exitCode = code;
@@ -2704,7 +2829,7 @@ for (const verb of ["work.start", "work.run"] as const) {
 	test(`session.list preserves fresh ${verb} worker identity before and after settlement`, async () => {
 		const f = await workSocketFixture();
 		const name = "identity-worker";
-		f.client.send({ v: "0.1", type: "request", id: "worker", verb, params: { name, text: "work", cwd: directory } });
+		f.client.send({ v: PROFILE_VERSION, type: "request", id: "worker", verb, params: { name, text: "work", cwd: directory } });
 		for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
 		expect(f.port.sends).toHaveLength(1);
 		const opRef = f.port.sends[0]!.opRef;
@@ -2717,7 +2842,7 @@ for (const verb of ["work.start", "work.run"] as const) {
 				await waitFrame(f.client.frames, "worker");
 			} else expect(f.database.workAttemptGet(opRef)?.settledAt).toBeNull();
 			const id = `sessions-${phase}`;
-			f.client.send({ v: "0.1", type: "request", id, verb: "session.list" });
+			f.client.send({ v: PROFILE_VERSION, type: "request", id, verb: "session.list" });
 			await waitFrame(f.client.frames, id);
 			const sessions = f.client.frames.find((frame) => frame.id === id).result.sessions;
 			expect(sessions).toHaveLength(1);
@@ -2756,10 +2881,10 @@ test("status reports each connected client's generation and flags an adapter old
 	// gateway process even though the reconnect itself is fresh.
 	const stale = await connect(config.socketPath);
 	stale.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "hello",
 		payload: {
-			supportedVersions: ["0.1"],
+			supportedVersions: [PROFILE_VERSION],
 			clientInfo: { name: "adapter-slack", startedAt: "2026-01-01T00:00:00.000Z" },
 		},
 	});
@@ -2767,10 +2892,10 @@ test("status reports each connected client's generation and flags an adapter old
 
 	const fresh = await connect(config.socketPath);
 	fresh.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "hello",
 		payload: {
-			supportedVersions: ["0.1"],
+			supportedVersions: [PROFILE_VERSION],
 			clientInfo: { name: "adapter-discord", startedAt: "2026-01-02T00:00:30.000Z" },
 		},
 	});
@@ -2778,10 +2903,10 @@ test("status reports each connected client's generation and flags an adapter old
 
 	// A client that reports no start time is a diagnostic gap, never "stale".
 	const anonymous = await connect(config.socketPath);
-	anonymous.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	anonymous.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(anonymous.frames, 1);
 
-	fresh.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	fresh.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(fresh.frames, 2);
 	const clients = fresh.frames[1].result.clients as Array<{
 		name: string;

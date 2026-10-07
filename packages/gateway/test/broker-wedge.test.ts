@@ -17,7 +17,7 @@ import {
 } from "../src/orchestrator/session-port";
 import { TailRunner } from "../src/orchestrator/tail-runner";
 import { GatewayDatabase } from "../src/store/db";
-import { initializeTestBrokerAuthority, noRelay, ScriptedSessionPort } from "./session-port.fake";
+import { initializeTestBrokerAuthority, noRelay, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const NOW = Date.parse("2026-09-18T00:00:00.000Z");
 const REPO = "/tmp/gajaeway-broker-wedge-repo";
@@ -25,6 +25,41 @@ const ORIGIN = "discord/channel/broker-wedge";
 
 const directories: string[] = [];
 const databases: GatewayDatabase[] = [];
+
+test("scripted steering lookup retains exact receipts and rejects mismatched original identities", async () => {
+	const port = new ScriptedSessionPort();
+	const input = { sessionId: "original-session", repo: REPO, clientRef: "original-steer", text: "Inspect" };
+	expect(await port.lookupSteerStatus(input)).toEqual({ status: "unknown", clientRef: input.clientRef });
+	await port.steer(input);
+	const receipt = await port.lookupSteerStatus(input);
+	expect(receipt).toEqual({ status: "accepted", clientRef: input.clientRef, acceptedAt: expect.any(Number) });
+	expect(await port.lookupSteerStatus(input)).toEqual(receipt);
+	for (const mismatch of [{ ...input, sessionId: "other-session" }, { ...input, repo: "/other-repo" }]) {
+		expect(await port.lookupSteerStatus(mismatch)).toEqual({
+			status: "unavailable", clientRef: input.clientRef, code: "identity_mismatch",
+		});
+	}
+	expect(await port.lookupSteerStatus({ ...input, clientRef: "unrecorded" })).toEqual({
+		status: "unknown", clientRef: "unrecorded",
+	});
+	await expect(port.lookupSteerStatus({ ...input, clientRef: " original-steer" })).rejects.toThrow("canonical");
+	expect(port.steers).toEqual([input]);
+	expect(port.sends).toEqual([]);
+});
+
+test("scripted steering refusal is not acceptance and transport failure stays unknown", async () => {
+	const refusal = steerRefused();
+	const port = new ScriptedSessionPort({ onSteer: () => { throw refusal; } });
+	const input = { sessionId: "original-session", repo: REPO, clientRef: "refused-steer", text: "Inspect" };
+	await expect(port.steer(input)).rejects.toBe(refusal);
+	expect(await port.lookupSteerStatus(input)).toEqual({
+		status: "rejected", clientRef: input.clientRef, acceptedAt: expect.any(Number),
+		terminalAt: expect.any(Number), errorCode: "busy",
+	});
+	const uncertain = new ScriptedSessionPort({ onSteer: () => { throw new Error("transport lost"); } });
+	await expect(uncertain.steer(input)).rejects.toThrow("transport lost");
+	expect(await uncertain.lookupSteerStatus(input)).toEqual({ status: "unknown", clientRef: input.clientRef });
+});
 
 afterEach(async () => {
 	for (const database of databases.splice(0)) database.close();

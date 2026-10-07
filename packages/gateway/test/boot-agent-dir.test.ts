@@ -169,6 +169,8 @@ describe("agent directory in practice", () => {
 
 		// Simulate an upgrade: the newest migration is pending, as on a host booting a newer build.
 		const raw = new Database(dbPath);
+		// Subtract only v33 fixture objects before rewinding receipts; missing objects are fixture errors.
+		raw.exec("DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks;");
 		raw.run("DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)");
 		raw.close();
 

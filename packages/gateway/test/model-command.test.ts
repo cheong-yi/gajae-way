@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { applyModelCommand, listModelChoices, parseModelArgument } from "../src/server/model-command";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -224,11 +225,11 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 	try {
 		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
 		client = await connect(config.socketPath);
-		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await Bun.sleep(5);
 		// Autocomplete source over the socket: no broker agent dir here, so only the
 		// configured selector is offered.
-		client.send({ v: "0.1", type: "request", id: "choices", verb: "session.modelChoices" });
+		client.send({ v: PROFILE_VERSION, type: "request", id: "choices", verb: "session.modelChoices" });
 		const choicesClient = client;
 		await waitFor(
 			() => choicesClient.frames.some((frame) => frame.id === "choices"),
@@ -240,7 +241,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		});
 		const origin = { platform: "loopback", kind: "loopback", conversationId: "model" };
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "first",
 			verb: "chat.send",
@@ -258,7 +259,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		);
 
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "model",
 			verb: "chat.send",
@@ -285,7 +286,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		).toBe(true);
 
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "second",
 			verb: "chat.send",
@@ -299,7 +300,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 		expect(port.serviceTiers).toHaveLength(1);
 		port.complete(second.opRef, "second transcript");
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "clear",
 			verb: "chat.send",
@@ -310,7 +311,7 @@ test("/model live-rebind keeps the session transcript and applies the new model 
 			return typeof selection !== "string" && selection?.preset === "base";
 		}, "clearing the override did not restore the configured model on the same session");
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "third",
 			verb: "chat.send",

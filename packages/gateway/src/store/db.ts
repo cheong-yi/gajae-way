@@ -14,6 +14,17 @@ import {
 	type ProtocolFailureReason,
 	parseOriginKey,
 	validateOriginRef,
+	validateDeliveryConfirmParams,
+	validateWorkTaskMessageMetadata,
+	type WorkTaskDispositionParams,
+	type WorkTaskDispositionRecord,
+	type WorkTaskDispositionResult,
+	validateWorkTaskDispositionParams,
+	validateWorkTaskDispositionRecord,
+	validateWorkTaskDispositionResult,
+	type WorkTaskDispositionBasis,
+	type WorkTaskDispositionBasisResult,
+	validateWorkTaskDispositionBasisResult,
 } from "@gajae-gateway/protocol";
 import {
 	assertValidOpRef,
@@ -119,6 +130,9 @@ const BROKER_SNAPSHOT_TABLES = [
 	"session_tail_cursors",
 	"work_attempt_runtime",
 	"lane_reports",
+	"work_tasks",
+	"work_controls",
+	"work_task_sources",
 	"broker_owned_bindings",
 	"broker_tail_cursors",
 	"broker_retired_sessions",
@@ -129,6 +143,10 @@ const REPLAYABLE_INBOUND =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'inbound' AND q.subject_id = inbound_messages.message_id)";
 const REPLAYABLE_MONITOR =
 	"NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'monitor' AND q.subject_id = monitor_events.event_id)";
+const UNRETAINED_TASK_INBOUND =
+	"NOT EXISTS (SELECT 1 FROM work_controls c WHERE c.notification_id = inbound_messages.message_id) AND NOT EXISTS (SELECT 1 FROM work_tasks t JOIN work_attempt_runtime r ON r.op_ref = t.op_ref WHERE json_extract(r.record_json, '$.reportId') = inbound_messages.message_id)";
+const UNRETAINED_TASK_DELIVERY =
+	"NOT EXISTS (SELECT 1 FROM work_tasks t WHERE t.op_ref = deliveries.turn_id) AND NOT EXISTS (SELECT 1 FROM work_task_sources s WHERE s.delivery_id = deliveries.delivery_id)";
 
 export type WorkAttemptMode = "start" | "run" | "historical";
 export type WorkAttemptDecision =
@@ -275,6 +293,281 @@ export class WorkAttemptStateError extends Error {
 		this.opRef = opRef;
 		this.assertion = assertion;
 	}
+}
+
+export type WorkTaskKind = "read_only" | "code_mutating";
+export interface WorkTaskEvidence {
+	readonly principalId: string;
+	readonly origin: OriginRef;
+	readonly eventId: string;
+	readonly editId: string | null;
+	readonly evidenceAt: string;
+	readonly observedAt: string;
+}
+export interface WorkTaskRequest {
+	readonly text: string;
+	readonly context?: string;
+	readonly kind: WorkTaskKind;
+	readonly cwd: string;
+	readonly model?: GjcModelSelection;
+	readonly coordinator: OriginRef;
+	readonly surface: { readonly thread: OriginRef } | { readonly parent: OriginRef; readonly title?: string };
+	readonly evidence: WorkTaskEvidence;
+}
+export interface WorkTask {
+	readonly taskId: string;
+	readonly laneName: string;
+	readonly jobId: string;
+	readonly opRef: string;
+	readonly request: WorkTaskRequest;
+	readonly requestHash: string;
+	readonly thread: OriginRef | null;
+	readonly surfacePhase: "pending" | "claimed" | "bound" | "held";
+	readonly surfaceClaimId: string | null;
+	readonly surfaceHoldReason: string | null;
+	readonly dispatchPhase: "pending" | "prepared";
+	readonly sessionId: string | null;
+	readonly epoch: number | null;
+	readonly obligationState: "awaiting_final" | "final_admitted" | "held";
+	readonly terminalReportId: string | null;
+	readonly reportDisposition: WorkAttemptDecision | null;
+	readonly reportAdmittedAt: string | null;
+	readonly holdReason: string | null;
+	readonly createdAt: string;
+	readonly updatedAt: string;
+	readonly version: number;
+}
+/** Independently retained admission scope, never a validated runtime task or execution capability. */
+export interface WorkTaskQualifiedAdmissionScope {
+	readonly qualification: "retained_admission";
+	readonly taskId: string;
+	readonly requestHash: string;
+	readonly request: Pick<WorkTaskRequest, "kind" | "cwd" | "coordinator">;
+}
+export interface WorkTaskAttemptIdentity {
+	readonly opRef: string;
+	readonly sessionId: string;
+	readonly epoch: number;
+}
+export interface WorkControlRequest {
+	readonly taskId: string;
+	readonly expectedOpRef: string;
+	readonly kind: "steer" | "cancel_request" | "reset_notice";
+	readonly scope: WorkTaskKind;
+	readonly body: string;
+	readonly evidence: WorkTaskEvidence;
+}
+/** Internal manager proof after owner authentication and dedicated-worktree validation.
+ * This is not a wire capability; the store checks identity, never Git/OS facts.
+ */
+export interface WorkControlScopeAdmission {
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly cwd: string;
+	readonly kind: "code_mutating";
+	readonly eventId: string;
+	readonly sourceId: string;
+	readonly validatedAt: string;
+}
+/** Internal proof of an authenticated, explicitly named target. Source origin remains
+ * the actual caller's origin; this is not a public routing or authority override.
+ */
+export interface WorkControlRouteAdmission {
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly thread: OriginRef;
+	readonly sourceId: string;
+}
+export interface WorkControl {
+	readonly controlId: string;
+	readonly request: WorkControlRequest;
+	readonly requestHash: string;
+	readonly sequence: number;
+	readonly clientRef: string | null;
+	readonly notificationId: string;
+	readonly notificationDisposition: { readonly kind: "inbound" | "delivery"; readonly id: string } | null;
+	readonly sessionId: string | null;
+	readonly epoch: number | null;
+	readonly phase: "pending" | "sending" | "accepted" | "refused" | "held";
+	readonly reason: string | null;
+	readonly sendingAt: string | null;
+	readonly receipt: WorkControlReceipt | null;
+	readonly createdAt: string;
+	readonly updatedAt: string;
+	readonly version: number;
+}
+/** A caller-validated transport receipt, not proof of mandate completion. */
+export interface WorkControlReceipt extends WorkTaskAttemptIdentity {
+	readonly source: "turn.steer" | "turn.steer_status";
+	readonly clientRef: string;
+	readonly eventId: string;
+	readonly outcome: "accepted" | "refused";
+	readonly observedAt: string;
+	readonly evidence: string;
+}
+export interface WorkTaskSourceInput {
+	readonly sourceId: string;
+	readonly taskId: string;
+	readonly kind: "assignment" | "instruction" | "decision" | "observation";
+	readonly body: string;
+	readonly evidence: WorkTaskEvidence;
+	readonly supersedes: string | null;
+	readonly completeness: "complete" | "incomplete";
+	readonly controlId: string | null;
+	readonly reportId: string | null;
+	/** Written only by the identity-fenced administrative transaction. */
+	readonly administrative?: WorkTaskDispositionRecord;
+}
+/** Immutable retained source material; no consuming inbox read is needed. */
+export interface WorkTaskSource extends WorkTaskSourceInput {
+	readonly sequence: number;
+	readonly contentHash: string;
+	readonly deliveryId: string | null;
+}
+export type WorkTaskAdmission<T> =
+	| { readonly disposition: "created" | "duplicate"; readonly record: T }
+	| { readonly disposition: "conflict"; readonly record: T };
+export class WorkTaskStateError extends Error {
+	constructor(readonly code: "invalid" | "identity" | "transition" | "order" | "conflict" | "unavailable") {
+		super(`work task: ${code}`);
+		this.name = "WorkTaskStateError";
+	}
+}
+
+function taskAssert(condition: unknown, code: WorkTaskStateError["code"] = "invalid"): asserts condition {
+	if (!condition) throw new WorkTaskStateError(code);
+}
+function taskText(value: unknown, bytes: number): value is string {
+	return typeof value === "string" && value.trim().length > 0 && !value.includes("\0") &&
+		Buffer.byteLength(value, "utf8") <= bytes;
+}
+/** Canonical JSON makes property order irrelevant to immutable request deduplication. */
+function taskJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(taskJson).join(",")}]`;
+	if (value !== null && typeof value === "object")
+		return `{${Object.entries(value).filter(([, item]) => item !== undefined).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+			.map(([key, item]) => `${JSON.stringify(key)}:${taskJson(item)}`).join(",")}}`;
+	const json = JSON.stringify(value);
+	taskAssert(json !== undefined);
+	return json;
+}
+function taskHash(domain: string, value: unknown): string {
+	return createHash("sha256").update(taskJson([domain, value]), "utf8").digest("hex");
+}
+/** Transport observations are attribution, not a new assignment. Keep the first evidence verbatim. */
+function taskRequestHash(request: WorkTaskRequest): string {
+	return taskHash("work-task-assignment", {
+		text: request.text, context: request.context, kind: request.kind, cwd: request.cwd,
+		model: request.model, coordinator: request.coordinator, surface: request.surface,
+		principalId: request.evidence.principalId, origin: request.evidence.origin,
+	});
+}
+/** The event/edit identity dedupes delivery; receipt time cannot change its semantic payload. */
+function controlRequestHash(request: WorkControlRequest): string {
+	return taskHash("work-control-payload", {
+		taskId: request.taskId, expectedOpRef: request.expectedOpRef, kind: request.kind,
+		scope: request.scope, body: request.body, principalId: request.evidence.principalId,
+		origin: request.evidence.origin, eventId: request.evidence.eventId, editId: request.evidence.editId,
+	});
+}
+function workControlEventKey(request: WorkControlRequest): string {
+	return taskHash("work-control-event", [request.taskId, originKey(request.evidence.origin),
+		request.evidence.eventId, request.evidence.editId]);
+}
+export function workTaskSourceDeliveryId(taskId: string, sourceId: string, thread: OriginRef): string {
+	return `work-task-${taskHash("work-task-delivery", [taskId, sourceId, originKey(thread)])}`;
+}
+export function workTaskDispositionId(taskId: string, eventId: string, origin: OriginRef): string {
+	return `disposition-${taskHash("work-task-disposition", [taskId, eventId, originKey(origin)])}`;
+}
+
+export function workTaskDispositionText(request: WorkTaskDispositionParams): string {
+	return `Administrative ${request.outcome}: ${request.reason}\n` +
+		`Evidence (${request.evidence.availability}): ${request.evidence.detail}\n` +
+		(request.validationUnavailable
+			? `Retained validation-unavailable evidence ${request.validationUnavailable.sourceId}; stored admission only, not SDK proof.\n`
+			: "") +
+		"Execution unchanged; original uncertainty and obligations retained.";
+}
+
+function validateAdministrativeSource(source: WorkTaskSourceInput): void {
+	if (source.administrative === undefined) {
+		taskAssert(!/^disposition-[0-9a-f]{64}$/.test(source.sourceId), "identity");
+		return;
+	}
+	const record = validateWorkTaskDispositionRecord(source.administrative);
+	taskAssert(source.kind === "decision" && source.supersedes === null && source.completeness === "incomplete" &&
+		source.body === workTaskDispositionText(record.request) && record.request.taskId === source.taskId &&
+		source.sourceId === workTaskDispositionId(source.taskId, record.request.eventId, record.origin) &&
+		record.principalId === source.evidence.principalId &&
+		taskJson(record.origin) === taskJson(source.evidence.origin) &&
+		record.request.eventId === source.evidence.eventId && source.evidence.editId === null &&
+		record.recordedAt === source.evidence.observedAt &&
+		source.controlId === (record.request.target.kind === "control" ? record.request.target.controlId : null) &&
+		source.reportId === (record.request.target.kind === "report" ? record.request.target.reportId : null), "identity");
+}
+function validateTaskEvidence(value: WorkTaskEvidence): void {
+	taskAssert(value && typeof value === "object");
+	taskAssert(workString(value.principalId) && workString(value.eventId, 1024) &&
+		Buffer.byteLength(value.eventId, "utf8") <= 1024);
+	taskAssert(value.editId === null || workString(value.editId));
+	taskAssert(workTime(value.evidenceAt) && workTime(value.observedAt));
+	validateOriginRef(value.origin);
+}
+function validateTaskRequest(value: WorkTaskRequest): void {
+	taskAssert(value && typeof value === "object" && taskText(value.text, 16 * 1024));
+	taskAssert(value.context === undefined || taskText(value.context, 16 * 1024));
+	taskAssert(["read_only", "code_mutating"].includes(value.kind));
+	taskAssert(workString(value.cwd, 4096) && isAbsolute(value.cwd) && normalize(value.cwd) === value.cwd);
+	taskAssert(value.model === undefined || parseModelSelection(value.model) !== undefined);
+	validateOriginRef(value.coordinator);
+	taskAssert(["discord", "slack", "telegram", "loopback"].includes(value.coordinator.platform));
+	validateTaskEvidence(value.evidence);
+	taskAssert(value.surface && typeof value.surface === "object");
+	taskAssert(("thread" in value.surface) !== ("parent" in value.surface));
+	const surface = "thread" in value.surface ? value.surface.thread : value.surface.parent;
+	validateOriginRef(surface);
+	taskAssert(surface.platform === "discord");
+	if ("thread" in value.surface) taskAssert(surface.kind === "thread");
+	else taskAssert(surface.kind === "channel" &&
+		(value.surface.title === undefined || (taskText(value.surface.title, 400) && value.surface.title.length <= 100)));
+	taskAssert(Buffer.byteLength(taskJson(value), "utf8") <= 96 * 1024);
+}
+function validateTask(value: WorkTask): void {
+	taskAssert(value && typeof value === "object");
+	taskAssert(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value.taskId));
+	taskAssert(value.laneName === `fm-${value.taskId}` && value.jobId === laneJobDatabaseId(value.laneName), "identity");
+	assertValidOpRef(value.opRef);
+	validateTaskRequest(value.request);
+	taskAssert(value.requestHash === taskRequestHash(value.request), "identity");
+	taskAssert(["pending", "claimed", "bound", "held"].includes(value.surfacePhase));
+	taskAssert(value.surfaceClaimId === null || workString(value.surfaceClaimId));
+	taskAssert(value.surfaceHoldReason === null || taskText(value.surfaceHoldReason, 2048));
+	taskAssert((value.surfacePhase === "held") === (value.surfaceHoldReason !== null));
+	taskAssert(value.surfacePhase !== "claimed" || value.surfaceClaimId !== null);
+	taskAssert((value.surfacePhase === "bound") === (value.thread !== null));
+	if (value.thread !== null) {
+		validateOriginRef(value.thread);
+		taskAssert(value.thread.platform === "discord" && value.thread.kind === "thread");
+		if ("thread" in value.request.surface)
+			taskAssert(taskJson(value.thread) === taskJson(value.request.surface.thread), "identity");
+	}
+	taskAssert(["pending", "prepared"].includes(value.dispatchPhase));
+	taskAssert(value.dispatchPhase === "pending"
+		? value.sessionId === null && value.epoch === null
+		: workString(value.sessionId) && Number.isSafeInteger(value.epoch) && value.epoch! >= 0 && value.thread !== null);
+	taskAssert(["awaiting_final", "final_admitted", "held"].includes(value.obligationState));
+	taskAssert((value.obligationState === "held") === (value.holdReason !== null));
+	taskAssert(value.holdReason === null || taskText(value.holdReason, 2048));
+	taskAssert(value.terminalReportId === null || workString(value.terminalReportId));
+	taskAssert(value.reportDisposition === null ||
+		["undecided", "reported", "fallback", "suppressed", "no_target", "wake_unaccepted"].includes(value.reportDisposition));
+	taskAssert(value.reportAdmittedAt === null || workTime(value.reportAdmittedAt));
+	taskAssert(value.obligationState !== "final_admitted" ||
+		(value.terminalReportId !== null && value.reportAdmittedAt !== null &&
+			value.reportDisposition !== null && value.reportDisposition !== "undecided"));
+	taskAssert(workTime(value.createdAt) && workTime(value.updatedAt));
+	taskAssert(Number.isSafeInteger(value.version) && value.version >= 0);
 }
 
 /**
@@ -617,7 +910,7 @@ export class InboundTurnConflictError extends Error {
 	}
 }
 
-const LATEST_SCHEMA_VERSION = 32;
+const LATEST_SCHEMA_VERSION = 33;
 
 /** Maximum number of prior messages supplied to one engaged conversation turn. */
 export const CONVERSATION_DIFF_MAX_ROWS = 60;
@@ -887,6 +1180,14 @@ export class GatewayDatabase {
 				this.#database
 					.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM lane_reports WHERE state IN ('pending','claimed')")
 					.get()?.n ?? 0;
+			for (const row of this.#database.query<{ task_id: string }, []>("SELECT task_id FROM work_tasks").all()) {
+				const task = this.workTaskGet(row.task_id)!;
+				if (!this.isBrokerQuarantined("work", task.jobId) &&
+					(task.dispatchPhase === "pending" || task.obligationState !== "final_admitted" ||
+						this.#database.query(
+							"SELECT 1 FROM work_controls WHERE task_id = ? AND phase NOT IN ('accepted','refused') LIMIT 1",
+						).get(task.taskId))) openWork++;
+			}
 		} catch (error) {
 			if (!(error as Error).message.includes("no such table")) throw error;
 		}
@@ -1100,6 +1401,7 @@ export class GatewayDatabase {
 			for (const [kind, table, column] of [
 				["inbound", "inbound_messages", "message_id"],
 				["work", "lane_jobs", "job_id"],
+				["work", "work_tasks", "job_id"],
 				["monitor", "monitor_events", "event_id"],
 			] as const) {
 				this.#database
@@ -1144,6 +1446,1130 @@ export class GatewayDatabase {
 	/** Explicit seam for operations that must participate in a caller-owned commit. */
 	requireTransaction(): void {
 		if (!this.#inTransaction) throw new Error("operation requires a database transaction");
+	}
+
+	workTaskGet(taskId: string): WorkTask | undefined {
+		const task = this.#workTaskAdmission(taskId);
+		if (task?.dispatchPhase === "prepared")
+			this.#workTaskRuntime(task, { opRef: task.opRef, sessionId: task.sessionId!, epoch: task.epoch! });
+		return task;
+	}
+
+	/** Private admission bookkeeping, never an execution/control fallback. */
+	#workTaskAdmission(taskId: string): WorkTask | undefined {
+		const row = this.#database.query<{
+			task_id: string; lane_name: string; job_id: string; op_ref: string;
+			thread_origin_key: string | null; version: number; record_json: string;
+			dispatch_phase: string; surface_phase: string; obligation_state: string;
+		}, [string]>("SELECT * FROM work_tasks WHERE task_id = ?").get(taskId);
+		if (!row) return undefined;
+		const task = JSON.parse(row.record_json) as WorkTask;
+		validateTask(task);
+		taskAssert(task.taskId === row.task_id && task.laneName === row.lane_name &&
+			task.jobId === row.job_id && task.opRef === row.op_ref && task.version === row.version &&
+			(task.thread === null ? null : originKey(task.thread)) === row.thread_origin_key &&
+			task.dispatchPhase === row.dispatch_phase && task.surfacePhase === row.surface_phase &&
+			task.obligationState === row.obligation_state, "identity");
+		return task;
+	}
+
+	#workTaskNegativeAnchor(taskId: string): { task: WorkTask; mapped: boolean } {
+		const task = this.#workTaskAdmission(taskId);
+		taskAssert(task && task.dispatchPhase === "prepared", "unavailable");
+		const assignment = this.workTaskSourceGet(`assignment-${task.taskId}`);
+		taskAssert(assignment && assignment.taskId === task.taskId && assignment.kind === "assignment" &&
+			assignment.body === task.request.text && assignment.completeness === "complete" &&
+			taskJson(assignment.evidence) === taskJson(task.request.evidence) &&
+			assignment.supersedes === null && assignment.controlId === null && assignment.reportId === null &&
+			assignment.administrative === undefined && assignment.deliveryId === null &&
+			task.createdAt === assignment.evidence.observedAt, "identity");
+		// A locator/tombstone alone is not authenticated creation or delivery evidence.
+		// Mapping failures permit only an admission-attributed source with null intent.
+		let mapped = false;
+		try {
+			const marker = this.workTaskSourceGet(`activation-${task.taskId}`);
+			taskAssert(task.thread && task.surfacePhase === "bound" && marker &&
+				marker.taskId === task.taskId && marker.kind === "observation" &&
+				marker.completeness === "complete" && marker.supersedes === null &&
+				marker.controlId === null && marker.reportId === null && marker.administrative === undefined &&
+				marker.evidence.principalId === "gateway" && marker.evidence.editId === null &&
+				taskJson(marker.evidence.origin) === taskJson(task.thread) &&
+				marker.body === `Assignment ${task.taskId}\n${task.request.text}\nScope: ${task.request.kind}; repository admission is not an OS sandbox.` &&
+				marker.deliveryId === workTaskSourceDeliveryId(task.taskId, marker.sourceId, task.thread), "identity");
+			if ("parent" in task.request.surface) {
+				taskAssert(task.surfaceClaimId !== null && marker.evidence.eventId === task.surfaceClaimId &&
+					task.thread.parentId === task.request.surface.parent.conversationId &&
+					task.thread.boundaryId === task.request.surface.parent.boundaryId, "identity");
+			}
+			const delivery = this.deliveryGet(marker.deliveryId!);
+			taskAssert(delivery && delivery.turn_id === task.opRef &&
+				delivery.origin_key === originKey(task.thread), "identity");
+			const payload = JSON.parse(delivery.payload_json) as ChatMessagePayload;
+			validateWorkTaskMessageMetadata(payload.workTask, {
+				origin: task.thread, taskId: task.taskId, opRef: task.opRef, sourceId: marker.sourceId,
+			});
+			taskAssert(payload.deliveryId === marker.deliveryId && payload.turnId === task.opRef &&
+				taskJson(payload.origin) === taskJson(task.thread) && payload.text === marker.body &&
+				payload.role === "assistant" && payload.final === false &&
+				!payload.reaction && !payload.voiceText, "identity");
+			mapped = true;
+		} catch { /* No guessed destination, replacement mapping, or retroactive intent. */ }
+		return { task, mapped };
+	}
+
+	#workTaskUnavailableBody(task: WorkTask, sourceId: string, mapped: boolean): string {
+		return `Task ${task.taskId}; stored admission operation ${task.opRef}; request hash ${task.requestHash}.\n` +
+			"Original linked runtime/job evidence unavailable. Code: linked_record_unavailable.\n" +
+			`Opaque corruption fact ${sourceId}.\n` +
+			"Identity provenance: validated retained task columns, request hash and original assignment source; stored admission is not GJC truth.\n" +
+			"Execution, session ownership, terminal outcome and safety are unknown. Evidence incomplete; no replay, control, release or cleanup authority.\n" +
+			(mapped ? "Destination verified against original activation source and retained delivery."
+				: "No verified available original destination: audit only, null delivery intent; no retroactive delivery promise.");
+	}
+
+	/**
+	 * Negative-only write. No caller body, SDK identity, target or exception text is
+	 * accepted. Quarantine remains intact; normal task reads and writes stay strict.
+	 */
+	workTaskRecordLinkedUnavailableInTransaction(
+		taskId: string, at: string, surfaceAvailable: (origin: OriginRef) => boolean,
+	): WorkTaskSource | undefined {
+		this.requireTransaction();
+		taskAssert(workTime(at));
+		const { task, mapped } = this.#workTaskNegativeAnchor(taskId);
+		try {
+			this.#workTaskRuntime(task, { opRef: task.opRef, sessionId: task.sessionId!, epoch: task.epoch! });
+			return undefined;
+		} catch { /* Only the failure to validate is evidence; never parse for salvage. */ }
+		const runtime = this.#database.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(task.opRef);
+		const job = this.#database.query("SELECT * FROM lane_jobs WHERE job_id = ?").get(task.jobId);
+		const fingerprint = taskHash("work-task-linked-unavailable", {
+			taskId: task.taskId, opRef: task.opRef, requestHash: task.requestHash, runtime, job,
+		});
+		const sourceId = `unavailability-${fingerprint}`;
+		const existing = this.workTaskSourceGet(sourceId);
+		if (existing) {
+			this.#validateWorkTaskUnavailable(task, mapped, existing);
+			return existing;
+		}
+		let deliver = false;
+		if (mapped) {
+			try { deliver = surfaceAvailable(JSON.parse(taskJson(task.thread!)) as OriginRef) === true; }
+			catch { /* Presentation lookup failure cannot invent a destination or erase the negative fact. */ }
+		}
+		const retained = this.#workTaskNegativeAnchor(taskId);
+		taskAssert(taskJson(retained.task) === taskJson(task) && retained.mapped === mapped &&
+			taskJson(this.#database.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(task.opRef)) === taskJson(runtime) &&
+			taskJson(this.#database.query("SELECT * FROM lane_jobs WHERE job_id = ?").get(task.jobId)) === taskJson(job), "conflict");
+		const input: WorkTaskSourceInput = {
+			sourceId, taskId, kind: "observation",
+			body: this.#workTaskUnavailableBody(task, sourceId, deliver),
+			evidence: { principalId: "gateway", origin: deliver ? task.thread! : task.request.evidence.origin,
+				eventId: sourceId, editId: null, evidenceAt: at, observedAt: at },
+			supersedes: null, completeness: "incomplete", controlId: null, reportId: null,
+		};
+		let payload: ChatMessagePayload | undefined;
+		if (deliver) {
+			const deliveryId = workTaskSourceDeliveryId(taskId, sourceId, task.thread!);
+			const body = buildDeliveryPayload(task.opRef, task.thread!, input.body, deliveryId, undefined, false);
+			taskAssert(body, "unavailable");
+			payload = { ...body, workTask: { taskId, opRef: task.opRef, sourceId, mappedOnly: true } };
+		}
+		return this.#workTaskSourceAppendInTransaction(input, payload, task);
+	}
+
+	#validateWorkTaskUnavailable(task: WorkTask, mapped: boolean, source: WorkTaskSource): void {
+		const delivered = source.deliveryId !== null;
+		taskAssert(/^unavailability-[0-9a-f]{64}$/.test(source.sourceId) &&
+			source.taskId === task.taskId && source.kind === "observation" &&
+			source.body === this.#workTaskUnavailableBody(task, source.sourceId, delivered) &&
+			source.completeness === "incomplete" && source.supersedes === null &&
+			source.controlId === null && source.reportId === null && source.administrative === undefined &&
+			source.evidence.principalId === "gateway" && source.evidence.eventId === source.sourceId &&
+			source.evidence.editId === null && source.evidence.evidenceAt === source.evidence.observedAt &&
+			taskJson(source.evidence.origin) === taskJson(delivered ? task.thread : task.request.evidence.origin) &&
+			(!delivered || (mapped && source.deliveryId ===
+				workTaskSourceDeliveryId(task.taskId, source.sourceId, task.thread!))), "identity");
+		if (delivered) {
+			const delivery = this.deliveryGet(source.deliveryId!);
+			taskAssert(delivery && delivery.turn_id === task.opRef &&
+				delivery.origin_key === originKey(task.thread!), "identity");
+			const payload = JSON.parse(delivery.payload_json) as ChatMessagePayload;
+			validateWorkTaskMessageMetadata(payload.workTask, {
+				origin: task.thread!, taskId: task.taskId, opRef: task.opRef, sourceId: source.sourceId,
+			});
+			taskAssert(payload.deliveryId === source.deliveryId && payload.turnId === task.opRef &&
+				taskJson(payload.origin) === taskJson(task.thread) && payload.text === source.body &&
+				payload.role === "assistant" && payload.final === false &&
+				!payload.reaction && !payload.voiceText, "identity");
+		}
+	}
+
+	/** Read-only scope proof for negative administration; normal SDK readers remain strict. */
+	workTaskQualifiedAdmissionScopeInTransaction(taskId: string): WorkTaskQualifiedAdmissionScope {
+		this.requireTransaction();
+		const { task, mapped } = this.#workTaskNegativeAnchor(taskId);
+		taskAssert(mapped, "unavailable");
+		return { qualification: "retained_admission", taskId, requestHash: task.requestHash,
+			request: { kind: task.request.kind, cwd: task.request.cwd,
+				coordinator: structuredClone(task.request.coordinator) } };
+	}
+
+	/** Negative presentation only; retained mapping is not runtime or execution proof. */
+	workTaskQualifiedSurfaceInTransaction(taskId: string, origin: OriginRef): boolean {
+		this.requireTransaction();
+		const { task, mapped } = this.#workTaskNegativeAnchor(taskId);
+		return mapped && taskJson(task.thread) === taskJson(origin);
+	}
+
+	/** Standalone administrative snapshot; never an SDK status or execution capability. */
+	workTaskDispositionBasis(taskId: string): WorkTaskDispositionBasisResult {
+		const select = (): WorkTaskDispositionBasisResult => {
+			try {
+				const task = this.#workTaskAdmission(taskId);
+				if (!task) return { execution: "none", kind: "unavailable", basis: null };
+				let unavailable = false;
+				try { this.workTaskGet(taskId); } catch { unavailable = true; }
+				let qualification: Extract<WorkTaskDispositionBasisResult,
+					{ kind: "validation_unavailable" }>["qualification"] | undefined;
+				if (unavailable) {
+					const anchor = this.#workTaskNegativeAnchor(taskId);
+					// A public administrative target requires an authentic original destination.
+					if (!anchor.mapped) return { execution: "none", kind: "unavailable", basis: null };
+					const fingerprint = this.#workTaskCorruptionFingerprint(task);
+					const source = this.workTaskSourceGet(`unavailability-${fingerprint}`);
+					if (!source) return { execution: "none", kind: "unavailable", basis: null };
+					this.#validateWorkTaskUnavailable(task, anchor.mapped, source);
+					qualification = { kind: "validation_unavailable", scope: task.request.kind, sourceId: source.sourceId,
+						corruptionFingerprint: fingerprint, firstObservedAt: source.evidence.observedAt };
+				}
+				const rows = this.#database.query<{ control_id: string }, [string]>(
+					"SELECT control_id FROM work_controls WHERE task_id = ? ORDER BY sequence LIMIT 21",
+				).all(taskId);
+				const controls: WorkTaskDispositionBasis["controls"][number][] = [];
+				let partial = rows.length > 20;
+				for (const row of rows.slice(0, 20)) {
+					try {
+						const control = this.workControlGet(row.control_id)!;
+						if (control.phase !== "held" || control.receipt !== null) continue;
+						this.#workTaskDispositionControl(task, control);
+						controls.push({ kind: "control", controlId: control.controlId,
+							eventId: control.request.evidence.eventId, clientRef: control.clientRef });
+					} catch { partial = true; }
+				}
+				const basis: WorkTaskDispositionBasis = {
+					taskId, jobId: task.jobId, expectedOpRef: task.opRef, sessionId: task.sessionId,
+					epoch: task.epoch, cwd: task.request.cwd, requestHash: task.requestHash,
+					expectedTaskVersion: task.version, controls, controlsCompleteness: partial ? "partial" : "complete",
+					report: task.obligationState === "held" ||
+						(qualification && task.obligationState === "awaiting_final")
+						? { kind: "report", reportId: task.terminalReportId } : null,
+				};
+				return validateWorkTaskDispositionBasisResult(qualification
+					? { execution: "none", kind: "validation_unavailable", basis, qualification }
+					: { execution: "none", kind: "original", basis });
+			} catch { return { execution: "none", kind: "unavailable", basis: null }; }
+		};
+		return this.#inTransaction ? select() : this.withTransaction(select);
+	}
+
+	#workTaskCorruptionFingerprint(task: WorkTask): string {
+		return taskHash("work-task-linked-unavailable", {
+			taskId: task.taskId, opRef: task.opRef, requestHash: task.requestHash,
+			runtime: this.#database.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(task.opRef),
+			job: this.#database.query("SELECT * FROM lane_jobs WHERE job_id = ?").get(task.jobId),
+		});
+	}
+
+	#workTaskDispositionControl(task: WorkTask, control: WorkControl): void {
+		taskAssert(control.request.taskId === task.taskId && control.request.expectedOpRef === task.opRef &&
+			control.sessionId === task.sessionId && control.epoch === task.epoch, "identity");
+		// Direct controls without a retained admission hash cannot independently
+		// authenticate a client reference when the runtime is unreadable.
+		const route = this.workTaskSourceGet(`route-${control.controlId}`);
+		taskAssert(route && route.taskId === task.taskId && route.kind === "decision" &&
+			route.controlId === control.controlId && route.completeness === "complete" &&
+			route.reportId === null && route.supersedes === null &&
+			taskJson(route.evidence) === taskJson(control.request.evidence), "identity");
+		const proof = JSON.parse(route.body) as { requestHash: string; routeAdmission: WorkControlRouteAdmission };
+		taskAssert(proof.requestHash === control.requestHash && proof.routeAdmission.taskId === task.taskId &&
+			proof.routeAdmission.opRef === task.opRef &&
+			taskJson(proof.routeAdmission.thread) === taskJson(task.thread), "identity");
+		const source = this.workTaskSourceGet(proof.routeAdmission.sourceId);
+		taskAssert(source && source.taskId === task.taskId && source.kind === "instruction" &&
+			source.completeness === "complete" && source.body === control.request.body &&
+			taskJson(source.evidence) === taskJson(control.request.evidence), "identity");
+	}
+
+	/** Retained negative facts only; no reinterpretation of current SDK JSON. */
+	workTaskLinkedUnavailableSourcesInTransaction(taskId: string): {
+		sources: readonly WorkTaskSource[]; manifest: string; omitted: number | null;
+	} {
+		this.requireTransaction();
+		const { task, mapped } = this.#workTaskNegativeAnchor(taskId);
+		const rows = this.#database.query<{ source_id: string }, [string]>(
+			"SELECT source_id FROM work_task_sources WHERE task_id = ? AND source_id GLOB 'unavailability-*' AND length(source_id) = 79 AND substr(source_id, 16) NOT GLOB '*[^0-9a-f]*' ORDER BY sequence DESC LIMIT 51",
+		).all(taskId);
+		const sources: WorkTaskSource[] = [];
+		let bytes = 0;
+		for (const row of rows.slice(0, 50)) {
+			const source = this.workTaskSourceGet(row.source_id)!;
+			this.#validateWorkTaskUnavailable(task, mapped, source);
+			bytes += Buffer.byteLength(JSON.stringify(source), "utf8");
+			if (bytes > 12 * 1024) break;
+			sources.push(source);
+		}
+		const omitted = rows.length === 51 ? null : rows.length - sources.length;
+		return { sources, manifest: taskHash("work-task-negative-manifest",
+			[taskId, omitted, ...sources.map((source) => source.contentHash)]), omitted };
+	}
+
+	workTaskByThread(threadOriginKey: string): WorkTask | undefined {
+		const row = this.#database.query<{ task_id: string }, [string]>(
+			"SELECT task_id FROM work_tasks WHERE thread_origin_key = ?",
+		).get(threadOriginKey);
+		return row ? this.workTaskGet(row.task_id) : undefined;
+	}
+
+	/** Routing hint only: includes corrupt records and permanent settled mappings. */
+	workTaskDiscordLocator(conversationId: string): { taskId: string } | undefined {
+		// Ingress validates the generic OriginRef segment. Membership discovery
+		// must also find corrupt nonnumeric mappings, not impose task admission.
+		// Canonical Discord thread keys are discord/thread/<id>/parent=<id>.
+		// A binary range uses the existing UNIQUE thread_origin_key index, without
+		// reading record_json or trusting a caller-supplied parent/boundary.
+		const prefix = `discord/thread/${conversationId}`;
+		const rows = this.#database.query<{ task_id: string }, [string, string]>(
+			"SELECT task_id FROM work_tasks WHERE thread_origin_key >= ? AND thread_origin_key < ? LIMIT 2",
+		).all(`${prefix}/`, `${prefix}0`);
+		taskAssert(rows.length <= 1, "identity");
+		return rows[0] ? { taskId: rows[0].task_id } : undefined;
+	}
+
+	workTaskByLane(laneName: string): WorkTask | undefined {
+		const row = this.#database.query<{ task_id: string }, [string]>(
+			"SELECT task_id FROM work_tasks WHERE lane_name = ?",
+		).get(laneName);
+		return row ? this.workTaskGet(row.task_id) : undefined;
+	}
+
+	/** Bounded non-consuming keyset read. Quarantined tasks remain visible as debt. */
+	workTaskList(limit = 20, afterTaskId = ""): readonly WorkTask[] {
+		taskAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 20);
+		return this.#database.query<{ task_id: string }, [string, number]>(
+			"SELECT task_id FROM work_tasks WHERE task_id > ? ORDER BY task_id LIMIT ?",
+		).all(afterTaskId, limit).map((row) => this.workTaskGet(row.task_id)!);
+	}
+
+	/**
+	 * Index locators only, NOT validated task facts. Recovery inspects each key under
+	 * its own error boundary; one corrupt record must not hide the rest of the page.
+	 * No JSON parsing, mutation, quarantine filtering or consuming inbox operation.
+	 */
+	workTaskKeys(limit = 20, afterTaskId = ""): {
+		readonly keys: readonly { readonly taskId: string; readonly jobId: string }[];
+		readonly nextTaskId: string | null;
+	} {
+		taskAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 20);
+		taskAssert(afterTaskId === "" || workString(afterTaskId, 128));
+		const rows = this.#database.query<{ taskId: string; jobId: string }, [string, number]>(
+			"SELECT task_id AS taskId, job_id AS jobId FROM work_tasks WHERE task_id > ? ORDER BY task_id LIMIT ?",
+		).all(afterTaskId, limit + 1);
+		const keys = rows.slice(0, limit);
+		return { keys, nextTaskId: rows.length > limit ? keys[keys.length - 1]!.taskId : null };
+	}
+
+	/** Candidate locators, not an owner-action classification or validated record read. */
+	workTaskSnapshotKeys(limit = 20): {
+		readonly keys: readonly { readonly taskId: string; readonly jobId: string }[];
+		readonly total: number; readonly omitted: number; readonly manifest: string;
+	} {
+		taskAssert(Number.isSafeInteger(limit) && limit >= 1 && limit <= 20);
+		const select = () => {
+			const total = this.#database.query<{ total: number }, []>(
+				"SELECT COUNT(*) AS total FROM work_tasks",
+			).get()!.total;
+			const rows = this.#database.query<{
+				taskId: string; jobId: string; version: number; runtimeVersion: number | null;
+				controlRevision: number; sourceRevision: number; priority: number;
+			}, [number]>(`
+				SELECT t.task_id AS taskId, t.job_id AS jobId, t.version,
+					(SELECT version FROM work_attempt_runtime r WHERE r.op_ref = t.op_ref) AS runtimeVersion,
+					(SELECT COALESCE(SUM(version + 1), 0) FROM work_controls c WHERE c.task_id = t.task_id) AS controlRevision,
+					(SELECT COALESCE(MAX(sequence), 0) FROM work_task_sources s WHERE s.task_id = t.task_id) AS sourceRevision,
+					CASE WHEN t.surface_phase = 'held' OR t.obligation_state = 'held'
+						OR EXISTS (SELECT 1 FROM work_controls c WHERE c.task_id = t.task_id AND c.phase IN ('pending','sending','held'))
+						THEN 0 ELSE 1 END AS priority
+				FROM work_tasks t ORDER BY priority, t.task_id LIMIT ?
+			`).all(limit);
+			return {
+				keys: rows.map(({ taskId, jobId }) => ({ taskId, jobId })), total,
+				omitted: total - rows.length,
+				manifest: taskHash("work-task-selection-v1", [limit, total, rows]),
+			};
+		};
+		return this.#inTransaction ? select() : this.withTransaction(select);
+	}
+
+	workTaskCreate(input: { taskId: string; opRef: string; request: WorkTaskRequest }): WorkTaskAdmission<WorkTask> {
+		return this.withTransaction(() => this.workTaskCreateInTransaction(input));
+	}
+
+	/** Admission can join immutable source and delivery writes in the caller's transaction. */
+	workTaskCreateInTransaction(input: {
+		taskId: string; opRef: string; request: WorkTaskRequest;
+	}): WorkTaskAdmission<WorkTask> {
+		this.requireTransaction();
+		validateTaskRequest(input.request);
+		const hash = taskRequestHash(input.request);
+		const existing = this.workTaskGet(input.taskId);
+		if (existing) {
+			this.#assertNotQuarantined("work", existing.jobId);
+			return { disposition: existing.requestHash === hash ? "duplicate" : "conflict", record: existing };
+		}
+		const now = input.request.evidence.observedAt;
+		const task: WorkTask = {
+			taskId: input.taskId, laneName: `fm-${input.taskId}`, jobId: laneJobDatabaseId(`fm-${input.taskId}`),
+			opRef: input.opRef, request: JSON.parse(taskJson(input.request)), requestHash: hash,
+			thread: null, surfacePhase: "pending", surfaceClaimId: null, surfaceHoldReason: null,
+			dispatchPhase: "pending", sessionId: null, epoch: null, obligationState: "awaiting_final",
+			terminalReportId: null, reportDisposition: null, reportAdmittedAt: null, holdReason: null,
+			createdAt: now, updatedAt: now, version: 0,
+		};
+		validateTask(task);
+		this.#assertNotQuarantined("work", task.jobId);
+		taskAssert(this.laneJobJson(task.jobId) === undefined &&
+			this.laneJobJsonByLaneKey(`work-${task.laneName}`) === undefined &&
+			!this.#database.query("SELECT 1 FROM work_attempt_runtime WHERE op_ref = ? OR job_id = ?")
+				.get(task.opRef, task.jobId), "conflict");
+		taskAssert(!this.#database.query("SELECT 1 FROM work_tasks WHERE op_ref = ?").get(task.opRef), "conflict");
+		this.#database.query(
+			"INSERT INTO work_tasks(task_id, lane_name, job_id, op_ref, thread_origin_key, surface_phase, dispatch_phase, obligation_state, version, record_json) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
+		).run(task.taskId, task.laneName, task.jobId, task.opRef, task.surfacePhase, task.dispatchPhase,
+			task.obligationState, task.version, JSON.stringify(task));
+		this.workTaskSourceAppendInTransaction({
+			sourceId: `assignment-${task.taskId}`, taskId: task.taskId, kind: "assignment",
+			body: task.request.text, evidence: task.request.evidence, supersedes: null,
+			completeness: "complete", controlId: null, reportId: null,
+		});
+		return { disposition: "created", record: task };
+	}
+
+	#workTaskCas(current: WorkTask, next: WorkTask): WorkTask {
+		validateTask(next);
+		taskAssert(next.version === current.version + 1 &&
+			next.taskId === current.taskId && next.opRef === current.opRef &&
+			next.requestHash === current.requestHash && next.createdAt === current.createdAt, "identity");
+		const changed = this.#database.query(
+			"UPDATE work_tasks SET thread_origin_key = ?, surface_phase = ?, dispatch_phase = ?, obligation_state = ?, version = ?, record_json = ? WHERE task_id = ? AND version = ?",
+		).run(next.thread === null ? null : originKey(next.thread), next.surfacePhase, next.dispatchPhase,
+			next.obligationState, next.version, JSON.stringify(next), current.taskId, current.version).changes;
+		taskAssert(changed === 1, "conflict");
+		return next;
+	}
+
+	/** A claim is never replaced; a bound thread is a permanent one-to-one tombstone. */
+	workTaskSurfaceInTransaction(taskId: string, expectedVersion: number, change:
+		| { phase: "claimed"; claimId: string; at: string }
+		| { phase: "bound"; thread: OriginRef; claimId: string | null; at: string }
+		| { phase: "held"; reason: string; at: string },
+	): WorkTask | undefined {
+		this.requireTransaction();
+		const task = this.workTaskGet(taskId);
+		if (!task || task.version !== expectedVersion) return undefined;
+		this.#assertNotQuarantined("work", task.jobId);
+		taskAssert(workTime(change.at));
+		taskAssert(task.dispatchPhase === "pending" &&
+			(task.surfacePhase === "pending" || task.surfacePhase === "claimed"), "transition");
+		if (change.phase === "held") {
+			taskAssert(taskText(change.reason, 2048));
+			return this.#workTaskCas(task, { ...task, surfacePhase: "held", surfaceHoldReason: change.reason,
+				updatedAt: change.at, version: task.version + 1 });
+		}
+		if (change.phase === "claimed") {
+			taskAssert(task.surfacePhase === "pending" && !("thread" in task.request.surface), "transition");
+			taskAssert(workString(change.claimId));
+			return this.#workTaskCas(task, { ...task, surfacePhase: "claimed", surfaceClaimId: change.claimId,
+				updatedAt: change.at, version: task.version + 1 });
+		}
+		taskAssert(change.phase === "bound" && task.surfaceClaimId === change.claimId, "identity");
+		taskAssert("thread" in task.request.surface || task.surfacePhase === "claimed", "transition");
+		validateOriginRef(change.thread);
+		taskAssert(change.thread.platform === "discord" && change.thread.kind === "thread");
+		if ("parent" in task.request.surface)
+			taskAssert(change.thread.parentId === task.request.surface.parent.conversationId &&
+				change.thread.boundaryId === task.request.surface.parent.boundaryId, "identity");
+		const key = originKey(change.thread);
+		taskAssert(!this.workTaskDiscordLocator(change.thread.conversationId), "conflict");
+		// Do not capture a persona's in-flight turn or queued owner input.
+		taskAssert(!this.#database.query(
+			"SELECT 1 FROM inbound_messages WHERE origin_key = ? AND state <> 'done' LIMIT 1",
+		).get(key), "unavailable");
+		return this.#workTaskCas(task, { ...task, surfacePhase: "bound", thread: change.thread,
+			updatedAt: change.at, version: task.version + 1 });
+	}
+
+	#workTaskRuntime(task: WorkTask, identity: WorkTaskAttemptIdentity): WorkAttemptRuntime {
+		taskAssert(task.dispatchPhase === "prepared" && task.opRef === identity.opRef &&
+			task.sessionId === identity.sessionId && task.epoch === identity.epoch, "identity");
+		const runtime = this.workAttemptGet(task.opRef);
+		taskAssert(runtime && runtime.jobId === task.jobId && runtime.sessionId === task.sessionId &&
+			runtime.epoch === task.epoch && runtime.sessionKey === `work/task/${task.laneName}` &&
+			runtime.cwd === task.request.cwd && runtime.parent?.kind === "persona" &&
+			runtime.parent.originKey === originKey(task.request.coordinator) &&
+			taskJson(runtime.parent.origin) === taskJson(task.request.coordinator), "identity");
+		return runtime;
+	}
+
+	/** No execution state is copied: this only references the existing report obligation. */
+	workTaskObligationInTransaction(taskId: string, expectedVersion: number, input: {
+		identity: WorkTaskAttemptIdentity; state: "held" | "final_admitted"; reason: string | null; at: string;
+	}): WorkTask | undefined {
+		this.requireTransaction();
+		const task = this.workTaskGet(taskId);
+		if (!task || task.version !== expectedVersion) return undefined;
+		this.#assertNotQuarantined("work", task.jobId);
+		taskAssert(workTime(input.at) && task.obligationState !== "final_admitted", "transition");
+		const runtime = this.#workTaskRuntime(task, input.identity);
+		if (input.state === "final_admitted") {
+			taskAssert(input.reason === null && runtime.terminal?.kind === "broker" &&
+				runtime.output.proof !== null && runtime.output.disposition === "available" &&
+				runtime.decision === "reported" && runtime.settledAt !== null, "transition");
+		} else taskAssert(input.state === "held" && taskText(input.reason, 2048));
+		return this.#workTaskCas(task, { ...task, obligationState: input.state, holdReason: input.reason,
+			terminalReportId: runtime.reportId, reportDisposition: runtime.decision,
+			reportAdmittedAt: input.state === "final_admitted" ? input.at : task.reportAdmittedAt,
+			version: task.version + 1, updatedAt: input.at });
+	}
+
+	/** Adds original late evidence without rewriting the settled attempt or its report. */
+	workTaskSupplementInTransaction(taskId: string, expectedVersion: number, input: {
+		identity: WorkTaskAttemptIdentity; text: string; at: string;
+		proof: { source: "turn.result"; fullness: "original"; sessionId: string; repo: string;
+			opRef: string; clientRef: string; commandId?: string; turnId?: string;
+			terminalAt: number; contentVersion: 1; byteLength: number };
+	}, delivery: ChatMessagePayload): WorkTask | undefined {
+		this.requireTransaction();
+		const task = this.workTaskGet(taskId);
+		if (!task || task.version !== expectedVersion) return undefined;
+		this.#assertNotQuarantined("work", task.jobId);
+		const runtime = this.#workTaskRuntime(task, input.identity);
+		const status = runtime.terminal?.status;
+		const proof = input.proof;
+		taskAssert(runtime.terminal?.kind === "broker" && runtime.settledAt !== null && status &&
+			proof.source === "turn.result" && proof.fullness === "original" && proof.contentVersion === 1 &&
+			proof.sessionId === runtime.sessionId && proof.repo === runtime.cwd &&
+			proof.opRef === runtime.opRef && proof.clientRef === runtime.opRef &&
+			Number.isFinite(proof.terminalAt) && proof.terminalAt === status.terminalAt && proof.commandId === status.commandId &&
+			proof.turnId === status.turnId && workTime(input.at) &&
+			taskText(input.text, 16 * 1024) && !isSilentOutput(input.text) &&
+			proof.byteLength === Buffer.byteLength(input.text, "utf8") &&
+			delivery.text === input.text && delivery.final === true, "identity");
+		taskAssert(task.obligationState !== "final_admitted", "transition");
+		this.workTaskSourceAppendInTransaction({
+			sourceId: `supplement-proof-${taskId}-original`, taskId, kind: "decision",
+			body: taskJson({ identity: input.identity, proof }),
+			evidence: { principalId: "gateway", origin: task.thread!, eventId: task.opRef, editId: null,
+				evidenceAt: new Date(proof.terminalAt).toISOString(), observedAt: input.at },
+			supersedes: null, completeness: "complete", controlId: null, reportId: runtime.reportId,
+		});
+		this.workTaskSourceAppendInTransaction({
+			sourceId: `supplement-${taskId}-original`, taskId, kind: "observation", body: input.text,
+			evidence: { principalId: "gateway", origin: task.thread!, eventId: task.opRef, editId: null,
+				evidenceAt: new Date(proof.terminalAt).toISOString(), observedAt: input.at },
+			supersedes: null, completeness: "complete", controlId: null, reportId: runtime.reportId,
+		}, delivery);
+		return this.#workTaskCas(task, { ...task, obligationState: "final_admitted", holdReason: null,
+			terminalReportId: runtime.reportId, reportDisposition: runtime.decision,
+			reportAdmittedAt: input.at, version: task.version + 1, updatedAt: input.at });
+	}
+
+	workControlGet(controlId: string): WorkControl | undefined {
+		const row = this.#database.query<{
+			control_id: string; task_id: string; event_id: string; sequence: number; phase: string;
+			client_ref: string | null; notification_id: string; version: number; record_json: string;
+		}, [string]>("SELECT * FROM work_controls WHERE control_id = ?").get(controlId);
+		if (!row) return undefined;
+		const control = JSON.parse(row.record_json) as WorkControl;
+		this.#validateControl(control);
+		taskAssert(control.controlId === row.control_id && control.request.taskId === row.task_id &&
+			workControlEventKey(control.request) === row.event_id && control.sequence === row.sequence &&
+			control.phase === row.phase && control.clientRef === row.client_ref &&
+			control.notificationId === row.notification_id && control.version === row.version, "identity");
+		return control;
+	}
+
+	workControlList(taskId: string, afterSequence = 0, limit = 50): readonly WorkControl[] {
+		taskAssert(Number.isSafeInteger(afterSequence) && afterSequence >= 0 &&
+			Number.isSafeInteger(limit) && limit >= 1 && limit <= 50);
+		return this.#database.query<{ control_id: string }, [string, number, number]>(
+			"SELECT control_id FROM work_controls WHERE task_id = ? AND sequence > ? ORDER BY sequence LIMIT ?",
+		).all(taskId, afterSequence, limit).map((row) => this.workControlGet(row.control_id)!);
+	}
+
+	#validateControl(control: WorkControl): void {
+		const request = control.request;
+		validateTaskEvidence(request.evidence);
+		taskAssert(["steer", "cancel_request", "reset_notice"].includes(request.kind) &&
+			["read_only", "code_mutating"].includes(request.scope) && taskText(request.body, 16 * 1024));
+		taskAssert(workString(request.taskId) && workString(request.expectedOpRef));
+		taskAssert(control.requestHash === controlRequestHash(request) &&
+			control.controlId === `control-${workControlEventKey(request)}` &&
+			control.clientRef === (request.kind === "steer" ? `fm-steer-${workControlEventKey(request)}` : null) &&
+			control.notificationId === `lane-report-${taskHash("work-control-notification", control.controlId)}`, "identity");
+		taskAssert(Number.isSafeInteger(control.sequence) && control.sequence > 0 &&
+			Number.isSafeInteger(control.version) && control.version >= 0);
+		taskAssert(["pending", "sending", "accepted", "refused", "held"].includes(control.phase));
+		taskAssert((control.sessionId === null && control.epoch === null) ||
+			(workString(control.sessionId) && Number.isSafeInteger(control.epoch) && control.epoch! >= 0));
+		taskAssert(control.reason === null || taskText(control.reason, 2048));
+		taskAssert(!["held", "refused"].includes(control.phase) || control.reason !== null);
+		taskAssert(workTime(control.createdAt) && workTime(control.updatedAt));
+		taskAssert(control.sendingAt === null || workTime(control.sendingAt));
+		taskAssert(control.phase !== "sending" || (request.kind === "steer" &&
+			control.sendingAt !== null && control.sessionId !== null));
+		taskAssert(control.phase !== "pending" || (control.sendingAt === null && control.receipt === null));
+		if (control.receipt !== null) {
+			const receipt = control.receipt;
+			taskAssert(["turn.steer", "turn.steer_status"].includes(receipt.source) &&
+				receipt.opRef === request.expectedOpRef && receipt.sessionId === control.sessionId &&
+				receipt.epoch === control.epoch && receipt.clientRef === control.clientRef &&
+				receipt.eventId === request.evidence.eventId && receipt.outcome === control.phase &&
+				workTime(receipt.observedAt) && taskText(receipt.evidence, 4096) && control.sendingAt !== null, "identity");
+		}
+		taskAssert(request.kind !== "steer" || control.phase !== "accepted" || control.receipt !== null);
+		if (control.notificationDisposition !== null)
+			taskAssert(["inbound", "delivery"].includes(control.notificationDisposition.kind) &&
+				workString(control.notificationDisposition.id));
+	}
+
+	workControlAdmitInTransaction(request: WorkControlRequest,
+		scopeAdmission?: WorkControlScopeAdmission,
+		routeAdmission?: WorkControlRouteAdmission,
+	): WorkTaskAdmission<WorkControl> {
+		this.requireTransaction();
+		validateTaskEvidence(request.evidence);
+		const task = this.workTaskGet(request.taskId);
+		taskAssert(task, "unavailable");
+		this.#assertNotQuarantined("work", task.jobId);
+		const key = workControlEventKey(request);
+		const existing = this.workControlGet(`control-${key}`);
+		const requestHash = controlRequestHash(request);
+		if (existing) return { disposition: existing.requestHash === requestHash ? "duplicate" : "conflict", record: existing };
+		if (request.evidence.editId !== null)
+			taskAssert(this.workControlGet(`control-${workControlEventKey({
+				...request, evidence: { ...request.evidence, editId: null },
+			})}`) !== undefined, "unavailable");
+		taskAssert(task.opRef === request.expectedOpRef && task.thread !== null, "identity");
+		if (routeAdmission) {
+			const source = this.workTaskSourceGet(routeAdmission.sourceId);
+			taskAssert(task.surfacePhase === "bound" && routeAdmission.taskId === task.taskId &&
+				routeAdmission.opRef === task.opRef && taskJson(routeAdmission.thread) === taskJson(task.thread) &&
+				source?.taskId === task.taskId && source.kind === "instruction" && source.completeness === "complete" &&
+				source.body === request.body && source.evidence.principalId === request.evidence.principalId &&
+				source.evidence.eventId === request.evidence.eventId && source.evidence.editId === request.evidence.editId &&
+				taskJson(source.evidence.origin) === taskJson(request.evidence.origin), "identity");
+		} else taskAssert(taskJson(task.thread) === taskJson(request.evidence.origin), "identity");
+		const runtime = task.dispatchPhase === "prepared"
+			? this.#workTaskRuntime(task, { opRef: task.opRef, sessionId: task.sessionId!, epoch: task.epoch! }) : undefined;
+		if (scopeAdmission) {
+			const source = this.workTaskSourceGet(scopeAdmission.sourceId);
+			taskAssert(request.kind === "steer" && request.scope === "code_mutating" &&
+				scopeAdmission.kind === request.scope && scopeAdmission.taskId === task.taskId &&
+				scopeAdmission.opRef === task.opRef && scopeAdmission.cwd === task.request.cwd &&
+				scopeAdmission.eventId === request.evidence.eventId && workTime(scopeAdmission.validatedAt) &&
+				task.surfacePhase === "bound" && source?.taskId === task.taskId &&
+				source.kind === "instruction" && source.completeness === "complete" &&
+				source.body === request.body && source.evidence.principalId === request.evidence.principalId &&
+				source.evidence.eventId === request.evidence.eventId && source.evidence.editId === request.evidence.editId &&
+				taskJson(source.evidence.origin) === taskJson(request.evidence.origin), "identity");
+		}
+		const reason = request.scope === "code_mutating" && task.request.kind === "read_only" && !scopeAdmission ? "scope_elevation_refused"
+			: runtime?.terminal || task.obligationState === "final_admitted" ? "original_attempt_terminal"
+			: request.kind === "cancel_request" ? "local_operator_action_required" : null;
+		const phase: WorkControl["phase"] = reason === "local_operator_action_required" ? "held"
+			: reason !== null ? "refused" : request.kind === "reset_notice" ? "accepted" : "pending";
+		const sequence = this.#database.query<{ sequence: number }, [string]>(
+			"SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM work_controls WHERE task_id = ?",
+		).get(task.taskId)!.sequence;
+		const controlId = `control-${key}`;
+		const control: WorkControl = {
+			controlId, request: JSON.parse(taskJson(request)), requestHash, sequence,
+			clientRef: request.kind === "steer" ? `fm-steer-${key}` : null,
+			notificationId: `lane-report-${taskHash("work-control-notification", controlId)}`,
+			notificationDisposition: null, sessionId: task.sessionId, epoch: task.epoch,
+			phase, reason, sendingAt: null, receipt: null, createdAt: request.evidence.observedAt,
+			updatedAt: request.evidence.observedAt, version: 0,
+		};
+		this.#validateControl(control);
+		this.#database.query(
+			"INSERT INTO work_controls(control_id, task_id, event_id, sequence, client_ref, notification_id, phase, version, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		).run(control.controlId, task.taskId, key, sequence, control.clientRef, control.notificationId, phase, 0, JSON.stringify(control));
+		if (scopeAdmission && phase === "pending") this.workTaskSourceAppendInTransaction({
+			sourceId: `scope-${controlId}`, taskId: task.taskId, kind: "decision",
+			body: taskJson({ scopeAdmission, requestHash }), evidence: request.evidence,
+			supersedes: null, completeness: "complete", controlId, reportId: null,
+		});
+		if (routeAdmission) this.workTaskSourceAppendInTransaction({
+			sourceId: `route-${controlId}`, taskId: task.taskId, kind: "decision",
+			body: taskJson({ routeAdmission, requestHash }), evidence: request.evidence,
+			supersedes: null, completeness: "complete", controlId, reportId: null,
+		});
+		return { disposition: "created", record: control };
+	}
+
+	/** pending→sending is the single send claim; held/sending can never return to pending. */
+	workControlTransitionInTransaction(controlId: string, expectedVersion: number, input: {
+		phase: "sending" | "accepted" | "refused" | "held"; identity: WorkTaskAttemptIdentity;
+		at: string; reason?: string; receipt?: WorkControlReceipt;
+	}): WorkControl | undefined {
+		this.requireTransaction();
+		const control = this.workControlGet(controlId);
+		if (!control || control.version !== expectedVersion) return undefined;
+		const task = this.workTaskGet(control.request.taskId);
+		taskAssert(task, "unavailable");
+		this.#assertNotQuarantined("work", task.jobId);
+		const runtime = this.#workTaskRuntime(task, input.identity);
+		taskAssert(control.request.expectedOpRef === input.identity.opRef &&
+			(control.sessionId === null || (control.sessionId === input.identity.sessionId && control.epoch === input.identity.epoch)),
+			"identity");
+		taskAssert(workTime(input.at) && control.request.kind === "steer", "transition");
+		if (input.phase === "sending") {
+			taskAssert(control.phase === "pending" && control.sendingAt === null && input.receipt === undefined &&
+				runtime.sendPhase === "accepted" && runtime.terminal === null && runtime.settledAt === null &&
+				task.obligationState !== "final_admitted" && task.surfacePhase === "bound", "transition");
+			const binding = this.getSessionRecord(runtime.sessionKey);
+			taskAssert(binding?.sessionId === runtime.sessionId && binding.epoch === runtime.epoch, "identity");
+			// Only the local cancellation notification is exempt. Pending/held steers
+			// retain owner order even if never sent; uncertain sends always block.
+			taskAssert(!this.#database.query(
+				`SELECT 1 FROM work_controls WHERE task_id = ? AND sequence < ?
+					AND phase NOT IN ('accepted','refused')
+					AND NOT COALESCE((phase = 'held' AND json_extract(record_json, '$.request.kind') = 'cancel_request'
+						AND json_type(record_json, '$.sendingAt') = 'null'
+						AND json_type(record_json, '$.receipt') = 'null'
+						AND json_extract(record_json, '$.reason') = 'local_operator_action_required'), 0) LIMIT 1`,
+			).get(task.taskId, control.sequence), "order");
+		} else if (input.phase === "accepted" || (input.phase === "refused" && control.sendingAt !== null)) {
+			taskAssert((control.phase === "sending" || control.phase === "held") && input.receipt !== undefined &&
+				input.receipt.outcome === input.phase, "transition");
+		} else {
+			taskAssert((input.phase === "held" && (control.phase === "pending" || control.phase === "sending")) ||
+				(input.phase === "refused" && control.phase === "pending"), "transition");
+			taskAssert(input.receipt === undefined, "transition");
+		}
+		taskAssert(!["refused", "held"].includes(input.phase) || taskText(input.reason, 2048));
+		const next: WorkControl = {
+			...control, phase: input.phase, sessionId: runtime.sessionId, epoch: runtime.epoch,
+			sendingAt: input.phase === "sending" ? input.at : control.sendingAt,
+			reason: input.reason ?? null, receipt: input.receipt ?? null,
+			updatedAt: input.at, version: control.version + 1,
+		};
+		this.#workControlCas(control, next);
+		return next;
+	}
+
+	#workControlCas(current: WorkControl, next: WorkControl): void {
+		this.#validateControl(next);
+		taskAssert(next.controlId === current.controlId && next.requestHash === current.requestHash &&
+			next.sequence === current.sequence && next.version === current.version + 1, "identity");
+		taskAssert(this.#database.query(
+			"UPDATE work_controls SET phase = ?, version = ?, record_json = ? WHERE control_id = ? AND version = ?",
+		).run(next.phase, next.version, JSON.stringify(next), current.controlId, current.version).changes === 1, "conflict");
+	}
+
+	/** Reference an already joined inbox/fallback row, never invent notification acceptance. */
+	workControlNotificationInTransaction(controlId: string, expectedVersion: number,
+		disposition: NonNullable<WorkControl["notificationDisposition"]>,
+	): WorkControl | undefined {
+		this.requireTransaction();
+		const control = this.workControlGet(controlId);
+		if (!control || control.version !== expectedVersion) return undefined;
+		const task = this.workTaskGet(control.request.taskId);
+		taskAssert(task, "unavailable");
+		this.#assertNotQuarantined("work", task.jobId);
+		taskAssert(control.notificationDisposition === null && disposition.id === control.notificationId, "identity");
+		const destination = originKey(task.request.coordinator);
+		taskAssert(disposition.kind === "inbound"
+			? this.#database.query("SELECT 1 FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND source = 'lane_report'")
+				.get(disposition.id, destination)
+			: disposition.kind === "delivery" && this.#database.query(
+				"SELECT 1 FROM deliveries WHERE delivery_id = ? AND turn_id = ? AND origin_key = ?",
+			).get(disposition.id, task.opRef, destination), "identity");
+		const next = { ...control, notificationDisposition: disposition, version: control.version + 1 };
+		this.#workControlCas(control, next);
+		return next;
+	}
+
+	workTaskSourceAppendInTransaction(input: WorkTaskSourceInput, delivery?: ChatMessagePayload): WorkTaskSource {
+		taskAssert(input.administrative === undefined && !/^disposition-[0-9a-f]{64}$/.test(input.sourceId), "invalid");
+		taskAssert(!/^unavailability-[0-9a-f]{64}$/.test(input.sourceId), "invalid");
+		return this.#workTaskSourceAppendInTransaction(input, delivery);
+	}
+
+	/**
+	 * Presentation only for independently anchored retained negative sources.
+	 * Undefined selects the ordinary strict path; validation failures never do.
+	 * Neither runtime validity nor execution/control/release authority is inferred.
+	 */
+	workTaskNegativeDeliveryConfirmInTransaction(input: unknown) {
+		this.requireTransaction();
+		const params = validateDeliveryConfirmParams(input);
+		const current = this.deliveryGet(params.deliveryId);
+		taskAssert(current, "unavailable");
+		const payload = JSON.parse(current.payload_json) as ChatMessagePayload;
+		const metadata = validateWorkTaskMessageMetadata(payload.workTask, { origin: payload.origin });
+		const source = this.workTaskSourceGet(metadata.sourceId);
+		taskAssert(source, "identity");
+		if (!/^unavailability-[0-9a-f]{64}$/.test(source.sourceId) &&
+			!source.administrative?.request.validationUnavailable) return undefined;
+		const { task, mapped } = this.#workTaskNegativeAnchor(metadata.taskId);
+		taskAssert(mapped && task.thread, "identity");
+		if (!source.administrative) this.#validateWorkTaskUnavailable(task, mapped, source);
+		// Administrative source reads validate the original negative observation and
+		// its admission; both kinds still require this exact retained presentation.
+		taskAssert(source.taskId === task.taskId && metadata.opRef === task.opRef &&
+			source.deliveryId === params.deliveryId &&
+			source.deliveryId === workTaskSourceDeliveryId(task.taskId, source.sourceId, task.thread) &&
+			current.turn_id === task.opRef && current.origin_key === originKey(task.thread) &&
+			payload.deliveryId === current.delivery_id && payload.turnId === task.opRef &&
+			taskJson(payload.origin) === taskJson(task.thread) && payload.text === source.body &&
+			payload.role === "assistant" && payload.final === false &&
+			!payload.reaction && !payload.voiceText, "identity");
+		const receipt = params.platformReceipt;
+		taskAssert(receipt && taskJson(receipt.origin) === taskJson(task.thread), "identity");
+		taskAssert(["pending", "inflight", "confirmed"].includes(current.state), "transition");
+		const firstId = receipt.messageIds[0]!;
+		const evidenceAt = new Date(Number((BigInt(firstId) >> 22n) + 1420070400000n)).toISOString();
+		const sourceId = `receipt-${createHash("sha256").update(current.delivery_id).digest("hex")}`;
+		const body = JSON.stringify({
+			deliveryId: current.delivery_id, firstMessageId: firstId, messageCount: receipt.messageIds.length,
+			messageIdsSha256: createHash("sha256").update(JSON.stringify(receipt.messageIds)).digest("hex"),
+		});
+		const previous = this.workTaskSourceGet(sourceId);
+		taskAssert((!previous || previous.body === body) &&
+			(current.state !== "confirmed" || previous), "conflict");
+		const outcome = this.deliveryConfirmWithSettleInTransaction(current.delivery_id, "delivered");
+		this.#workTaskSourceAppendInTransaction({
+			sourceId, taskId: task.taskId, kind: "observation", body,
+			evidence: { origin: task.thread, principalId: "gateway:discord-adapter",
+				eventId: firstId, editId: null, evidenceAt,
+				observedAt: previous?.evidence.observedAt ?? new Date().toISOString() },
+			supersedes: null, completeness: "complete", controlId: null, reportId: null,
+		}, undefined, task);
+		return outcome;
+	}
+
+	/**
+	 * Server supplies evidence only after existing owner authentication/routing.
+	 * WorkTaskEvidence is attribution, NOT a caller credential or an authorization API.
+	 * No runtime/control/report write is performed. The enclosing transaction must
+	 * propagate failures so CAS, source audit and optional mapped intent roll back.
+	 */
+	workTaskDispositionInTransaction(
+		params: WorkTaskDispositionParams,
+		trustedEvidence: WorkTaskEvidence,
+		delivery?: ChatMessagePayload,
+	): WorkTaskDispositionResult {
+		this.requireTransaction();
+		const request = validateWorkTaskDispositionParams(params);
+		taskAssert(request.validationUnavailable === undefined, "identity");
+		validateTaskEvidence(trustedEvidence);
+		taskAssert(trustedEvidence.eventId === request.eventId && trustedEvidence.editId === null &&
+			taskText(trustedEvidence.principalId, 1024), "identity");
+		const task = this.workTaskGet(request.taskId);
+		taskAssert(task, "unavailable");
+		this.#assertNotQuarantined("work", task.jobId);
+		const sourceId = workTaskDispositionId(task.taskId, request.eventId, trustedEvidence.origin);
+		if (delivery) taskAssert(delivery.text === workTaskDispositionText(request), "identity");
+		const existing = this.workTaskSourceGet(sourceId);
+		if (existing) {
+			const record = existing.administrative;
+			taskAssert(record && taskJson(record.request) === taskJson(request) &&
+				record.principalId === trustedEvidence.principalId &&
+				taskJson(record.origin) === taskJson(trustedEvidence.origin), "conflict");
+			// Receipt/observation times may differ on a retry; immutable input may not.
+			if (delivery) {
+				taskAssert(existing.deliveryId !== null, "conflict");
+				this.#workTaskSourceAppendInTransaction({
+					sourceId: existing.sourceId, taskId: existing.taskId, kind: existing.kind, body: existing.body,
+					evidence: existing.evidence, supersedes: existing.supersedes, completeness: existing.completeness,
+					controlId: existing.controlId, reportId: existing.reportId, administrative: record,
+				}, delivery);
+			}
+			return validateWorkTaskDispositionResult({ execution: "none", disposition: "duplicate",
+				dispositionId: sourceId, sourceId, deliveryId: existing.deliveryId, record });
+		}
+		taskAssert(task.jobId === request.jobId && task.opRef === request.expectedOpRef &&
+			task.sessionId === request.sessionId && task.epoch === request.epoch &&
+			task.request.cwd === request.cwd && task.requestHash === request.requestHash, "identity");
+		taskAssert(task.version === request.expectedTaskVersion, "conflict");
+		if (request.target.kind === "control") {
+			const control = this.workControlGet(request.target.controlId);
+			taskAssert(control && control.request.taskId === task.taskId &&
+				control.request.expectedOpRef === task.opRef &&
+				control.request.evidence.eventId === request.target.eventId &&
+				control.clientRef === request.target.clientRef &&
+				control.sessionId === task.sessionId && control.epoch === task.epoch, "identity");
+			taskAssert(control.phase === "held" && control.receipt === null, "transition");
+		} else {
+			taskAssert(task.terminalReportId === request.target.reportId, "identity");
+			taskAssert(task.obligationState === "held", "transition");
+		}
+		const record = validateWorkTaskDispositionRecord({
+			request, principalId: trustedEvidence.principalId, origin: trustedEvidence.origin,
+			recordedAt: trustedEvidence.observedAt, taskVersion: task.version + 1,
+			retained: { obligationState: task.obligationState, reportId: task.terminalReportId,
+				holdReason: task.holdReason, controlPhase: request.target.kind === "control" ? "held" : null },
+		});
+		const source = this.#workTaskSourceAppendInTransaction({
+			sourceId, taskId: task.taskId, kind: "decision", body: workTaskDispositionText(request),
+			evidence: trustedEvidence, supersedes: null, completeness: "incomplete",
+			controlId: request.target.kind === "control" ? request.target.controlId : null,
+			reportId: request.target.kind === "report" ? request.target.reportId : null, administrative: record,
+		}, delivery);
+		this.#workTaskCas(task, { ...task, version: record.taskVersion, updatedAt: record.recordedAt });
+		return validateWorkTaskDispositionResult({ execution: "none", disposition: "recorded",
+			dispositionId: sourceId, sourceId, deliveryId: source.deliveryId, record });
+	}
+
+	/**
+	 * Owner authentication, current scope and captured proof remain server duties.
+	 * The only task mutation is its audit CAS version; no runtime field is salvaged.
+	 */
+	workTaskNegativeDispositionInTransaction(
+		params: WorkTaskDispositionParams, trustedEvidence: WorkTaskEvidence,
+		surfaceAvailable: (origin: OriginRef) => boolean,
+	): WorkTaskDispositionResult {
+		this.requireTransaction();
+		const request = validateWorkTaskDispositionParams(params);
+		taskAssert(request.validationUnavailable, "identity");
+		validateTaskEvidence(trustedEvidence);
+		taskAssert(trustedEvidence.eventId === request.eventId && trustedEvidence.editId === null &&
+			taskText(trustedEvidence.principalId, 1024), "identity");
+		const { task, mapped } = this.#workTaskNegativeAnchor(request.taskId);
+		taskAssert(mapped, "unavailable");
+		const sourceId = workTaskDispositionId(task.taskId, request.eventId, trustedEvidence.origin);
+		const existing = this.workTaskSourceGet(sourceId);
+		if (existing) {
+			taskAssert(existing.administrative &&
+				taskJson(existing.administrative.request) === taskJson(request) &&
+				existing.administrative.principalId === trustedEvidence.principalId &&
+				taskJson(existing.administrative.origin) === taskJson(trustedEvidence.origin), "conflict");
+			return validateWorkTaskDispositionResult({ execution: "none", disposition: "duplicate",
+				dispositionId: sourceId, sourceId, deliveryId: existing.deliveryId, record: existing.administrative });
+		}
+		const selected = this.workTaskDispositionBasis(task.taskId);
+		taskAssert(selected.kind === "validation_unavailable", "unavailable");
+		if (selected.kind !== "validation_unavailable") throw new WorkTaskStateError("unavailable");
+		const basis = selected.basis;
+		taskAssert(taskJson(selected.qualification) === taskJson(request.validationUnavailable), "conflict");
+		taskAssert(basis.jobId === request.jobId && basis.expectedOpRef === request.expectedOpRef &&
+			basis.sessionId === request.sessionId && basis.epoch === request.epoch &&
+			basis.cwd === request.cwd && basis.requestHash === request.requestHash, "identity");
+		taskAssert(basis.expectedTaskVersion === request.expectedTaskVersion, "conflict");
+		taskAssert(request.target.kind === "report"
+			? basis.report !== null && taskJson(basis.report) === taskJson(request.target)
+			: basis.controls.some((target) => taskJson(target) === taskJson(request.target)), "identity");
+		const record = validateWorkTaskDispositionRecord({
+			request, principalId: trustedEvidence.principalId, origin: trustedEvidence.origin,
+			recordedAt: trustedEvidence.observedAt, taskVersion: task.version + 1,
+			retained: { obligationState: task.obligationState, reportId: task.terminalReportId,
+				holdReason: task.holdReason, controlPhase: request.target.kind === "control" ? "held" : null },
+		});
+		let delivery: ChatMessagePayload | undefined;
+		let deliver = false;
+		try { deliver = surfaceAvailable(JSON.parse(taskJson(task.thread!))) === true; } catch { /* Audit only. */ }
+		if (deliver) {
+			const deliveryId = workTaskSourceDeliveryId(task.taskId, sourceId, task.thread!);
+			const body = buildDeliveryPayload(task.opRef, task.thread!, workTaskDispositionText(request),
+				deliveryId, undefined, false);
+			taskAssert(body, "unavailable");
+			delivery = { ...body, workTask: { taskId: task.taskId, opRef: task.opRef, sourceId, mappedOnly: true } };
+		}
+		// External presentation lookup must not change the captured admission or corruption.
+		taskAssert(taskJson(this.#workTaskNegativeAnchor(task.taskId).task) === taskJson(task) &&
+			taskJson(this.workTaskDispositionBasis(task.taskId)) === taskJson(selected), "conflict");
+		// Preserve all task fields, including updatedAt; only the administrative CAS advances.
+		this.#workTaskCas(task, { ...task, version: record.taskVersion });
+		const source = this.#workTaskSourceAppendInTransaction({
+			sourceId, taskId: task.taskId, kind: "decision", body: workTaskDispositionText(request),
+			evidence: trustedEvidence, supersedes: null, completeness: "incomplete",
+			controlId: request.target.kind === "control" ? request.target.controlId : null,
+			reportId: request.target.kind === "report" ? request.target.reportId : null, administrative: record,
+		}, delivery, { ...task, version: record.taskVersion });
+		return validateWorkTaskDispositionResult({ execution: "none", disposition: "recorded",
+			dispositionId: sourceId, sourceId, deliveryId: source.deliveryId, record });
+	}
+
+	#workTaskSourceAppendInTransaction(input: WorkTaskSourceInput, delivery?: ChatMessagePayload,
+		negativeAdmission?: WorkTask): WorkTaskSource {
+		this.requireTransaction();
+		const task = negativeAdmission ?? this.workTaskGet(input.taskId);
+		taskAssert(task, "unavailable");
+		if (!negativeAdmission) this.#assertNotQuarantined("work", task.jobId);
+		validateTaskEvidence(input.evidence);
+		validateAdministrativeSource(input);
+		taskAssert(workString(input.sourceId) && taskText(input.body, 64 * 1024) &&
+			["assignment", "instruction", "decision", "observation"].includes(input.kind) &&
+			["complete", "incomplete"].includes(input.completeness));
+		taskAssert(input.kind !== "assignment" ||
+			(input.sourceId === `assignment-${task.taskId}` && input.body === task.request.text &&
+				taskJson(input.evidence) === taskJson(task.request.evidence) && input.supersedes === null), "identity");
+		if (input.supersedes !== null) {
+			const previous = this.workTaskSourceGet(input.supersedes);
+			taskAssert(previous?.taskId === input.taskId && previous.kind === input.kind &&
+				input.kind !== "assignment", "identity");
+		}
+		if (input.controlId !== null)
+			taskAssert(this.workControlGet(input.controlId)?.request.taskId === task.taskId, "identity");
+		if (input.reportId !== null)
+			taskAssert(input.reportId === workAttemptReportId(this.instanceId, task.jobId, task.opRef), "identity");
+		const contentHash = taskHash("work-task-source", input);
+		if (delivery) {
+			taskAssert(task.thread !== null, "identity");
+			try {
+				validateWorkTaskMessageMetadata(delivery.workTask, {
+					origin: delivery.origin, taskId: task.taskId, opRef: task.opRef, sourceId: input.sourceId,
+				});
+			} catch { throw new WorkTaskStateError("identity"); }
+		}
+		const deliveryId = delivery ? workTaskSourceDeliveryId(task.taskId, input.sourceId, task.thread!) : null;
+		const existing = this.workTaskSourceGet(input.sourceId);
+		if (existing) {
+			taskAssert(existing.contentHash === contentHash && existing.deliveryId === deliveryId, "conflict");
+			if (delivery) this.#workTaskSourceDelivery(task, deliveryId!, delivery);
+			return existing;
+		}
+		const sequence = this.#database.query<{ sequence: number }, [string]>(
+			"SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence FROM work_task_sources WHERE task_id = ?",
+		).get(task.taskId)!.sequence;
+		taskAssert(Number.isSafeInteger(sequence) && sequence > 0);
+		const source: WorkTaskSource = { ...JSON.parse(taskJson(input)), sequence, contentHash, deliveryId };
+		if (delivery) this.#workTaskSourceDelivery(task, deliveryId!, delivery);
+		this.#database.query(
+			"INSERT INTO work_task_sources(source_id, task_id, sequence, content_hash, delivery_id, record_json) VALUES (?, ?, ?, ?, ?, ?)",
+		).run(source.sourceId, task.taskId, sequence, contentHash, deliveryId, JSON.stringify(source));
+		return source;
+	}
+
+	#workTaskSourceDelivery(task: WorkTask, deliveryId: string, payload: ChatMessagePayload): void {
+		taskAssert(task.thread !== null && task.surfacePhase === "bound" &&
+			payload.deliveryId === deliveryId && payload.turnId === task.opRef &&
+			taskJson(payload.origin) === taskJson(task.thread) && taskText(payload.text, 1024 * 1024) &&
+			payload.role === "assistant" && typeof payload.final === "boolean" &&
+			!isSilentOutput(payload.text) && !payload.reaction && !payload.voiceText, "identity");
+		this.deliveryCreateInTransaction({
+			id: deliveryId, turnId: task.opRef, originKey: originKey(task.thread), payloadJson: JSON.stringify(payload),
+		});
+	}
+
+	workTaskSourceGet(sourceId: string): WorkTaskSource | undefined {
+		const row = this.#database.query<{
+			source_id: string; task_id: string; sequence: number; content_hash: string;
+			delivery_id: string | null; record_json: string;
+		}, [string]>("SELECT * FROM work_task_sources WHERE source_id = ?").get(sourceId);
+		if (!row) return undefined;
+		const source = JSON.parse(row.record_json) as WorkTaskSource;
+		const { sequence, contentHash, deliveryId, ...input } = source;
+		validateTaskEvidence(source.evidence);
+		validateAdministrativeSource(source);
+		taskAssert(workString(source.sourceId) && taskText(source.body, 64 * 1024) &&
+			["assignment", "instruction", "decision", "observation"].includes(source.kind) &&
+			["complete", "incomplete"].includes(source.completeness) &&
+			Number.isSafeInteger(sequence) && sequence > 0);
+		taskAssert(source.sourceId === row.source_id && source.taskId === row.task_id &&
+			sequence === row.sequence && contentHash === row.content_hash && deliveryId === row.delivery_id &&
+			contentHash === taskHash("work-task-source", input), "identity");
+		if (source.administrative) {
+			const record = source.administrative;
+			const request = record.request;
+			const task = request.validationUnavailable
+				? this.#workTaskNegativeAnchor(source.taskId).task : this.workTaskGet(source.taskId);
+			taskAssert(task && task.version >= record.taskVersion && task.jobId === request.jobId &&
+				task.opRef === request.expectedOpRef && task.requestHash === request.requestHash &&
+				task.request.cwd === request.cwd, "identity");
+			// A known original binding cannot be replaced. A genuinely pre-attempt
+			// unknown snapshot does not assert a subsequently acquired identity.
+			taskAssert(request.sessionId === null ||
+				(task.sessionId === request.sessionId && task.epoch === request.epoch), "identity");
+			if (request.validationUnavailable) {
+				const negative = this.workTaskSourceGet(request.validationUnavailable.sourceId);
+				taskAssert(negative, "identity");
+				this.#validateWorkTaskUnavailable(task, this.#workTaskNegativeAnchor(task.taskId).mapped, negative);
+				taskAssert(negative.evidence.observedAt === request.validationUnavailable.firstObservedAt &&
+					request.validationUnavailable.scope === task.request.kind &&
+					negative.sequence < sequence, "identity");
+				// This authentic historical snapshot does not assert current runtime corruption.
+			}
+			if (request.target.kind === "control") {
+				const control = this.workControlGet(request.target.controlId);
+				taskAssert(control && control.request.taskId === task.taskId &&
+					control.request.expectedOpRef === request.expectedOpRef &&
+					control.request.evidence.eventId === request.target.eventId &&
+					control.clientRef === request.target.clientRef, "identity");
+				if (request.validationUnavailable) this.#workTaskDispositionControl(task, control);
+			} else taskAssert(request.target.reportId === null ||
+				request.target.reportId === workAttemptReportId(this.instanceId, task.jobId, task.opRef), "identity");
+			taskAssert(deliveryId === null || (task.thread !== null &&
+				deliveryId === workTaskSourceDeliveryId(task.taskId, source.sourceId, task.thread)), "identity");
+		}
+		return source;
+	}
+
+	/** Source/attempt revisions only; a wider projection must also manifest its selected delivery/inbox rows. */
+	workTaskSources(taskId: string, options: { afterSequence?: number; limit?: number; manifest?: string; recent?: boolean } = {}): {
+		taskId: string; taskVersion: number; manifest: string; newSnapshot: boolean;
+		sources: readonly WorkTaskSource[]; omitted: number; overflow: boolean;
+		lastSequence: number; byteLimit: number; recordLimit: number;
+	} | undefined {
+		return this.withTransaction(() => this.workTaskSourcesInTransaction(taskId, options));
+	}
+
+	/** Allows the read model to select delivery and report facts in the same snapshot. */
+	workTaskSourcesInTransaction(taskId: string, options: { afterSequence?: number; limit?: number; manifest?: string; recent?: boolean } = {}): {
+		taskId: string; taskVersion: number; manifest: string; newSnapshot: boolean;
+		sources: readonly WorkTaskSource[]; omitted: number; overflow: boolean;
+		lastSequence: number; byteLimit: number; recordLimit: number;
+	} | undefined {
+		this.requireTransaction();
+		const after = options.afterSequence ?? 0;
+		const limit = options.limit ?? 50;
+		taskAssert(options.recent === undefined || typeof options.recent === "boolean");
+		taskAssert(!options.recent || options.afterSequence === undefined);
+		taskAssert(Number.isSafeInteger(after) && after >= 0 && Number.isSafeInteger(limit) && limit >= 1 && limit <= 50);
+			const task = this.workTaskGet(taskId);
+			if (!task) return undefined;
+			const controls = this.#database.query<{ count: number; revision: number }, [string]>(
+				"SELECT COUNT(*) AS count, COALESCE(SUM(version), 0) AS revision FROM work_controls WHERE task_id = ?",
+			).get(taskId)!;
+			const count = this.#database.query<{ total: number; remaining: number }, [number, string]>(
+				"SELECT COUNT(*) AS total, COALESCE(SUM(sequence > ?), 0) AS remaining FROM work_task_sources WHERE task_id = ?",
+			).get(after, taskId)!;
+			const runtimeVersion = this.workAttemptGet(task.opRef)?.version ?? null;
+			const manifest = taskHash("work-task-manifest", [taskId, task.version, runtimeVersion, controls, count.total,
+				...(options.recent ? ["recent", limit] : [])]);
+			const rows = this.#database.query<{ source_id: string; sequence: number }, [string, number, number]>(
+				options.recent
+					? "SELECT source_id, sequence FROM work_task_sources WHERE task_id = ? AND sequence > ? ORDER BY sequence DESC, source_id DESC LIMIT ?"
+					: "SELECT source_id, sequence FROM work_task_sources WHERE task_id = ? AND sequence > ? ORDER BY sequence, source_id LIMIT ?",
+			).all(taskId, after, limit);
+			const sources: WorkTaskSource[] = [];
+			const snapshot = { taskId, taskVersion: task.version, manifest,
+				newSnapshot: options.manifest !== undefined && options.manifest !== manifest,
+				sources, omitted: count.remaining, overflow: false,
+				lastSequence: rows.at(-1)?.sequence ?? after, byteLimit: 16 * 1024, recordLimit: limit };
+			// Include the envelope and separators. Omitted only decreases; true is shorter than false.
+			let bytes = Buffer.byteLength(JSON.stringify(snapshot), "utf8");
+			let overflow = false;
+			for (const row of rows) {
+				const source = this.workTaskSourceGet(row.source_id)!;
+				const size = Buffer.byteLength(JSON.stringify(source), "utf8") + (sources.length === 0 ? 0 : 1);
+				if (bytes + size > 16 * 1024) { overflow = true; continue; }
+				sources.push(source);
+				bytes += size;
+			}
+			return { ...snapshot, omitted: count.remaining - sources.length, overflow };
 	}
 
 	workAttemptGet(opRef: string): WorkAttemptRuntime | undefined {
@@ -1421,7 +2847,12 @@ export class GatewayDatabase {
 
 	/** Atomically append history, freeze notification intent and refresh activity before send. */
 	workAttemptPrepare(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {
-		this.withTransaction(() => {
+		this.withTransaction(() => this.workAttemptPrepareInTransaction(runtime, record));
+	}
+
+	/** Joins task/source/delivery writes without a nested transaction or pre-commit publication. */
+	workAttemptPrepareInTransaction(runtime: WorkAttemptRuntime, record: LaneJobRecord): void {
+		this.requireTransaction();
 			this.#assertNotQuarantined("work", runtime.jobId);
 			validateWorkRuntime(runtime, this.instanceId);
 			workAssert(runtime.version === 0 && runtime.decision === "undecided" && runtime.terminal === null);
@@ -1466,12 +2897,31 @@ export class GatewayDatabase {
 					JSON.stringify(runtime),
 				);
 			this.#workActivity(runtime, runtime.startedAt);
-		});
+			const tasks = this.#database.query<{ task_id: string }, [string, string, string]>(
+				"SELECT task_id FROM work_tasks WHERE job_id = ? OR op_ref = ? OR lane_name = ?",
+			).all(runtime.jobId, runtime.opRef, runtime.sessionKey.slice("work/task/".length));
+			taskAssert(tasks.length <= 1, "identity");
+			if (tasks[0]) {
+				const task = this.workTaskGet(tasks[0].task_id)!;
+				taskAssert(task.dispatchPhase === "pending" && task.surfacePhase === "bound" &&
+					task.opRef === runtime.opRef && task.jobId === runtime.jobId &&
+					runtime.sessionKey === `work/task/${task.laneName}` && runtime.mode === "start" &&
+					runtime.cwd === task.request.cwd && record.attempts.length === 1 &&
+					runtime.parent?.kind === "persona" &&
+					runtime.parent.originKey === originKey(task.request.coordinator) &&
+					taskJson(runtime.parent.origin) === taskJson(task.request.coordinator), "identity");
+				this.#workTaskCas(task, { ...task, dispatchPhase: "prepared", sessionId: runtime.sessionId,
+					epoch: runtime.epoch, version: task.version + 1, updatedAt: runtime.startedAt });
+			}
 	}
 
 	/** CAS staging, including output-read claims, acceptance proof, and notice receipt. */
 	workAttemptUpdate(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
-		return this.withTransaction(() => {
+		return this.withTransaction(() => this.workAttemptUpdateInTransaction(opRef, expectedVersion, patch));
+	}
+
+	workAttemptUpdateInTransaction(opRef: string, expectedVersion: number, patch: WorkAttemptPatch): WorkAttemptRuntime | undefined {
+		this.requireTransaction();
 			const current = this.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 			this.#assertNotQuarantined("work", current.jobId);
@@ -1483,7 +2933,6 @@ export class GatewayDatabase {
 			if (acceptanceEstablished && next.noticeHash !== null)
 				this.metaSet(`lane-notice:${next.sessionKey}`, JSON.stringify({ epoch: next.epoch, hash: next.noticeHash }));
 			return next;
-		});
 	}
 
 	/**
@@ -1513,7 +2962,17 @@ export class GatewayDatabase {
 		patch: WorkAttemptSettlement,
 		admission?: WorkAttemptAdmission,
 	): WorkAttemptSettleResult | undefined {
-		return this.withTransaction(() => {
+		return this.withTransaction(() => this.workAttemptSettleInTransaction(opRef, expectedVersion, record, patch, admission));
+	}
+
+	workAttemptSettleInTransaction(
+		opRef: string,
+		expectedVersion: number,
+		record: LaneJobRecord,
+		patch: WorkAttemptSettlement,
+		admission?: WorkAttemptAdmission,
+	): WorkAttemptSettleResult | undefined {
+		this.requireTransaction();
 			const current = this.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 			this.#assertNotQuarantined("work", current.jobId);
@@ -1717,7 +3176,6 @@ export class GatewayDatabase {
 				...(childFallback ? { childFallback } : {}),
 				...(requeuedParent ? { requeuedParent } : {}),
 			};
-		});
 	}
 
 	#laneParentAvailable(name: string): boolean {
@@ -4212,7 +5670,14 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 		deliveryId: string,
 		monitorEventStage: "delivered" | "authored",
 	): "unknown" | "transitioned" | "already_terminal" {
-		return this.withTransaction(() => {
+		return this.withTransaction(() => this.deliveryConfirmWithSettleInTransaction(deliveryId, monitorEventStage));
+	}
+	/** Joins mapped receipt and activation evidence under the caller's transaction owner. */
+	deliveryConfirmWithSettleInTransaction(
+		deliveryId: string,
+		monitorEventStage: "delivered" | "authored",
+	): "unknown" | "transitioned" | "already_terminal" {
+		this.requireTransaction();
 			const delivery = this.#database
 				.query<{ delivery_id: string; turn_id: string; state: string }, [string]>(
 					"SELECT delivery_id, turn_id, state FROM deliveries WHERE delivery_id = ?",
@@ -4232,7 +5697,6 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				.run(new Date().toISOString(), deliveryId);
 			this.settleMonitorEventsForTurn(delivery.turn_id, monitorEventStage);
 			return "transitioned";
-		});
 	}
 	/** Settles the monitor batch of a turn id (used by the atomic confirm path). */
 	settleMonitorEventsForTurn(turnId: string, stage: "delivered" | "authored"): void {
@@ -4661,7 +6125,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				"inbound_messages",
 				this.#database
 					.query(
-						`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') LIMIT ?)`,
+						`DELETE FROM inbound_messages WHERE rowid IN (SELECT rowid FROM inbound_messages WHERE state = 'done' AND received_at < ? AND ${REPLAYABLE_INBOUND} AND ${UNRETAINED_TASK_INBOUND} AND NOT EXISTS (SELECT 1 FROM inbound_messages s WHERE s.turn_op_ref = inbound_messages.turn_op_ref AND s.state <> 'done') LIMIT ?)`,
 					)
 					.run(historyCutoff, batch).changes,
 			);
@@ -4685,7 +6149,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				"deliveries",
 				this.#database
 					.query(
-						"DELETE FROM deliveries WHERE rowid IN (SELECT rowid FROM deliveries WHERE (state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?) LIMIT ?)",
+						`DELETE FROM deliveries WHERE rowid IN (SELECT rowid FROM deliveries WHERE ((state = 'confirmed' AND updated_at < ?) OR (state = 'expired' AND updated_at < ?)) AND ${UNRETAINED_TASK_DELIVERY} LIMIT ?)`,
 					)
 					.run(deliveryCutoff, historyCutoff, batch).changes,
 			);
@@ -4693,7 +6157,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 				"lane_reports",
 				this.#database
 					.query(
-						"DELETE FROM lane_reports WHERE rowid IN (SELECT rowid FROM lane_reports WHERE state IN ('consumed','fallback','undeliverable') AND updated_at < ? LIMIT ?)",
+						"DELETE FROM lane_reports WHERE rowid IN (SELECT rowid FROM lane_reports WHERE state IN ('consumed','fallback','undeliverable') AND updated_at < ? AND NOT EXISTS (SELECT 1 FROM work_tasks t WHERE t.op_ref = lane_reports.child_op_ref) LIMIT ?)",
 					)
 					.run(historyCutoff, batch).changes,
 			);
@@ -4715,7 +6179,7 @@ SELECT 1 FROM dispatch_leases l WHERE l.event_id = monitor_events.event_id AND l
 	}
 
 	deliveryPrune(before: string): number {
-		return this.#database.query("DELETE FROM deliveries WHERE state = 'confirmed' AND updated_at < ?").run(before)
+		return this.#database.query(`DELETE FROM deliveries WHERE state = 'confirmed' AND updated_at < ? AND ${UNRETAINED_TASK_DELIVERY}`).run(before)
 			.changes;
 	}
 
@@ -5416,6 +6880,51 @@ CREATE INDEX monitor_events_monitor_stage ON monitor_events (monitor_id, stage);
 				this.#database
 					.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 					.run(32, new Date().toISOString());
+			});
+		}
+		if (current < 33) {
+			this.withTransaction(() => {
+				this.#database.exec(`
+					CREATE TABLE work_tasks (
+						task_id TEXT PRIMARY KEY,
+						lane_name TEXT NOT NULL UNIQUE,
+						job_id TEXT NOT NULL UNIQUE,
+						op_ref TEXT NOT NULL UNIQUE,
+						thread_origin_key TEXT UNIQUE,
+						surface_phase TEXT NOT NULL CHECK(surface_phase IN ('pending','claimed','bound','held')),
+						dispatch_phase TEXT NOT NULL CHECK(dispatch_phase IN ('pending','prepared')),
+						obligation_state TEXT NOT NULL CHECK(obligation_state IN ('awaiting_final','final_admitted','held')),
+						version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version >= 0),
+						record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+						CHECK((surface_phase = 'bound') = (thread_origin_key IS NOT NULL))
+					);
+					CREATE INDEX work_tasks_pending ON work_tasks(dispatch_phase, surface_phase, task_id);
+					CREATE INDEX work_tasks_obligation ON work_tasks(obligation_state, task_id);
+					CREATE TABLE work_controls (
+						control_id TEXT PRIMARY KEY,
+						task_id TEXT NOT NULL REFERENCES work_tasks(task_id),
+						event_id TEXT NOT NULL UNIQUE,
+						sequence INTEGER NOT NULL CHECK(typeof(sequence) = 'integer' AND sequence > 0),
+						client_ref TEXT UNIQUE,
+						notification_id TEXT NOT NULL UNIQUE,
+						phase TEXT NOT NULL CHECK(phase IN ('pending','sending','accepted','refused','held')),
+						version INTEGER NOT NULL CHECK(typeof(version) = 'integer' AND version >= 0),
+						record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+						UNIQUE(task_id, sequence)
+					);
+					CREATE INDEX work_controls_pending ON work_controls(task_id, phase, sequence);
+					CREATE TABLE work_task_sources (
+						source_id TEXT PRIMARY KEY,
+						task_id TEXT NOT NULL REFERENCES work_tasks(task_id),
+						sequence INTEGER NOT NULL CHECK(typeof(sequence) = 'integer' AND sequence > 0),
+						content_hash TEXT NOT NULL,
+						delivery_id TEXT UNIQUE REFERENCES deliveries(delivery_id),
+						record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+						UNIQUE(task_id, sequence)
+					);
+				`);
+				this.#database.query("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(33, new Date().toISOString());
 			});
 		}
 	}

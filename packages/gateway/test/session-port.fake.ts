@@ -2,6 +2,7 @@ import {
 	type BrokerSession,
 	type CliResult,
 	GjcCliError,
+	OpRefError,
 	OpRefRejectedError,
 	type SendReceipt,
 	type StatusReport,
@@ -17,6 +18,8 @@ import type {
 	SessionRequestResult,
 	SessionSendInput,
 	SessionSteerInput,
+	SessionSteerStatusInput,
+	SessionSteerStatusResult,
 	TerminateHostOutcome,
 	WorkerOutputInput,
 	WorkerOutputResult,
@@ -131,6 +134,7 @@ export class ScriptedSessionPort implements SessionPort {
 	readonly sends: SessionSendInput[] = [];
 	readonly sendAttempts: SessionSendInput[] = [];
 	readonly steers: SessionSteerInput[] = [];
+	readonly #steerStatuses = new Map<string, SessionSteerStatusResult>();
 	readonly workerOutputReads: WorkerOutputInput[] = [];
 	readonly #workerOutputFixtures = new Map<string, CliResult>();
 	readonly binds: SessionBindInput[] = [];
@@ -279,7 +283,37 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async steer(input: SessionSteerInput): Promise<void> {
 		this.steers.push(input);
-		await this.onSteer?.(input, this);
+		const key = JSON.stringify([input.sessionId, input.repo, input.clientRef]);
+		const acceptedAt = Date.now();
+		this.#steerStatuses.set(key, { status: "unknown", clientRef: input.clientRef });
+		try {
+			await this.onSteer?.(input, this);
+			this.#steerStatuses.set(key, { status: "accepted", clientRef: input.clientRef, acceptedAt });
+		} catch (error) {
+			const details = error instanceof GjcCliError ? error.details : undefined;
+			if (typeof details === "object" && details !== null && "refused" in details && details.refused === true) {
+				this.#steerStatuses.set(key, {
+					status: "rejected", clientRef: input.clientRef, acceptedAt, terminalAt: Date.now(),
+					...("code" in details && typeof details.code === "string" ? { errorCode: details.code } : {}),
+				});
+			}
+			throw error;
+		}
+	}
+
+	async lookupSteerStatus(input: SessionSteerStatusInput): Promise<SessionSteerStatusResult> {
+		if (input.clientRef.length === 0 || input.clientRef.length > 128 || input.clientRef.trim() !== input.clientRef)
+			throw new OpRefError("steer clientRef must be a canonical non-empty string of at most 128 characters");
+		if (
+			(input.relay !== undefined && input.relay.sessionId !== input.sessionId) ||
+			(this.#sessionStates.has(input.sessionId) && this.#sessionStates.get(input.sessionId)?.repo !== input.repo)
+		)
+			return { status: "unavailable", clientRef: input.clientRef, code: "identity_mismatch" };
+		const status = this.#steerStatuses.get(JSON.stringify([input.sessionId, input.repo, input.clientRef]));
+		if (status) return { ...status };
+		if (this.steers.some((steer) => steer.clientRef === input.clientRef))
+			return { status: "unavailable", clientRef: input.clientRef, code: "identity_mismatch" };
+		return { status: "unknown", clientRef: input.clientRef };
 	}
 
 	/** Session controls/queries the caller routed over a live relay handle instead of the CLI (issue #316). */
@@ -387,7 +421,7 @@ export class ScriptedSessionPort implements SessionPort {
 							clientRef: input.opRef,
 							terminalAt: operation.terminalAt,
 							receiptState: "present",
-							outcome: { reason: "end_turn" },
+							outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 						}
 					: operation.state === "failed"
 						? {
@@ -429,6 +463,7 @@ export class ScriptedSessionPort implements SessionPort {
 						...(operation.state === "terminal_ok"
 							? {
 									receiptState: "present",
+									outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 									content: {
 										version: 1,
 										type: "text",
@@ -595,7 +630,7 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_end",
 			rawKind: "agent_end",
-			payload: { outcome: { reason: "end_turn" } },
+			payload: { outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" } },
 			steerEcho: false,
 			idle: true,
 		});
@@ -658,7 +693,7 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#emit(operation.sessionId, opRef, {
 			kind: "agent_end",
 			rawKind: "agent_end",
-			payload: { outcome: { reason: "end_turn" } },
+			payload: { outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" } },
 			steerEcho: false,
 			idle: true,
 		});

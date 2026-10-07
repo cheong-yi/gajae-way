@@ -685,12 +685,12 @@ describe("work attempt durable transactions", () => {
 			BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
 		`);
 		f.raw.exec(
-			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
+			"DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
 		);
 
 		const migrated = await GatewayDatabase.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(32);
+		expect(migrated.schemaVersion).toBe(33);
 		expect(migrated.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "fallback",
 			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
@@ -715,7 +715,7 @@ describe("work attempt durable transactions", () => {
 		const f = await fixture();
 		f.database.workAttemptPrepare(f.runtime, f.record);
 		f.raw.exec(
-			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
+			"DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
 		);
 		f.raw.query("UPDATE work_attempt_runtime SET record_json = '{' WHERE op_ref = ?").run(f.runtime.opRef);
 		await expect(GatewayDatabase.open(f.path)).rejects.toBeInstanceOf(DatabaseStartupError);
@@ -731,7 +731,7 @@ describe("work attempt durable transactions", () => {
 	test("v21 migration preserves historical open history and adopts without parent", async () => {
 		const f = await fixture();
 		f.database.putLaneJob({ ...f.record, laneKey: f.runtime.laneKey, json: JSON.stringify(f.record) });
-		// Preserve the fixture's explicit provenance while replaying v21 through v26.
+		// Preserve the fixture's explicit provenance while replaying v21 through v33.
 		// Restoring a snapshot is not initialization/adoption of a populated database.
 		f.raw.exec(`CREATE TEMP TABLE saved_authority AS SELECT * FROM broker_authority;
 			CREATE TEMP TABLE saved_bindings AS SELECT * FROM broker_owned_bindings;`);
@@ -751,6 +751,9 @@ describe("work attempt durable transactions", () => {
 		f.raw.exec(`
 ALTER TABLE memory_intents DROP COLUMN quarantine_reason;
 ALTER TABLE memory_intents DROP COLUMN attempts;
+DROP TABLE work_task_sources;
+DROP TABLE work_controls;
+DROP TABLE work_tasks;
 DROP TABLE work_attempt_runtime;
 ALTER TABLE inbound_messages DROP COLUMN source;
 DROP TABLE lane_reports;
@@ -767,7 +770,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(32);
+		expect(migrated.schemaVersion).toBe(33);
 		expect(migrated.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.workAttemptPrepare(historical, f.record);

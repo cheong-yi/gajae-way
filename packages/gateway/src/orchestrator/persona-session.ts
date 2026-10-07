@@ -592,7 +592,15 @@ class OriginActor {
 		if (this.#bindWedged) return "broker_wedged";
 		if (this.#lastBindHoldReason) return this.#lastBindHoldReason;
 		if (this.#manager.database.inboundHasQuarantinedNonterminalTurn(this.originKey)) return "quarantined_turn";
-		return undefined;
+		return this.#taskSurfaceHold();
+	}
+
+	#taskSurfaceHold(): string | undefined {
+		try {
+			return this.#manager.database.workTaskByThread(this.originKey) ? "mapped_task_surface" : undefined;
+		} catch {
+			return "mapped_task_record_unavailable";
+		}
 	}
 
 	get state(): PersonaActorState {
@@ -619,6 +627,7 @@ class OriginActor {
 	 * origin sends it as the next turn. No window, no coalescing.
 	 */
 	async admit(): Promise<void> {
+		if (this.#taskSurfaceHold()) return;
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
@@ -703,6 +712,7 @@ class OriginActor {
 
 	async recover(): Promise<void> {
 		this.#recoveryScanned = true;
+		if (this.#taskSurfaceHold()) return;
 		for (const turn of this.#manager.database.inboundNonterminalTurns(this.originKey)) {
 			if (this.#current?.turn.opRef === turn.opRef || this.#retired.has(retiredKey({ epoch: turn.epoch, turn })))
 				continue;
@@ -1120,7 +1130,9 @@ class OriginActor {
 	 */
 	async #dispatchNext(): Promise<void> {
 		if (this.#state !== "idle" || this.#current || this.#dispatchRetry) return;
+		if (this.#taskSurfaceHold()) return;
 		await this.#resolveStaleHolds();
+		if (this.#taskSurfaceHold()) return;
 		const trigger = this.#manager.database.inboundPendingOldest(this.originKey);
 		if (!trigger) return;
 		const epoch = this.#epoch();
@@ -2481,14 +2493,19 @@ class OriginActor {
 	}
 
 	/**
-	 * A submission-phase failure means the host never started the prompt, so
-	 * re-sending it cannot repeat any work. Only the first such failure of a
-	 * live turn that showed nothing is retried; a second one is reported.
+	 * Only a correlated runtime submission rejection proves the prompt never
+	 * started. Missing output, unknown status, or an unqualified phase do not.
+	 * Retain upstream's single retry, never on a permanently mapped task surface.
 	 */
 	#submissionRetryable(bound: BoundTurn, report: StatusReport, evidence: FailedTurnEvidence | undefined): boolean {
 		return (
+			report.operationRef === bound.turn.opRef &&
+			report.status.status === "failed" &&
 			report.status.outcome?.phase === "submission" &&
+			report.status.outcome.provenance === "agent_failed" &&
+			report.status.outcome.category === "agent_runtime" &&
 			evidence?.reason !== "provider_quota_exhausted" &&
+			!this.#taskSurfaceHold() &&
 			!bound.retired &&
 			this.#current === bound &&
 			!bound.replyVisible &&

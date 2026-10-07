@@ -1,4 +1,6 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test as bunTest } from "bun:test";
+import type { WorkJobsResult } from "@gajae-gateway/protocol";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,6 +34,80 @@ import {
 const bot = { id: "bot-9" };
 const GUILD_ID = "1510336487894286436";
 const CATEGORY_ID = "1520004470489223219";
+
+// Keep native timer behavior, but cancel only this test's timers at teardown.
+// ReconnectingGateway has no public close API; unref alone would leak retries
+// into later files and can even start real socket connection attempts.
+const fixtureScope = new AsyncLocalStorage<{
+	timers: Set<ReturnType<typeof setTimeout>>;
+	gateways: ReconnectingGateway[];
+	passes: Set<Promise<void>>;
+}>();
+const nativeSetTimeout = globalThis.setTimeout;
+let timerSpy: ReturnType<typeof spyOn<typeof globalThis, "setTimeout">>;
+beforeAll(() => {
+	timerSpy = spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+		const timer = nativeSetTimeout(...args);
+		fixtureScope.getStore()?.timers.add(timer);
+		return timer;
+	}) as typeof setTimeout);
+});
+afterAll(() => timerSpy.mockRestore());
+
+function test(name: string, body: () => void | Promise<void>): void {
+	bunTest(name, async () => {
+		const scope = {
+			timers: new Set<ReturnType<typeof setTimeout>>(),
+			gateways: [] as ReconnectingGateway[],
+			passes: new Set<Promise<void>>(),
+		};
+		await fixtureScope.run(scope, async () => {
+			try {
+				await body();
+			} finally {
+				for (const timer of scope.timers) clearTimeout(timer);
+				try {
+					await Promise.all(scope.passes);
+					await Promise.all(scope.gateways.map((gateway) => gateway.cursorsFlushed));
+				} finally {
+					for (const timer of scope.timers) clearTimeout(timer);
+				}
+			}
+		});
+	});
+}
+
+/** Recovery fixtures have no task memberships; discovery is a separate, observed operation. */
+function recoveryGateway(...args: ConstructorParameters<typeof ReconnectingGateway>) {
+	const client = args[7];
+	if (!client) throw new Error("Recovery fixture requires an initial client");
+	const discoveryRequests: unknown[] = [];
+	args[7] = {
+		...client,
+		request: async <T = unknown>(verb: string, params?: unknown): Promise<T> => {
+			if (verb === "work.jobs") {
+				discoveryRequests.push(params);
+				expect(params).toBeUndefined();
+				// An absent nextTaskId terminates this bounded, empty page.
+				const page: WorkJobsResult = { jobs: [], tasks: [], taskErrors: [] };
+				return page as T;
+			}
+			return client.request<T>(verb, params);
+		},
+	} as typeof client;
+	const gateway = Object.assign(new ReconnectingGateway(...args), { discoveryRequests });
+	const scope = fixtureScope.getStore();
+	if (!scope) throw new Error("Recovery gateway must belong to a test");
+	scope.gateways.push(gateway);
+	const recover = gateway.recoverMissedMessages.bind(gateway);
+	gateway.recoverMissedMessages = () => {
+		const pass = recover();
+		scope.passes.add(pass);
+		void pass.then(() => scope.passes.delete(pass), () => scope.passes.delete(pass));
+		return pass;
+	};
+	return gateway;
+}
 
 /** Full cursor-store state from just its watermarks. */
 function cursorState(recoveredThrough: Record<string, string>): RecoveryCursorState {
@@ -284,6 +360,7 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	// The rejected send burned one attempt and the in-pass retry acked it: two chat.sends,
 	// one watermark. A reconnect afterwards has nothing left to replay.
 	expect(requests).toEqual(["chat.send", "chat.send"]);
+	expect(firstGateway.discoveryRequests).toEqual([undefined]);
 	await settle();
 	const persisted = await loadRecoveryCursors(cursorPath);
 	expect(persisted.recoveredThrough).toEqual({ "channel-1": inbound.id });
@@ -293,6 +370,7 @@ test("gateway rejection is retried inside the pass and then persisted once", asy
 	await secondGateway.recoverMissedMessages();
 	await secondGateway.recoverMissedMessages();
 	expect(requests).toEqual(["chat.send", "chat.send"]);
+	expect(secondGateway.discoveryRequests).toEqual([undefined, undefined]);
 });
 
 test("cold-start recovery waits for both gateway client and Discord user", async () => {
@@ -311,7 +389,7 @@ test("cold-start recovery waits for both gateway client and Discord user", async
 		configPath: "config",
 		channels: { "channel-1": {} },
 	} as const;
-	const gateway = new ReconnectingGateway(
+	const gateway = recoveryGateway(
 		"socket",
 		{
 			channels: {
@@ -330,9 +408,11 @@ test("cold-start recovery waits for both gateway client and Discord user", async
 	);
 	await gateway.recoverMissedMessages();
 	expect(fetches).toBe(0);
+	expect(gateway.discoveryRequests).toEqual([]);
 	botUser = bot;
 	await Promise.all([gateway.recoverMissedMessages(), gateway.recoverMissedMessages()]);
 	expect(fetches).toBe(1);
+	expect(gateway.discoveryRequests).toEqual([undefined]);
 });
 
 test("an active thread gap is recovered once through its configured parent", async () => {
@@ -348,7 +428,7 @@ test("an active thread gap is recovered once through its configured parent", asy
 		},
 	});
 	const sent: string[] = [];
-	const gateway = new ReconnectingGateway(
+	const gateway = recoveryGateway(
 		"socket",
 		{ channels: { fetch: async (id: string) => (id === "thread-1" ? thread : parent) } },
 		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
@@ -367,6 +447,7 @@ test("an active thread gap is recovered once through its configured parent", asy
 	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["thread-1"]).toBe(missed.id);
 	await gateway.recoverMissedMessages();
 	expect(sent).toEqual([missed.id]);
+	expect(gateway.discoveryRequests).toEqual([undefined, undefined]);
 });
 
 test("a permission-dead thread keeps its gap and does not block sibling recovery", async () => {
@@ -383,7 +464,7 @@ test("a permission-dead thread keeps its gap and does not block sibling recovery
 		},
 	});
 	const permission = Object.assign(new Error("Missing Access"), { code: 50_001 });
-	const gateway = new ReconnectingGateway(
+	const gateway = recoveryGateway(
 		"socket",
 		{
 			channels: {
@@ -407,6 +488,7 @@ test("a permission-dead thread keeps its gap and does not block sibling recovery
 	const state = await loadRecoveryCursors(cursorPath);
 	expect(state.recoveredThrough["thread-good"]).toBe(healthyMessage.id);
 	expect(state.recoveredThrough["thread-blocked"]).toBeUndefined();
+	expect(gateway.discoveryRequests).toEqual([undefined, undefined, undefined]);
 	expect(gateway.recoveryRetryPending).toBe(false);
 });
 
@@ -436,6 +518,8 @@ test("a known DM gap survives restart without a configured channel", async () =>
 	const restarted = wiredGateway(fakeChannel([missed]), client, cursorPath, {});
 	await restarted.recoverMissedMessages();
 	expect(sent).toEqual([liveId, missed.id]);
+	expect(first.discoveryRequests).toEqual([]);
+	expect(restarted.discoveryRequests).toEqual([undefined]);
 	expect((await loadRecoveryCursors(cursorPath)).recoveredThrough["dm-1"]).toBe(missed.id);
 });
 
@@ -544,8 +628,8 @@ function wiredGateway(
 	cursorPath: string,
 	channels: Record<string, Record<string, never>> = { "channel-1": {} },
 	getBotUser: () => unknown = () => bot,
-): ReconnectingGateway {
-	return new ReconnectingGateway(
+): ReturnType<typeof recoveryGateway> {
+	return recoveryGateway(
 		"socket",
 		{ channels: { fetch: async () => channel } },
 		{ tokenFile: "token", token: "redacted", configPath: "config", channels } as never,
@@ -1010,7 +1094,7 @@ test("a throwing history fetch leaves other channels recovered and arms a retry"
 			},
 		},
 	};
-	const gateway = new ReconnectingGateway(
+	const gateway = recoveryGateway(
 		"socket",
 		{ channels: { fetch: async (id: string) => (id === "channel-broken" ? broken : healthy) } },
 		{
@@ -1055,7 +1139,7 @@ test("one channel's unexpected throw leaves later channels recovered and arms a 
 	const poisonOrigin = message(snowflakeFromTimestamp(Date.now() - 120_000), {
 		channel: { id: "channel-broken", isThread: () => true, parentId: null },
 	} as Partial<DiscordInboundMessage>);
-	const gateway = new ReconnectingGateway(
+	const gateway = recoveryGateway(
 		"socket",
 		{
 			channels: {
@@ -1289,7 +1373,7 @@ test("ledger cap eviction preserves the active head-of-line entry", () => {
 test("a channel that lost access is quarantined without blocking healthy recovery", async () => {
 	const cursorPath = join(home, "lost-access", "recovery-cursor.json");
 	const inbound = message(snowflakeFromTimestamp(Date.now() - 60_000));
-	const gateway = new ReconnectingGateway(
+	const gateway = recoveryGateway(
 		"socket",
 		// A deleted channel / revoked permission resolves to nothing fetchable.
 		{ channels: { fetch: async (id: string) => (id === "channel-gone" ? null : fakeChannel([inbound])) } },
@@ -1317,6 +1401,7 @@ test("a channel that lost access is quarantined without blocking healthy recover
 	expect(gateway.recoveryRetryPending).toBe(true);
 	await gateway.recoverMissedMessages();
 	expect(gateway.recoveryRetryPending).toBe(false);
+	expect(gateway.discoveryRequests).toEqual([undefined, undefined, undefined]);
 	const retained = await loadRecoveryCursors(cursorPath);
 	expect(retained.recoveredThrough["channel-1"]).toBe(inbound.id);
 });
@@ -1410,7 +1495,7 @@ test("accepted thread follow-ups arm presence and typing while overheard channel
 	status.arm = (conversationId: string, messageId: string) => void armed.push([conversationId, messageId]);
 	let engaged = true;
 	const client = { request: async () => ({ engaged }) };
-	const gateway = new ReconnectingGateway(
+	const gateway = recoveryGateway(
 		"socket",
 		{ channels: { fetch: async () => fakeChannel([]) } },
 		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,

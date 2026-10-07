@@ -37,10 +37,18 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 
 - Send a DM that your `dmPolicy` accepts (`owner-only`, `allowlist`, or `open`) and talk normally. Your bot responds in that conversation's own ongoing context.
 - In a group, it stays out of the way until you mention it. You can explicitly open a configured channel for normal conversation.
-- Send `/new` when you want a fresh start in that conversation. It confirms that a fresh session has started.
+- Send `/new` when you want a fresh start in an ordinary persona conversation. A Firstmate task surface is different: resetting or archiving its presentation must not retire, replace, or retask its worker.
 - When the gateway accepts a DM or an addressed group turn (a real mention or native reply), Discord and Slack both show a reaction-gradient presence — phase markers, an advancing clock, and an effort digit (tool calls, falling back to output tokens) reacted directly onto the message it is answering; Discord also shows the platform's native typing indicator, and Slack also drives Slack's native assistant status line (`<app> <status>`, via `assistant.threads.setStatus`) under the reply thread. Slack additionally promotes messages in an adapter-configured `open` channel to addressed; Discord does not treat `open`-channel messages as addressed without a real mention. The reaction-gradient markers themselves are never a posted or edited message. Presence stays up through mid-work messages while the turn keeps working and comes off only when the turn ends. In a channel it merely overhears, nothing is shown until it actually replies.
 - Replies are protected by a durable delivery record. After a crash, a send whose outcome was uncertain may be reissued; when it was, it is visibly labeled as a duplicate rather than silently pretending it was not.
 - Conversations and useful monitor output are captured under your own `$GAJAEWAY_HOME/memory` directory as readable Markdown, not hidden in a proprietary store.
+
+**Firstmate Part 1** is the owner fork's durable-supervision contract, integrated into Gajaeway rather than a separate plugin or run loop. The [north star](https://github.com/cheong-yi/gajae-way/issues/3) describes one stable assignment, independent lane, and mapped Discord work thread, with the persona acting as the coordinator cockpit. A terminal lane turn is not proof that the assignment's mandate or report obligation is complete. Implementation is underway; this guidance is not a release, deployment, or runtime-verification claim.
+
+The cockpit is exceptions-first: selected state, outstanding owner actions, and evidence-linked results rather than a transcript mirror. Open a task's mapped thread for its assignment, accepted/refused/held steering outcomes, available proven checkpoints, errors, and final disposition. Authenticated owner steering there needs no coordinator approval, but stays task-local and within admission scope. Broader direction must explicitly name targets; each target has its own outcome. Context shared across sessions is evidence, not automatically propagated instructions or authoritative memory.
+
+On request, bounded context must identify its sources and revisions, evidence time separately from rendering time, and stale, missing, raced, or omitted material. Notify immediately of a cleared exception only when a previously requested owner action is no longer needed; otherwise update task detail and the next requested digest quietly. No scheduled digest or every-completion notice is prescribed.
+
+Mutation-capable tasks require pre-provisioned dedicated Git worktrees, not an OS sandbox. Recovery observes original identities and retrieves original results; it does not replay prompts or tools. Missing results may hide committed effects. Physical delivery is at-least-once, and unavailable output remains incomplete. See [architecture](docs/architecture.md#worker-lanes), [deployment](docs/deployment.md#upgrades), and the [operator runbook](docs/runbooks/gajaeway-v1.md#configuration-and-credentials) for the contract and remaining qualification gates. Vision-led autonomy and an unattended factory are outside Part 1.
 
 ## Packages
 
@@ -111,6 +119,30 @@ bun test packages # runs the full package test suite
 ```
 
 Production hosts run the compiled binaries, not this source checkout.
+
+### Local TypeScript checks
+
+Read [consumer facts](.gajaestack/routing.toml) before implementation and review;
+subsequent briefs must carry these commands and report failures without weakening
+native configuration or narrowing coverage:
+
+```sh
+bun .gajaestack/typescript/check.ts --quick # lint packages/ and scripts/; not changed-only
+bun .gajaestack/typescript/check.ts         # full native tsconfig typecheck, then lint
+bun test packages                         # independent native package tests
+```
+
+Only the standalone `typescript` asset is adopted. It uses installed local
+tsc/Biome and existing `tsconfig.json`/`biome.json`; it does not format or install
+tools. Quick mode does not typecheck, and a failed typecheck stops full-mode lint.
+No Gajaestack Bun preload or CI binding is activated; the existing conformance
+preload is unchanged. Required checks are completion instructions, not automatic
+enforcement or a claim that the baseline is green. Focused affected tests remain
+necessary for behavioral changes.
+
+Firstmate retains Gajaeway/GJC execution ownership and PCD evidence discipline.
+Meaningful slices still require paired Luna6/Sol6.1 review; this adoption does not
+complete F3/G001 or replace broader acceptance and crash/recovery proof.
 
 ### Publishing packages
 

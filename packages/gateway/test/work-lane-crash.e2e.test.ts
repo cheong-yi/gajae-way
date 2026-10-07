@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 import { type Barrier, eventually, noticeOrigin, WorkFixture } from "./fixtures/work-lane-server";
@@ -116,7 +117,7 @@ for (const point of ["prepared", "accepted-before-save"] as const) {
 		const f = await fixture(point);
 		const client = await f.connect();
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: "start",
 			verb: "work.start",

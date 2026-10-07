@@ -7,11 +7,15 @@ import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { type DatabaseStartupError, GatewayDatabase } from "../src/store/db";
 
+function dropV33FixtureSchema(database: Database): void {
+	database.exec("DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks;");
+}
+
 test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
 	try {
 		const database = await GatewayDatabase.open(join(directory, "gateway.db"));
-		expect(database.schemaVersion).toBe(32);
+		expect(database.schemaVersion).toBe(33);
 
 		database.memoryIntentCreate({ id: "memory-schema", kind: "daily_capture", payloadJson: "{}" });
 		expect(database.memoryIntentRows()[0]).toMatchObject({
@@ -88,13 +92,14 @@ test("adds quarantine diagnostics to existing memory intents", async () => {
 		current.close();
 
 		const legacy = new Database(path);
+		dropV33FixtureSchema(legacy);
 		legacy.exec(
 			"DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts; ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 23",
 		);
 		legacy.close();
 
 		const migrated = await GatewayDatabase.open(path);
-		expect(migrated.schemaVersion).toBe(32);
+		expect(migrated.schemaVersion).toBe(33);
 		expect(migrated.memoryIntentRows()[0]).toMatchObject({
 			id: "legacy-intent",
 			state: "queued",
@@ -155,6 +160,7 @@ test("adds last_error to existing deliveries without touching their state (#171)
 		current.close();
 
 		const legacy = new Database(path);
+		dropV33FixtureSchema(legacy);
 		legacy.exec("ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 26");
 		legacy.close();
 

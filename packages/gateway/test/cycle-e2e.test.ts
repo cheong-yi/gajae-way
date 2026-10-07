@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OriginRef } from "@gajae-gateway/protocol";
+import { type OriginRef, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { RuntimeCycleProjector } from "../src/ops/cycle";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
@@ -276,8 +276,8 @@ test("ops.cycle verb serves a fresh fail-closed snapshot over the socket", async
 	});
 	const conn = await socket;
 	const send = (frame: unknown) => conn.write(`${JSON.stringify(frame)}\n`);
-	send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	send({ v: "0.1", type: "request", id: "cycle", verb: "ops.cycle" });
+	send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+	send({ v: PROFILE_VERSION, type: "request", id: "cycle", verb: "ops.cycle" });
 	for (let i = 0; i < 100 && frames.length < 2; i++) await Bun.sleep(5);
 	conn.end();
 

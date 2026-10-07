@@ -113,12 +113,14 @@ export interface RelayRequestOptions {
 }
 
 export type RelayResponse = {
-	readonly ok: boolean;
+	/** Raw JSON evidence, not a normalized acknowledgement. Consumers must validate it. */
+	readonly [key: string]: unknown;
+	readonly ok?: unknown;
 	/** The host's `result` as sent: controls answer records or bare values (`model.profile.set` answers a boolean). */
 	readonly result?: unknown;
 	/** Paged queries answer `page: { items, complete, continuationCursor | cursor }` instead of `result`. */
-	readonly page?: Record<string, unknown>;
-	readonly error?: { readonly code?: string; readonly message?: string };
+	readonly page?: unknown;
+	readonly error?: unknown;
 };
 
 export interface TailHandle {
@@ -710,7 +712,14 @@ class ManagedTailHandle implements TailHandle {
 			if (!pending) return;
 			clearTimeout(pending.timer);
 			this.#pending.delete(id!);
-			pending.resolve(decodeResponse(frame));
+			if (frame.type !== pending.kind) {
+				pending.reject(new Error("relay response kind does not match the original request"));
+				return;
+			}
+			// Only consume the routing fields validated above. Retain all outcome
+			// evidence, including malformed values and certainty metadata.
+			const { type: _type, id: _id, ...response } = frame;
+			pending.resolve(response);
 			return;
 		}
 		if (frame.type === "reverse_request") {
@@ -958,23 +967,6 @@ class ManagedTailHandle implements TailHandle {
 		}
 		this.#runner.release(this);
 	}
-}
-
-function decodeResponse(frame: Record<string, unknown>): RelayResponse {
-	const error = recordOf(frame.error);
-	return {
-		ok: frame.ok === true,
-		...(frame.result !== undefined ? { result: frame.result } : {}),
-		...(recordOf(frame.page) ? { page: recordOf(frame.page) } : {}),
-		...(error
-			? {
-					error: {
-						...(typeof error.code === "string" ? { code: error.code } : {}),
-						...(typeof error.message === "string" ? { message: error.message } : {}),
-					},
-				}
-			: {}),
-	};
 }
 
 /**

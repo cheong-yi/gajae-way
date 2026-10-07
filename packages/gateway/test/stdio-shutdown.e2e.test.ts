@@ -1,7 +1,19 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+let home = "";
+let child: ReturnType<typeof Bun.spawn> | undefined;
+afterEach(async () => {
+	// Native test timeouts must not leave a daemon waiting on graceful shutdown.
+	child?.kill("SIGKILL");
+	if (child) await child.exited;
+	child = undefined;
+	if (home) await rm(home, { recursive: true, force: true });
+	home = "";
+});
 
 /**
  * A `gateway.shutdown` request over stdio must let `stop()` resolve: the request
@@ -9,9 +21,9 @@ import { join } from "node:path";
  * shutdown task itself would self-await forever and the daemon would never exit.
  */
 test("a stdio gateway.shutdown request completes ordered shutdown and exits the daemon", async () => {
-	const home = await mkdtemp(join(tmpdir(), "gajaeway-stdio-shutdown-"));
+	home = await mkdtemp(join(tmpdir(), "gajaeway-stdio-shutdown-"));
 	await Bun.write(join(home, "config.json"), JSON.stringify({ schemaVersion: 1 }));
-	const child = Bun.spawn({
+	const daemon = Bun.spawn({
 		cmd: ["bun", "packages/gateway/test/daemon-entry.ts", "--stdio"],
 		cwd: join(import.meta.dir, "../../.."),
 		env: { ...process.env, GAJAEWAY_HOME: home },
@@ -19,22 +31,20 @@ test("a stdio gateway.shutdown request completes ordered shutdown and exits the 
 		stdout: "pipe",
 		stderr: "ignore",
 	});
-	try {
-		const output = new Response(child.stdout as ReadableStream).text();
-		child.stdin.write(`${JSON.stringify({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } })}\n`);
-		child.stdin.write(
-			`${JSON.stringify({ v: "0.1", type: "request", id: "bye", verb: "gateway.shutdown", params: {} })}\n`,
-		);
-		child.stdin.flush();
-		const exit = await Promise.race([child.exited, Bun.sleep(15_000).then(() => "timeout" as const)]);
-		expect(exit).not.toBe("timeout");
-		const frames = (await output)
-			.split("\n")
-			.filter(Boolean)
-			.map((line) => JSON.parse(line) as { type: string; event?: string; id?: string });
-		expect(frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(true);
-	} finally {
-		child.kill();
-		await rm(home, { recursive: true, force: true });
-	}
+	child = daemon;
+	const output = new Response(daemon.stdout as ReadableStream).text();
+	daemon.stdin.write(
+		`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+	);
+	daemon.stdin.write(
+		`${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "bye", verb: "gateway.shutdown", params: {} })}\n`,
+	);
+	daemon.stdin.flush();
+	// The native test deadline bounds this wait; teardown kills only this fixture.
+	expect(await daemon.exited).toBe(0);
+	const frames = (await output)
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as { type: string; event?: string; id?: string });
+	expect(frames.some((frame) => frame.type === "event" && frame.event === "gateway.stopping")).toBe(true);
 });

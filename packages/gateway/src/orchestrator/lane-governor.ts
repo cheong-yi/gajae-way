@@ -73,6 +73,14 @@ export interface SweepNomination {
 export type LaneForceRetireReason = "session_dead" | "session_disowned";
 type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
+/** Eligibility only: neither host closure nor worktree cleanup permission. */
+export type TaskReleaseAssessment =
+	| { readonly kind: "unmapped" }
+	| { readonly kind: "hold"; readonly reason: string }
+	| { readonly kind: "eligible"; readonly taskId: string; readonly taskVersion: number;
+		readonly jobId: string; readonly opRef: string; readonly sessionId: string;
+		readonly epoch: number; readonly cwd: string };
+
 export interface LaneGovernorOptions {
 	readonly database: GatewayDatabase;
 	readonly sessionPort: SessionPort;
@@ -100,6 +108,7 @@ export class LaneGovernor {
 	readonly #log: (line: string, level?: LogLevel) => void;
 	#recoveryGate?: () => Promise<void>;
 	#forceRetireSettlement?: ForceRetireSettlement;
+	#taskReleaseAssessment?: (name: string) => TaskReleaseAssessment;
 	#stopped = false;
 	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
 
@@ -121,6 +130,10 @@ export class LaneGovernor {
 	/** Installed by the attempt owner so forced retirement settles history and runtime atomically. */
 	setForceRetireSettlement(settle: ForceRetireSettlement): void {
 		this.#forceRetireSettlement = settle;
+	}
+
+	setTaskReleaseAssessment(assess: (name: string) => TaskReleaseAssessment): void {
+		this.#taskReleaseAssessment = assess;
 	}
 
 	async stop(): Promise<void> {
@@ -222,6 +235,8 @@ export class LaneGovernor {
 		const sessionKey = workSessionKey(name);
 		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
+		const taskHold = this.#taskRetirementHold(name);
+		if (taskHold) return Promise.resolve({ retired: false, sessionKey, reason: taskHold });
 		// Refuse an unsettled lane now rather than queuing retirement behind its
 		// turn; the same check repeats under the lock because a run may start
 		// before we acquire it.
@@ -231,6 +246,8 @@ export class LaneGovernor {
 			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
+			const taskHold = this.#taskRetirementHold(name);
+			if (taskHold) return { retired: false, sessionKey, reason: taskHold };
 			const lane = this.activeLanes(expected ? Math.max(expected.now, this.#now()) : undefined).find(
 				(candidate) => candidate.name === name,
 			);
@@ -240,6 +257,8 @@ export class LaneGovernor {
 			if (lane.attemptOpen) return unsettled(sessionKey, lane);
 			if (expected && this.#sweepReason(lane) !== expected.reason)
 				return { retired: false, sessionKey, reason: `lane no longer qualifies for ${expected.reason} retirement` };
+			const assessment = this.#assessTask(name);
+			if (assessment.kind !== "unmapped") return this.#releaseTask(name, assessment);
 			const job = this.#job(name);
 			const record = job === "corrupt" ? undefined : job;
 			// Try job record repo first, then owned binding repo, then process.cwd() fallback.
@@ -266,6 +285,8 @@ export class LaneGovernor {
 			// or a crash-left attempt may still be running.
 			const runtime = await this.#runtimeSettled(record, lane.sessionId, repo);
 			if (!runtime.settled) return { retired: false, sessionKey, reason: runtime.reason };
+			const afterQueryHold = this.#taskRetirementHold(name);
+			if (afterQueryHold) return { retired: false, sessionKey, reason: afterQueryHold };
 			let closed = false;
 			try {
 				await this.#port.close({ sessionId: lane.sessionId, repo });
@@ -362,6 +383,8 @@ export class LaneGovernor {
 		const sessionKey = workSessionKey(name);
 		if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
+		const taskHold = this.#taskRetirementHold(name);
+		if (taskHold) return Promise.resolve({ retired: false, sessionKey, reason: taskHold });
 		// Unlike normal retire, we check the lane exists but do NOT check if an attempt is open.
 		// We will only close if liveness proves the session is dead/disowned.
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
@@ -370,8 +393,12 @@ export class LaneGovernor {
 			if (this.#database.isBrokerQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
+			const taskHold = this.#taskRetirementHold(name);
+			if (taskHold) return { retired: false, sessionKey, reason: taskHold };
 			const lane = this.activeLanes().find((candidate) => candidate.name === name);
 			if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
+			const assessment = this.#assessTask(name);
+			if (assessment.kind !== "unmapped") return this.#releaseTask(name, assessment, true);
 			const job = this.#job(name);
 			const record = job === "corrupt" ? undefined : job;
 			let repo = record?.lane.worktreePath;
@@ -407,6 +434,8 @@ export class LaneGovernor {
 					return { retired: false, sessionKey, reason: detail };
 				}
 			}
+			const afterQueryHold = this.#taskRetirementHold(name);
+			if (afterQueryHold) return { retired: false, sessionKey, reason: afterQueryHold };
 			// Close the session and rebind the epoch.
 			let closed = false;
 			try {
@@ -464,15 +493,69 @@ export class LaneGovernor {
 		return lane.idleMs >= this.idleRetireMs ? "idle" : undefined;
 	}
 
-	/**
-	 * Runtime terminality for the ledger's last attempt. `endedAt` is the
-	 * gateway's observation, not the broker's: `attempt_ended` (reaped wait)
-	 * and `terminal_uncertain` (crash-left) attempts may still be running. They
-	 * are settled only when `status` reports a terminal op, or reports an
-	 * unknown op on a session the broker says is dead (nothing can be running).
-	 * Status errors (e.g. session_unavailable) are also treated as proof the
-	 * session is gone: consult liveness and settle if dead/disowned.
-	 */
+	/** Mapped tasks never use the legacy missing/dead-host release fallback. */
+	#assessTask(name: string): TaskReleaseAssessment {
+		try {
+			const task = this.#database.workTaskByLane(name);
+			if (!task) return { kind: "unmapped" };
+			const assessment = this.#taskReleaseAssessment?.(name);
+			if (!assessment || assessment.kind === "unmapped")
+				return { kind: "hold", reason: "task_release_assessment_unavailable" };
+			if (assessment.kind === "eligible" && (assessment.taskId !== task.taskId ||
+				assessment.taskVersion !== task.version || assessment.jobId !== task.jobId ||
+				assessment.opRef !== task.opRef || assessment.sessionId !== task.sessionId ||
+				assessment.epoch !== task.epoch || assessment.cwd !== task.request.cwd))
+				return { kind: "hold", reason: "task_release_identity_changed" };
+			return assessment;
+		} catch {
+			return { kind: "hold", reason: "task_obligation_record_unavailable" };
+		}
+	}
+
+	#taskRetirementHold(name: string): string | undefined {
+		const assessment = this.#assessTask(name);
+		return assessment.kind === "hold" ? assessment.reason : undefined;
+	}
+
+	/** Called only under the existing lane lock. Releases capacity, never debt or files. */
+	async #releaseTask(name: string, assessment: TaskReleaseAssessment, forced = false): Promise<LaneRetireOutcome> {
+		const sessionKey = workSessionKey(name);
+		const hold = (reason: string): LaneRetireOutcome => ({ retired: false, sessionKey, reason });
+		if (assessment.kind !== "eligible")
+			return hold(assessment.kind === "hold" ? assessment.reason : "task_release_identity_changed");
+		const identity = JSON.stringify(assessment);
+		const authority = JSON.stringify(this.#database.inspectBrokerAuthority().authority);
+		const current = () => !this.#stopped &&
+			authority === JSON.stringify(this.#database.inspectBrokerAuthority().authority) &&
+			identity === JSON.stringify(this.#assessTask(name));
+		let hostClosed = false;
+		try {
+			if (!current()) return hold("task_release_identity_changed");
+			if (!this.#port.runningJobs) return hold("task_runtime_jobs_unsupported");
+			const jobs = await this.#port.runningJobs({ sessionId: assessment.sessionId, repo: assessment.cwd });
+			if (!current()) return hold("task_release_identity_changed");
+			if (!Array.isArray(jobs)) return hold("task_runtime_jobs_unavailable");
+			if (jobs.length) return hold("task_runtime_jobs_live");
+			// Exact original terminal evidence prevents new original prompt execution;
+			// the public jobs query covers host-managed running work, not arbitrary descendants.
+			// close resolves only on a fresh ordinary identity-bound host closure.
+			await this.#port.close({ sessionId: assessment.sessionId, repo: assessment.cwd });
+			hostClosed = true;
+			if (!current()) return hold("task_release_changed_after_close_closure_effect_retained");
+			this.#database.withTransaction(() => {
+				if (!current()) throw new Error("task_release_changed_after_close");
+				this.#database.rebindEpoch(sessionKey);
+			});
+			return { retired: true, sessionKey, sessionId: assessment.sessionId, closed: true,
+				...(forced ? { forced: true } : {}) };
+		} catch (error) {
+			// A close may already have taken effect. Neither failure nor host absence
+			// authorizes fallback release, replay, or a claim of safe nonexecution.
+			return hold(`${hostClosed ? "task_capacity_release_failed_after_close" : "task_release_unconfirmed"}: ${sanitizeDiagnostic(diagnostic(error))}`);
+		}
+	}
+
+	/** Legacy unmapped-lane policy only; mapped tasks require original terminal receipts. */
 	async #runtimeSettled(
 		job: LaneJobRecord | undefined,
 		sessionId: string,

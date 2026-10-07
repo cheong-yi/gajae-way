@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
@@ -111,10 +112,13 @@ async function response(frames: Array<Record<string, unknown>>, id: string): Pro
 
 test("delivery.confirm on a monitor batch advances authored events to delivered (server protocol)", async () => {
 	const ctx = await startWithMonitor();
-	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	await response(ctx.frames, "__negotiated__").catch(() => undefined);
+	ctx.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+	for (let attempt = 0; attempt < 400 && !ctx.frames.some((frame) => frame.type === "negotiated"); attempt++) {
+		await Bun.sleep(5);
+	}
+	expect(ctx.frames.some((frame) => frame.type === "negotiated")).toBe(true);
 	ctx.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "confirm",
 		verb: "delivery.confirm",
@@ -134,9 +138,9 @@ test("delivery.confirm on a monitor batch advances authored events to delivered 
 
 test("late delivery.fail cannot regress a delivered monitor event (server protocol)", async () => {
 	const ctx = await startWithMonitor();
-	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	ctx.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	ctx.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "confirm",
 		verb: "delivery.confirm",
@@ -146,7 +150,7 @@ test("late delivery.fail cannot regress a delivered monitor event (server protoc
 	// A late, out-of-order fail for the same delivery id (e.g. a duplicate
 	// adapter retry after confirmation):
 	ctx.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "fail",
 		verb: "delivery.fail",
@@ -160,8 +164,8 @@ test("late delivery.fail cannot regress a delivered monitor event (server protoc
 
 test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", async () => {
 	const ctx = await startWithMonitor();
-	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	ctx.send({ v: "0.1", type: "request", id: "c1", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+	ctx.send({ v: PROFILE_VERSION, type: "request", id: "c1", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
 	await response(ctx.frames, "c1");
 	expect(
 		ctx.db
@@ -170,7 +174,7 @@ test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", asyn
 			.map((row) => row.stage),
 	).toEqual(["delivered", "delivered"]);
 	// Duplicate confirm (idempotent ack):
-	ctx.send({ v: "0.1", type: "request", id: "c2", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
+	ctx.send({ v: PROFILE_VERSION, type: "request", id: "c2", verb: "delivery.confirm", params: { deliveryId: ctx.deliveryId } });
 	const dup = await response(ctx.frames, "c2");
 	expect(dup.result).toEqual({ settled: true });
 	expect(
@@ -183,9 +187,9 @@ test("RT-29 duplicate confirm on confirmed keeps monitor events delivered", asyn
 
 test("delivery.fail before confirmation keeps authored events authored (server protocol)", async () => {
 	const ctx = await startWithMonitor();
-	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	ctx.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	ctx.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "fail",
 		verb: "delivery.fail",
@@ -200,9 +204,9 @@ test("delivery.fail before confirmation keeps authored events authored (server p
 
 test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the ledger row", async () => {
 	const ctx = await startWithMonitor();
-	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	ctx.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	ctx.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "confirm",
 		verb: "delivery.confirm",
@@ -212,7 +216,7 @@ test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the led
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("confirmed");
 	// Adapter retries a stale failure AFTER the confirm landed:
 	ctx.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "late-fail",
 		verb: "delivery.fail",
@@ -229,11 +233,11 @@ test("RT-29 ledger monotonicity: late fail after confirmed is a no-op on the led
 
 test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late confirm", async () => {
 	const ctx = await startWithMonitor();
-	ctx.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	ctx.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	// Five non-ambiguous fails expire the delivery.
 	for (const id of ["f1", "f2", "f3", "f4", "f5"]) {
 		ctx.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "delivery.fail",
@@ -244,7 +248,7 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 	expect(ctx.db.deliveryRows().find((row) => row.delivery_id === ctx.deliveryId)?.state).toBe("expired");
 	// A late confirm cannot resurrect an expired delivery:
 	ctx.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "late-confirm",
 		verb: "delivery.confirm",
@@ -261,7 +265,7 @@ test("RT-29 ledger monotonicity: expired row cannot be resurrected by a late con
 	expect(stagesAfter.map((row) => row.stage)).toEqual(["failed_no_retry", "failed_no_retry"]);
 	for (const eventId of ctx.eventIds) expect(ctx.db.monitorFailure(eventId)?.code).toBe("delivery_expired");
 	// An UNKNOWN delivery id is still invalid_params (an error frame):
-	ctx.send({ v: "0.1", type: "request", id: "unknown-id", verb: "delivery.confirm", params: { deliveryId: "nope" } });
+	ctx.send({ v: PROFILE_VERSION, type: "request", id: "unknown-id", verb: "delivery.confirm", params: { deliveryId: "nope" } });
 	for (let attempt = 0; attempt < 400; attempt++) {
 		const frame = ctx.frames.find((f) => f.id === "unknown-id");
 		if (frame) {

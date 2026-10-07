@@ -72,12 +72,12 @@ class Host implements SessionRelayStream {
 		if (frame.type === "hello" && this.hello) this.host({ type: "hello", connectionId: this.connectionId });
 		else this.reply?.(frame, this);
 	}
-	answer(frame: Record<string, unknown>, result: Record<string, unknown>, code?: string) {
+	answer(frame: Record<string, unknown>, result: Record<string, unknown>, error?: { code: string; message: string }) {
 		this.host({
 			type: frame.type === "query_request" ? "query_response" : "control_response",
 			id: frame.id,
-			ok: !code,
-			...(code ? { error: { code } } : { result }),
+			ok: !error,
+			...(error ? { error } : { result }),
 		});
 	}
 	close() {
@@ -281,7 +281,9 @@ test("RT05b (#228) an idle broadcast on a reopened relay never settles the turn 
 	await until(() => f.logs.some((line) => line.includes("reason=relay_lost_mid_turn")));
 	// The final body was streamed while the relay was down; the reopened
 	// connection is not the turn's owner and only sees the session going idle.
-	const body = "FINAL ".repeat(3000).trim();
+	// Stay within Q26's 16 KiB original-result limit; an oversized body is
+	// correctly refused and would test incomplete evidence, not idle recovery.
+	const body = "FINAL ".repeat(2730).trim();
 	f.port.seedOperation(send.opRef, send.sessionId, "terminal_ok", body);
 	for (const tail of f.port.tailsOf(send.sessionId))
 		tail.emit({ kind: "activity", rawKind: "activity", payload: { state: "idle" }, steerEcho: false, idle: true });
@@ -349,7 +351,12 @@ for (const accepts of [true, false]) {
 			attempts++;
 			const ok = accepts && attempts === 3;
 			if (ok) accepted++;
-			stream.answer(frame, { accepted: true, ...ids }, ok ? undefined : "busy");
+			const input = frame.input as Record<string, unknown>;
+			stream.answer(
+				frame,
+				{ accepted: true, ...ids, clientRef: input.clientRef },
+				ok ? undefined : { code: "busy", message: "A turn is already running." },
+			);
 		});
 		const { port, input } = await broker(host, {
 			now: () => now,
@@ -368,7 +375,12 @@ for (const accepts of [true, false]) {
 }
 
 test("RT08 client_ref_conflict is typed and actor queries status without resending", async () => {
-	const host = new Host((frame, stream) => stream.answer(frame, {}, "client_ref_conflict"));
+	const host = new Host((frame, stream) =>
+		stream.answer(frame, {}, {
+			code: "client_ref_conflict",
+			message: "A submission with this clientRef is already retained; never reuse a clientRef for retry.",
+		}),
+	);
 	const real = await broker(host);
 	await expect(real.port.send(real.input)).rejects.toMatchObject({
 		name: "OpRefRejectedError",

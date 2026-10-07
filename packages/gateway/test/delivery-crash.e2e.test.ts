@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,8 +8,11 @@ import { DeliveryLedger } from "../src/store/ledger";
 
 let home = "";
 let child: ReturnType<typeof Bun.spawn> | undefined;
+const clients: Array<{ close(): void }> = [];
 afterEach(async () => {
-	child?.kill();
+	for (const client of clients.splice(0)) client.close();
+	// Teardown must not wait for the daemon's graceful-stop path on a failed test.
+	child?.kill("SIGKILL");
 	if (child) await child.exited;
 	child = undefined;
 	if (home) await rm(home, { recursive: true, force: true });
@@ -61,8 +65,10 @@ async function client(socketPath: string) {
 		},
 	});
 	const send = (value: unknown) => socket.write(`${JSON.stringify(value)}\n`);
-	send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
-	return { frames, send, close: () => socket.end() };
+	const connection = { frames, send, close: () => socket.end() };
+	clients.push(connection);
+	send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+	return connection;
 }
 async function waitFor(frames: any[], predicate: (frame: any) => boolean) {
 	for (let i = 0; i < 200; i++) {
@@ -78,7 +84,7 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	home = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-crash-")));
 	const first = await client(await start());
 	first.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "send",
 		verb: "chat.send",
@@ -117,9 +123,9 @@ test("inflight platform delivery is duplicate-labeled after a process crash", as
 	const second = await client(await start());
 	const redelivery = await waitFor(second.frames, (frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(redelivery.payload).toMatchObject({ deliveryId, redelivered: true, duplicateWarning: true });
-	second.send({ v: "0.1", type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
+	second.send({ v: PROFILE_VERSION, type: "request", id: "confirm", verb: "delivery.confirm", params: { deliveryId } });
 	await waitFor(second.frames, (frame) => frame.id === "confirm");
-	second.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
+	second.send({ v: PROFILE_VERSION, type: "request", id: "status", verb: "gateway.status" });
 	const status = await waitFor(second.frames, (frame) => frame.id === "status");
 	expect(status.result.delivery.pending).toBe(0);
 	second.close();

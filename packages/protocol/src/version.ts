@@ -6,11 +6,11 @@
  * version and produce a typed incompatibility, never silent divergence.
  */
 
-/** Current wire profile version served by this gateway build. */
-export const PROFILE_VERSION = "1.0" as const;
+/** Sole current profile, including mapped task delivery and cursor contracts. */
+export const PROFILE_VERSION = "1.1" as const;
 
 /** Inclusive range of profile versions this build can serve. */
-export const SUPPORTED_PROFILE_VERSIONS: readonly string[] = ["0.1", "1.0"];
+export const SUPPORTED_PROFILE_VERSIONS: readonly string[] = [PROFILE_VERSION];
 
 /** Capability identifiers advertised at negotiation. Grows additively per phase. */
 export const CAPABILITIES = [
@@ -20,12 +20,14 @@ export const CAPABILITIES = [
 	"chat.loopback",
 	/** Emoji reactions in both directions: chat.react + engagement.reaction. */
 	"chat.reactions",
+	/** Durable task admission, mapped surfaces, controls and observational context/recovery. */
+	"work.tasks",
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
 
 export interface HelloPayload {
-	/** Profile versions the client can speak, e.g. ["0.1"]. */
+	/** Profile versions the client can speak, e.g. ["1.1"]. */
 	readonly supportedVersions: readonly string[];
 	/** Capabilities the client requires; missing ones cause typed rejection. */
 	readonly requiredCapabilities?: readonly string[];

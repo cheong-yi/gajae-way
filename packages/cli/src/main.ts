@@ -15,8 +15,22 @@ import type {
 	WorkStartResult,
 	WorkStatusResult,
 	WorkSteerResult,
+	WorkTaskContextResult,
+	WorkTaskRecoverResult,
+	WorkTaskDispositionResult,
+	WorkTaskDispositionBasisResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, originKey } from "@gajae-gateway/protocol";
+import {
+	LOOPBACK_ORIGIN,
+	originKey,
+	validateWorkStartParams,
+	validateWorkStatusParams,
+	validateWorkSteerParams,
+	validateWorkTaskContextParams,
+	validateWorkTaskRecoverParams,
+	validateWorkTaskDispositionParams,
+	validateWorkTaskDispositionBasisParams,
+} from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	columnNames,
@@ -69,8 +83,11 @@ export const COMMANDS = [
 	"setup",
 ] as const;
 
+const WORK_USAGE =
+	'work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<text>"|work start fm-<task UUID> --task-id UUID --kind read_only|code_mutating (--thread-origin JSON|--parent-origin JSON [--title TEXT]) [--context TEXT] [--cwd DIR] [--model ID|--preset NAME] "<text>"|work status <name> [--task-id UUID [--expected-op-ref OPREF]]|work steer <name> <text> [--task-id UUID --expected-op-ref OPREF [--event-id UUID-or-namespaced-ID] [--kind read_only|code_mutating]]|work disposition --basis <task UUID>|work disposition --request "<WorkTaskDispositionParams JSON; all original identity fences required>"|work recover <task UUID>|work context [task UUID] [--topic TEXT] [--continuation TOKEN]|work retire [--force] <name>|work retire --all-dead|work jobs';
+
 export const CLI_USAGE =
-	"usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
+	`usage: gajaeway [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (test <id> [--type T] [--payload J] [--wait[=SECONDS]])|${WORK_USAGE}|ops backup <path>|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--json]|ops integrity|ops restore <backupPath>|ops restart-stack [--status]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status (work run waits for a response; caller timeout does not end the attempt; task start is asynchronous and cannot resume; task steer prints its retry event ID before connecting); cron timezone is an IANA zone and defaults to the gateway host's local timezone`;
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
 export const USAGE_EXIT_CODE = 2;
@@ -465,7 +482,12 @@ async function chat(socket: string): Promise<void> {
 		if (message.final) turnWaiters.get(message.turnId)?.();
 	});
 	const sendAndWait = async (text: string): Promise<void> => {
-		const { turnId } = await client.chatSend(LOOPBACK_ORIGIN, text);
+		const result = await client.chatSend(LOOPBACK_ORIGIN, text);
+		if (result.route === "work_task") {
+			console.log(JSON.stringify(result));
+			return;
+		}
+		const { turnId } = result;
 		if (turnId === null) {
 			console.error("(message was not engaged)");
 			return;
@@ -769,25 +791,123 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			}
 			case "work": {
 				const [command, ...args] = parsed.rest;
-				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+				const usage = `usage: gajaeway ${WORK_USAGE}`;
+				if (command === "disposition") {
+					if (args.length === 2 && args[0] === "--basis" && args[1]) {
+						const callerSessionId = process.env.GJC_SESSION_ID?.trim();
+						const params = validateWorkTaskDispositionBasisParams({
+							taskId: args[1], ...(callerSessionId ? { callerSessionId } : {}),
+						});
+						if (params.callerSessionId &&
+							!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(params.callerSessionId))
+							throw new Error("callerSessionId must be a canonical UUID");
+						const client = await GajaewayClient.connectSocket(parsed.socket);
+						try {
+							console.log(JSON.stringify(await client.request<WorkTaskDispositionBasisResult>("work.task.disposition.basis", params)));
+						} finally {
+							await client.close();
+						}
+						break;
+					}
+					if (args.length !== 2 || args[0] !== "--request" || !args[1])
+						throw new Error("usage: gajaeway work disposition --basis <taskId> | --request '<JSON>'\nRequired: taskId, jobId, expectedOpRef, sessionId, epoch, cwd, requestHash, expectedTaskVersion, eventId, outcome (unresolved|abandoned), reason, evidence {availability: partial|unavailable, detail, evidenceAt: ISO time|null}, target {kind: control, controlId, eventId, clientRef: string|null} or {kind: report, reportId: string|null}. Supply original fences; no values are inferred. Administrative evidence only; execution and obligations remain unchanged.");
+					const request = validateWorkTaskDispositionParams(JSON.parse(args[1]));
+					const callerSessionId = process.env.GJC_SESSION_ID?.trim();
+					const params = validateWorkTaskDispositionParams({
+						...request, ...(callerSessionId ? { callerSessionId } : {}),
+					});
+					if (params.callerSessionId &&
+						!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(params.callerSessionId))
+						throw new Error("callerSessionId must be a canonical UUID");
+					const client = await GajaewayClient.connectSocket(parsed.socket);
+					try {
+						console.log(JSON.stringify(await client.request<WorkTaskDispositionResult>("work.task.disposition", params)));
+					} finally {
+						await client.close();
+					}
+					break;
+				}
+				if (command === "recover" || command === "context") {
+					const input: Record<string, string> = {};
+					for (let i = 0; i < args.length; i++) {
+						const arg = args[i];
+						if (command === "context" && (arg === "--topic" || arg === "--continuation")) {
+							const key = arg === "--topic" ? "topic" : "continuation";
+							const value = args[++i];
+							if (!value?.trim() || value.startsWith("--") || key in input) throw new Error(usage);
+							input[key] = value;
+						} else if (!arg.startsWith("--") && !("taskId" in input)) {
+							input.taskId = arg;
+						} else throw new Error(usage);
+					}
+					const params =
+						command === "recover" ? validateWorkTaskRecoverParams(input) : validateWorkTaskContextParams(input);
+					const client = await GajaewayClient.connectSocket(parsed.socket);
+					try {
+						// Preserve original identities, completeness and source freshness without success inference.
+						console.log(
+							JSON.stringify(
+								command === "recover"
+									? await client.request<WorkTaskRecoverResult>("work.task.recover", params)
+									: await client.request<WorkTaskContextResult>("work.task.context", params),
+							),
+						);
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (command === "status" || command === "steer") {
 					const name = args[0];
-					const text = args.slice(1).join(" ").trim();
+					const identity: Record<string, string> = {};
+					const textParts: string[] = [];
+					for (let i = 1; i < args.length; i++) {
+						const arg = args[i];
+						if (
+							arg === "--task-id" ||
+							arg === "--expected-op-ref" ||
+							(command === "steer" && (arg === "--event-id" || arg === "--kind"))
+						) {
+							const key =
+								arg === "--task-id" ? "taskId" : arg === "--expected-op-ref" ? "expectedOpRef" : arg === "--event-id" ? "eventId" : "kind";
+							const value = args[++i];
+							if (!value?.trim() || value.startsWith("--") || key in identity) throw new Error(usage);
+							identity[key] = value;
+						} else if (arg.startsWith("--") || command === "status") throw new Error(usage);
+						else textParts.push(arg);
+					}
+					const text = textParts.join(" ").trim();
 					if (
 						!name ||
 						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
-						(command === "status" ? args.length !== 1 : !text || args.slice(1).some((arg) => arg.startsWith("--")))
+						(command === "steer" && !text)
 					)
 						throw new Error(usage);
+					if (command === "steer" && Object.keys(identity).length > 0 && !("eventId" in identity)) {
+						identity.eventId = `cli:${crypto.randomUUID()}`;
+					}
+					const callerSessionId = process.env.GJC_SESSION_ID?.trim();
+					const params =
+						command === "status"
+							? validateWorkStatusParams({ name, ...identity })
+							: validateWorkSteerParams({ name, text, ...identity, ...(callerSessionId ? { callerSessionId } : {}) });
+					if (command === "steer" && identity.eventId) {
+						// Publish before connecting: even an uncertain request can be retried with the same explicit ID.
+						console.log(JSON.stringify({ taskId: identity.taskId, expectedOpRef: identity.expectedOpRef, eventId: identity.eventId }));
+					}
 					const client = await GajaewayClient.connectSocket(parsed.socket);
 					try {
 						if (command === "status") {
-							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", { name })));
+							console.log(JSON.stringify(await client.request<WorkStatusResult>("work.status", params)));
 						} else {
-							const result = await client.request<WorkSteerResult>("work.steer", { name, text });
-							console.log(result.steered ? `steered: ${result.clientRef}` : `not steered: ${result.reason}`);
-							if (!result.steered) process.exitCode = 1;
+							const result = await client.request<WorkSteerResult>("work.steer", params);
+							if (result.route === "work_task") {
+								console.log(JSON.stringify(result));
+								if (result.delivery === "held" || result.delivery === "refused") process.exitCode = 1;
+							} else {
+								console.log(result.steered ? `steered: ${result.clientRef}` : `not steered: ${result.reason}`);
+								if (!result.steered) process.exitCode = 1;
+							}
 						}
 					} finally {
 						await client.close();
@@ -861,6 +981,26 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 									}`,
 								);
 							}
+							// Task obligations are independent of lane lifecycle, including before a lane exists.
+							for (const task of result.tasks) {
+								console.log(
+									`task ${task.taskId} name=${task.name} job=${task.jobId} op=${task.opRef} mapping=${task.surface.phase} obligation=${task.obligation} final=${task.finalReport.disposition}/${task.finalReport.completeness}${
+										task.surface.phase === "held" ? ` mappingReason=${JSON.stringify(task.surface.reason)}` : ""
+									}${task.holdReason ? ` holdReason=${JSON.stringify(task.holdReason)}` : ""}${
+										task.finalReport.reason ? ` finalReason=${JSON.stringify(task.finalReport.reason)}` : ""
+									}`,
+								);
+							}
+							for (const error of result.taskErrors) {
+								console.log(
+									`task ${error.taskId} projection=unavailable reason=${JSON.stringify(error.reason)} op=unavailable`,
+								);
+							}
+							if (result.nextTaskId !== undefined) {
+								console.log(
+									`tasks incomplete: first page only (at most 20); nextTaskId=${result.nextTaskId}; more tasks or projection errors may remain`,
+								);
+							}
 						}
 					} finally {
 						await client.close();
@@ -872,6 +1012,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				let cwd: string | undefined;
 				let resume = false;
 				let model: string | { preset: string } | undefined;
+				const taskOptions: Record<string, string> = {};
 				const textParts: string[] = [];
 				for (let i = 1; i < args.length; i++) {
 					const arg = args[i];
@@ -885,35 +1026,69 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							if (model !== undefined) throw new Error(`${usage}\n--model and --preset are mutually exclusive`);
 							model = arg === "--preset" ? { preset: value } : value;
 						}
+					} else if (
+						arg === "--task-id" ||
+						arg === "--kind" ||
+						arg === "--thread-origin" ||
+						arg === "--parent-origin" ||
+						arg === "--title" ||
+						arg === "--context"
+					) {
+						const value = args[++i];
+						if (!value?.trim() || value.startsWith("--") || arg in taskOptions) throw new Error(usage);
+						taskOptions[arg] = value;
 					} else if (arg === "--resume") resume = true;
 					else if (arg?.startsWith("--")) throw new Error(usage);
 					else textParts.push(arg as string);
 				}
 				const text = textParts.join(" ").trim();
 				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
+				const taskMode = Object.keys(taskOptions).length > 0;
+				if (taskMode && (command !== "start" || resume)) {
+					throw new Error(`${usage}\ntask mode requires work start without --resume`);
+				}
+				const callerSessionId = process.env.GJC_SESSION_ID?.trim();
+				const baseParams: WorkStartParams = {
+					name,
+					text,
+					...(cwd ? { cwd } : {}),
+					...(resume ? { resume: true } : {}),
+					...(model === undefined ? {} : { model }),
+					...(callerSessionId ? { callerSessionId } : {}),
+				};
+				const params = taskMode
+					? validateWorkStartParams({
+							...baseParams,
+							task: {
+								taskId: taskOptions["--task-id"],
+								kind: taskOptions["--kind"],
+								surface: {
+									...("--thread-origin" in taskOptions ? { threadOrigin: JSON.parse(taskOptions["--thread-origin"]) } : {}),
+									...("--parent-origin" in taskOptions ? { parentOrigin: JSON.parse(taskOptions["--parent-origin"]) } : {}),
+									...("--title" in taskOptions ? { title: taskOptions["--title"] } : {}),
+								},
+								...("--context" in taskOptions ? { context: taskOptions["--context"] } : {}),
+							},
+						})
+					: baseParams;
 				// This is a caller response-wait budget, never an attempt deadline.
 				// Timeout/disconnect leaves the attempt observable via work.status.
 				const client = await GajaewayClient.connectSocket(parsed.socket, {
 					requestTimeoutMs: command === "run" ? 3_600_000 : 120_000,
 				});
 				try {
-					const callerSessionId = process.env.GJC_SESSION_ID?.trim();
-					const params: WorkStartParams = {
-						name,
-						text,
-						...(cwd ? { cwd } : {}),
-						...(resume ? { resume: true } : {}),
-						...(model === undefined ? {} : { model }),
-						...(callerSessionId ? { callerSessionId } : {}),
-					};
 					if (command === "start") {
 						const result = await client.request<WorkStartResult>("work.start", params);
 						if (result.started) {
 							console.log(
-								`started: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,
+								`started: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}${result.taskId ? ` task=${result.taskId}` : ""}`,
+							);
+						} else if (result.accepted === "durable") {
+							console.log(
+								`accepted: durable execution=${result.execution} task=${result.taskId} job=${result.jobId} op=${result.opRef}`,
 							);
 						} else {
-							console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);
+							console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}${result.taskId ? ` task=${result.taskId} op=${result.opRef ?? "-"}` : ""}`);
 							process.exitCode = 1;
 						}
 					} else {

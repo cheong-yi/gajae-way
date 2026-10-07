@@ -1062,6 +1062,7 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 	const f = await fixture({ now: () => now });
 	const original = f.port.fetchWorkerOutput.bind(f.port);
 	let reads = 0;
+	let firstReadCompleted = false;
 	const result = await started(f, "a", origin);
 	f.port.complete(result.opRef, "PR opened");
 	const status = f.port.status.bind(f.port);
@@ -1076,7 +1077,7 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 		if (reads === 1) {
 			const early = await original(input);
 			expect(early.status).toBe("proven");
-			return parseWorkerOutputResponse(
+			const missing = parseWorkerOutputResponse(
 				input,
 				{
 					exitCode: 0,
@@ -1089,21 +1090,47 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 							status: "terminal_ok",
 							terminalAt: input.notBeforeMs + 1,
 							receiptState: "missing",
+							// terminalIdentity is a sanitized status projection, not
+							// a canonical turn.result outcome (agent is stripped).
+							outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 						},
 					}),
 					stderr: "",
 				},
 				Date.now(),
 			);
+			expect(missing).toEqual({ status: "absent", code: "output_pending" });
+			firstReadCompleted = true;
+			return missing;
 		}
 		return original(input);
 	};
-	await until(() => reads === 1);
+	await until(() => firstReadCompleted);
+	expect(reads).toBe(1);
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("terminal_missing_receipt");
 	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBeNull();
+	expect(f.db.workAttemptGet(result.opRef)?.output).toMatchObject({
+		disposition: "pending",
+		reads: 1,
+		nextReadAt: new Date(now + 1000).toISOString(),
+		proof: null,
+	});
+	expect(f.notices).toHaveLength(0);
 	now += 1000;
 	await until(() => f.db.workAttemptGet(result.opRef)?.settledAt != null);
 	expect(reads).toBe(2);
+	const settled = f.db.workAttemptGet(result.opRef)!;
+	expect(settled.output).toMatchObject({
+		disposition: "available",
+		reads: 2,
+		nextReadAt: null,
+		proof: {
+			source: "turn.result",
+			fullness: "original",
+			opRef: result.opRef,
+			clientRef: result.opRef,
+		},
+	});
 	expect(f.db.workAttemptGet(result.opRef)?.terminal?.reasonCode).toBe("end_turn");
 	expect(f.job().attempts[0]?.endState).toBe("completed");
 	expect(f.job().state).not.toBe("awaiting_operator");
@@ -1111,6 +1138,8 @@ test("late receipt after a missing-receipt terminal is reconciled once, without 
 	// Reprocessing the same terminal neither re-notifies nor re-runs the work.
 	await f.restart();
 	await Bun.sleep(20);
+	expect(f.db.workAttemptGet(result.opRef)?.settledAt).toBe(settled.settledAt);
+	expect(reads).toBe(2);
 	expect(f.notices).toHaveLength(1);
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);

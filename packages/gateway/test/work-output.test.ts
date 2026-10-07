@@ -87,15 +87,6 @@ async function broker(
 	});
 }
 
-/** A steer answered by the session's relay: the envelope IS the control_response body. */
-function steerRelay(envelope: () => unknown) {
-	return (request: ScriptedRelayRequest): ScriptedRelayReply => {
-		expect(request.type).toBe("control_request");
-		expect(request.operation).toBe("turn.steer");
-		return envelope() as ScriptedRelayReply;
-	};
-}
-
 function parse(result: unknown, overrides: Partial<WorkerOutputInput> = {}) {
 	return parseWorkerOutputResponse({ ...input, ...overrides }, response({ ok: true, result }), floor + 2_000);
 }
@@ -152,6 +143,69 @@ test("a neighboring prior reply less than two seconds before the floor is never 
 	});
 });
 
+for (const transport of ["cli", "relay"] as const) {
+	test(`original output rejects visible contradictory evidence through actual ${transport}`, async () => {
+		let envelope: Record<string, unknown> = { ok: true, result: terminal() };
+		let exitCode = 0;
+		let cliCalls = 0;
+		let relayCalls = 0;
+		const port = await broker(
+			async () => {
+				cliCalls++;
+				if (transport === "relay") throw new Error("relay evidence must not fall back to CLI");
+				return response(envelope, exitCode);
+			},
+			transport === "relay" ? (request) => {
+				relayCalls++;
+				expect(request).toEqual({
+					type: "query_request", operation: "turn.result", input: { kind: "prompt", clientRef: input.opRef },
+				});
+				return envelope as ScriptedRelayReply;
+			} : undefined,
+		);
+		const handle = transport === "relay"
+			? await port.attachTail({ sessionId: input.sessionId, repo: input.repo, brokerGeneration: 0 })
+			: undefined;
+		const fetch = () => port.fetchWorkerOutput({ ...input, relay: handle });
+		try {
+			expect(await fetch()).toMatchObject({ status: "proven", text: "original answer" });
+			envelope = { type: "query_response", query: "turn.result", ok: true, result: terminal() };
+			expect(await fetch()).toMatchObject({ status: "proven" });
+			const invalid = [
+				{ error: { code: "terminal_uncertain" } },
+				{ truncated: true },
+				{ valid: false },
+				{ complete: false },
+				{ outcomeCertainty: "unknown" },
+				{ continuationCursor: "more" },
+				{ query: "runtime.jobs.list" },
+				{ operation: "session.close" },
+				{ page: { items: [], complete: false } },
+				{ result: { ...terminal(), error: { code: "terminal_uncertain" } } },
+				{ result: { ...terminal(), truncated: true } },
+				{ result: { ...terminal(), complete: false } },
+				{ result: { ...terminal(), outcomeCertainty: "unknown" } },
+				{ result: { ...terminal(), outcome: { kind: "failed" } } },
+				{ result: terminal("x".repeat(16_385)) },
+				{ result: { ...terminal(), content: { ...terminal().content, complete: false } } },
+			];
+			for (const patch of invalid) {
+				envelope = { ok: true, result: terminal(), ...patch };
+				expect(await fetch()).toEqual({ status: "unavailable", code: "invalid_evidence" });
+			}
+			if (transport === "cli") {
+				exitCode = 1;
+				envelope = { ok: true, result: terminal() };
+				expect(await fetch()).toEqual({ status: "absent", code: "transport_error" });
+			}
+			expect(cliCalls).toBe(transport === "cli" ? invalid.length + 3 : 0);
+			expect(relayCalls).toBe(transport === "relay" ? invalid.length + 2 : 0);
+		} finally {
+			await handle?.close();
+		}
+	});
+}
+
 test("after-floor transcript timestamps and completed traversal do not prove attribution or finality", () => {
 	const transcript = { role: "assistant", ts: new Date(floor + 10).toISOString(), body: "ambiguous current text" };
 	expect(
@@ -185,6 +239,9 @@ test("summary-only, incomplete and malformed original content cannot become outp
 	}
 	expect(parse(terminal("original", { textSummary: "." }))).toMatchObject({ status: "proven", text: "original" });
 	expect(parse(terminal(" . \n"))).toMatchObject({ status: "proven", text: " . \n" });
+	expect(parse(terminal("x".repeat(16_384), {
+		outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+	}))).toMatchObject({ status: "proven", provenance: { byteLength: 16_384 } });
 });
 
 test("exact current clientRef is supported without fabricating optional command or turn ids", () => {
@@ -293,8 +350,22 @@ test("fake accepts send while response is delayed and supports production raw ou
 	expect(await port.fetchWorkerOutput(input)).toEqual({ status: "unavailable", code: "invalid_evidence" });
 });
 
-test("production steer accepts the observed SDK 0.16.3 raw control response without an accepted boolean", async () => {
+test("production steer accepts the selected SDK receipt through the real relay decoder without an accepted boolean", async () => {
 	const clientRef = "probe-terminal-steer-20260909";
+	// Same public receipt DTO as originalSteerReceipt / steerReceipt in the
+	// selected 0.18.7 port and relay fixtures, not a live SDK observation.
+	const supported = {
+		ok: true,
+		operation: "turn.steer",
+		result: {
+			commandId: "command-1",
+			turnId: "turn-1",
+			clientRef,
+			status: "accepted",
+			acceptedAt: 1_700_000_000_000,
+		},
+	};
+	// Retained historical 0.16.3 shape is negative evidence, not 0.18.7 provenance.
 	const observed = {
 		type: "control_response",
 		ok: true,
@@ -307,15 +378,31 @@ test("production steer accepts the observed SDK 0.16.3 raw control response with
 			acceptedAt: 1788932429645,
 		},
 	};
+	let envelope: unknown = supported;
+	const requests: ScriptedRelayRequest[] = [];
+	let cliCalls = 0;
 	const port = await broker(
 		async () => {
+			cliCalls++;
 			throw new Error("steer must not spawn a CLI");
 		},
-		steerRelay(() => observed),
+		(request) => {
+			requests.push(request);
+			return envelope as ScriptedRelayReply;
+		},
 	);
-	await expect(
-		port.steer({ sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef }),
-	).resolves.toBeUndefined();
+	const steer = { sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef };
+	await expect(port.steer(steer)).resolves.toBeUndefined();
+	envelope = observed;
+	const uncertain = await port.steer(steer).catch((error: unknown) => error);
+	expect(uncertain).toBeInstanceOf(GjcCliError);
+	expect((uncertain as GjcCliError).details).toEqual({
+		code: "receipt_identity_mismatch", outcomeCertainty: "unknown",
+	});
+	expect(requests).toEqual(Array.from({ length: 2 }, () => ({
+		type: "control_request", operation: "turn.steer", input: { text: "steer", clientRef },
+	})));
+	expect(cliCalls).toBe(0);
 });
 
 test("production steer requires structured acceptance, preserves caller clientRef, and rejects nested refusal", async () => {
@@ -390,16 +477,27 @@ test("completed fake status reflects original operation evidence without inventi
 
 test("steer authoritative refusal or matching rejection is marked while malformed acceptance stays uncertain", async () => {
 	let envelope: unknown;
+	const requests: ScriptedRelayRequest[] = [];
+	let cliCalls = 0;
 	const port = await broker(
 		async () => {
+			cliCalls++;
 			throw new Error("steer must not spawn a CLI");
 		},
-		steerRelay(() => envelope),
+		(request) => {
+			requests.push(request);
+			return envelope as ScriptedRelayReply;
+		},
 	);
 	const steer = { sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-ref" };
+	const refusal = { code: "busy", message: "occupied", outcomeCertainty: "not-applied" };
 	for (const rejected of [
-		{ ok: true, result: { accepted: false, status: "rejected", clientRef: "caller-ref" } },
-		{ ok: false, error: { code: "busy" } },
+		{ ok: true, result: {
+			accepted: false, status: "rejected", clientRef: "caller-ref",
+			commandId: "command-1", turnId: "turn-1", acceptedAt: 1_700_000_000_000,
+			error: refusal,
+		} },
+		{ ok: false, error: refusal },
 	]) {
 		envelope = rejected;
 		const error = await port.steer(steer).then(
@@ -409,7 +507,7 @@ test("steer authoritative refusal or matching rejection is marked while malforme
 		expect(error).toBeInstanceOf(GjcCliError);
 		expect((error as GjcCliError).details).toMatchObject({ refused: true });
 	}
-	for (const result of [
+	const malformedResults = [
 		undefined,
 		null,
 		{},
@@ -422,24 +520,58 @@ test("steer authoritative refusal or matching rejection is marked while malforme
 		{ accepted: false, error: { code: "busy" } },
 		{ status: "rejected" },
 		{ accepted: false, status: "rejected" },
+		{ accepted: false, status: "rejected", clientRef: "caller-ref" },
 		{ accepted: false, clientRef: "caller-ref" },
 		{ status: "rejected", clientRef: "caller-ref" },
 		{ accepted: false, status: "rejected", clientRef: "other-operation" },
 		{ accepted: true, status: "rejected", clientRef: "caller-ref" },
 		{ accepted: false, status: "accepted", clientRef: "caller-ref" },
-	]) {
+	];
+	for (const result of malformedResults) {
 		envelope = { ok: true, result };
 		const error = await port.steer(steer).then(
 			() => undefined,
 			(error: unknown) => error,
 		);
 		expect(error).toBeInstanceOf(GjcCliError);
-		expect((error as GjcCliError).details).toEqual({ code: "receipt_identity_mismatch" });
+		expect((error as GjcCliError).details).toEqual({
+			code: "receipt_identity_mismatch", outcomeCertainty: "unknown",
+		});
 	}
-	envelope = { ok: false, error: { code: "terminal_uncertain" } };
+	envelope = { ok: false, error: { code: "terminal_uncertain", message: "Original steering outcome is uncertain" } };
 	const uncertain = await port.steer(steer).then(
 		() => undefined,
 		(error: unknown) => error,
 	);
-	expect((uncertain as GjcCliError).details).toEqual({ code: "terminal_uncertain" });
+	expect((uncertain as GjcCliError).details).toEqual({ code: "terminal_uncertain", message: "Original steering outcome is uncertain" });
+	expect(requests).toEqual(Array.from({ length: malformedResults.length + 3 }, () => ({
+		type: "control_request", operation: "turn.steer", input: { text: "steer", clientRef: "caller-ref" },
+	})));
+	expect(cliCalls).toBe(0);
+});
+
+test("bare busy without no-effect evidence remains uncertain through the real relay decoder", async () => {
+	const requests: ScriptedRelayRequest[] = [];
+	let cliCalls = 0;
+	const port = await broker(
+		async () => {
+			cliCalls++;
+			throw new Error("steer must not spawn a CLI");
+		},
+		(request) => {
+			requests.push(request);
+			return { ok: false, error: { code: "busy" } };
+		},
+	);
+	const failure = await port.steer({
+		sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-ref",
+	}).catch((error: unknown) => error);
+	expect(requests).toEqual([{
+		type: "control_request", operation: "turn.steer", input: { text: "steer", clientRef: "caller-ref" },
+	}]);
+	expect(cliCalls).toBe(0);
+	expect(failure).toBeInstanceOf(GjcCliError);
+	expect((failure as GjcCliError).details).toEqual({
+		code: "receipt_identity_mismatch", outcomeCertainty: "unknown",
+	});
 });

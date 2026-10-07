@@ -1,9 +1,10 @@
-import type { OriginRef } from "./origin";
+import { ProtocolError } from "./errors";
+import { type OriginRef, validateOriginRef } from "./origin";
 import type { ReactionAction, ReactionRef } from "./reactions";
 
 /**
- * Typed verb + event catalogs for profile v0.1. Catalogs grow additively per
- * phase inside the fixed generic envelope (ARCH-006). The gateway action
+ * Typed verb + event catalogs for the current profile. Catalogs use the
+ * fixed generic envelope (ARCH-006). The gateway action
  * registry must cover every entry here — enforced by sdk-coverage-inventory.
  *
  * P1 additions: non-loopback chat origins, engagement metadata, ledger-backed
@@ -165,6 +166,8 @@ export interface EngagementContext {
 export interface ChatSendParams {
 	readonly origin: OriginRef;
 	readonly text: string;
+	/** Original platform evidence for mapped ingress, not caller authentication. */
+	readonly originSource?: WorkTaskOriginSource;
 	/** Stable platform message id for idempotent live/backfill ingestion. */
 	readonly messageId?: string;
 	/** Platform event time, when available; ordering and age policy use this value. */
@@ -181,6 +184,8 @@ export interface ChatSendParams {
  */
 export interface ChatEditParams {
 	readonly origin: OriginRef;
+	/** Original creation time, distinct from receivedAt's edit time. */
+	readonly originSource?: WorkTaskOriginSource;
 	/** Platform id of the message that was edited (the original `chat.send` messageId). */
 	readonly messageId: string;
 	/** The full new body. */
@@ -191,11 +196,12 @@ export interface ChatEditParams {
 	readonly engagement?: EngagementContext;
 }
 
-export interface ChatEditResult {
+export type ChatEditResult = {
 	/** Gateway-assigned turn id for the update, or null when it was declined or the message is unknown. */
 	readonly turnId: string | null;
 	readonly engaged: boolean;
-}
+	readonly route?: "persona";
+} | WorkTaskControlProjection;
 
 /**
  * What a working turn is doing right now, for the presence hint. `tool` names
@@ -234,7 +240,7 @@ export interface ChatProgressPayload {
 	readonly final?: boolean;
 }
 
-export interface ChatSendResult {
+export type ChatSendResult = {
 	/**
 	 * Gateway-assigned turn id, or null when engagement policy declined the
 	 * message (not mentioned in a mention-gated group). Declined messages are
@@ -242,11 +248,14 @@ export interface ChatSendResult {
 	 */
 	readonly turnId: string | null;
 	readonly engaged: boolean;
-}
+	readonly route?: "persona";
+} | WorkTaskControlProjection;
 
 export interface ChatMessagePayload {
 	readonly turnId: string;
 	readonly origin: OriginRef;
+	/** Deliver only to this mapped origin; never fall back to its parent. */
+	readonly workTask?: WorkTaskMessageMetadata;
 	readonly role: "assistant";
 	readonly text: string;
 	/**
@@ -343,6 +352,14 @@ export interface ChatMessagePayload {
 
 export interface DeliveryConfirmParams {
 	readonly deliveryId: string;
+	/** Whole-payload receipt, supplied only after every chunk was posted. */
+	readonly platformReceipt?: DeliveryPlatformReceipt;
+}
+
+export interface DeliveryPlatformReceipt {
+	readonly origin: WorkTaskThreadOrigin;
+	/** Posting order; the first marker chunk's snowflake supplies its platform time. */
+	readonly messageIds: readonly string[];
 }
 
 export interface DeliveryFailParams {
@@ -603,6 +620,745 @@ export interface MonitorProcedureVersion {
 	readonly mtime?: string;
 }
 
+export const WORK_TASK_CONTEXT_MAX_TASKS = 20;
+export const WORK_TASK_CONTEXT_MAX_RECORDS = 50;
+export const WORK_TASK_CONTEXT_MAX_BYTES = 16384;
+export const WORK_TASK_TEXT_MAX_BYTES = 16384;
+export const WORK_TASK_EVENT_ID_MAX_BYTES = 1024;
+export const WORK_TASK_TITLE_MAX_LENGTH = 100;
+export const DELIVERY_RECEIPT_MAX_MESSAGE_IDS = 1024;
+export const DELIVERY_CONFIRM_MAX_BYTES = 65536;
+
+/** Immutable delivery correlation, not a task row or proof of worker execution. */
+export interface WorkTaskMessageMetadata {
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly sourceId: string;
+	readonly mappedOnly: true;
+	/** Stable claim/source-binding hash, never the mutable task version. */
+	readonly bindingRevision?: string;
+}
+
+/** Adapter evidence; the authenticated server still establishes principal and mapping. */
+export interface WorkTaskOriginSource {
+	/** Original Message.createdTimestamp in Unix milliseconds, including for edits. */
+	readonly platformCreatedAt: number;
+	readonly recovered?: boolean;
+}
+
+export type WorkTaskKind = "read_only" | "code_mutating";
+export type WorkTaskThreadOrigin = OriginRef & {
+	readonly platform: "discord";
+	readonly kind: "thread";
+	readonly parentId: string;
+	readonly boundaryId: string;
+	readonly peerId?: never;
+};
+export type WorkTaskParentOrigin = OriginRef & {
+	readonly platform: "discord";
+	readonly kind: "channel";
+	readonly boundaryId: string;
+	readonly parentId?: never;
+	readonly peerId?: never;
+};
+export type WorkTaskSurface =
+	| { readonly threadOrigin: WorkTaskThreadOrigin; readonly parentOrigin?: never; readonly title?: never }
+	| { readonly parentOrigin: WorkTaskParentOrigin; readonly title?: string; readonly threadOrigin?: never };
+
+export interface WorkTaskSpec {
+	readonly taskId: string;
+	readonly kind: WorkTaskKind;
+	readonly surface: WorkTaskSurface;
+	/** Selected supporting context only; assignment remains WorkRunParams.text. */
+	readonly context?: string;
+}
+
+export type WorkTaskSurfaceProjection =
+	| { readonly phase: "pending"; readonly request: WorkTaskSurface }
+	| { readonly phase: "claimed"; readonly request: WorkTaskSurface; readonly claimId: string }
+	| { readonly phase: "bound"; readonly origin: WorkTaskThreadOrigin; readonly claimId?: string }
+	| { readonly phase: "held"; readonly reason: string; readonly claimId?: string };
+
+export interface WorkTaskProjection {
+	/** Task-aware status only; durable snapshot, never SDK proof or action permission. */
+	readonly dispositionBasis?: WorkTaskDispositionBasis;
+	readonly taskId: string;
+	readonly name: string;
+	readonly kind: WorkTaskKind;
+	readonly jobId: string;
+	readonly opRef: string;
+	readonly sessionId: string | null;
+	readonly epoch: number | null;
+	readonly surface: WorkTaskSurfaceProjection;
+	readonly obligation: "awaiting_final" | "final_admitted" | "held";
+	readonly holdReason?: string;
+	readonly finalReport: {
+		readonly reportId: string | null;
+		readonly completeness: "complete" | "partial" | "unavailable";
+		readonly disposition: "pending" | "admitted" | "held";
+		readonly reason?: string;
+	};
+}
+
+/** A committed control projection. PromptStatusBody cannot prove this receipt. */
+export interface WorkTaskControlProjection {
+	readonly route: "work_task";
+	readonly taskId: string;
+	readonly controlId: string;
+	readonly opRef: string;
+	readonly acceptance: "durable";
+	readonly delivery: "pending" | "accepted" | "refused" | "held";
+	readonly reason?: string;
+}
+
+export type WorkTaskSteerResult = WorkTaskControlProjection & (
+	| { readonly delivery: "accepted"; readonly steered: true; readonly clientRef: string }
+	| { readonly delivery: "pending" | "refused" | "held"; readonly steered: false }
+);
+
+export interface WorkThreadClaimParams {
+	readonly taskId: string;
+	readonly claimId: string;
+}
+
+export type WorkThreadClaimResult =
+	| {
+			readonly taskId: string;
+			readonly claimId: string;
+			readonly create: true;
+			readonly parentOrigin: WorkTaskParentOrigin;
+			readonly title?: string;
+	  }
+	| {
+			readonly taskId: string;
+			readonly claimId: string;
+			readonly create: false;
+			readonly disposition: "duplicate" | "held";
+			readonly surface: WorkTaskSurfaceProjection;
+	  };
+
+export interface WorkThreadBindParams extends WorkThreadClaimParams {
+	readonly outcome:
+		| { readonly kind: "bound"; readonly origin: WorkTaskThreadOrigin }
+		| { readonly kind: "held"; readonly reason: string };
+}
+
+export interface WorkThreadBindResult {
+	readonly taskId: string;
+	readonly claimId: string;
+	readonly disposition: "recorded" | "duplicate" | "held";
+	readonly surface: Extract<WorkTaskSurfaceProjection, { readonly phase: "bound" | "held" }>;
+}
+
+export interface WorkTaskRecoverParams {
+	readonly taskId: string;
+}
+
+/** Administrative evidence only. Neither outcome settles execution or an obligation. */
+export interface WorkTaskDispositionParams {
+	/** Retained negative evidence, never a replacement SDK identity. */
+	readonly validationUnavailable?: WorkTaskDispositionNegative;
+	readonly taskId: string;
+	readonly jobId: string;
+	readonly expectedOpRef: string;
+	readonly sessionId: string | null;
+	readonly epoch: number | null;
+	readonly cwd: string;
+	readonly requestHash: string;
+	readonly target:
+		| { readonly kind: "control"; readonly controlId: string; readonly eventId: string; readonly clientRef: string | null }
+		| { readonly kind: "report"; readonly reportId: string | null };
+	readonly eventId: string;
+	readonly expectedTaskVersion: number;
+	readonly outcome: "unresolved" | "abandoned";
+	readonly reason: string;
+	readonly evidence: {
+		readonly availability: "partial" | "unavailable";
+		readonly detail: string;
+		/** Operator-supplied qualification, not authenticated remote freshness. */
+		readonly evidenceAt: string | null;
+	};
+	/** Routing hint only; never an owner credential. */
+	readonly callerSessionId?: string;
+}
+
+export interface WorkTaskDispositionRetained {
+	readonly obligationState: "awaiting_final" | "held" | "final_admitted";
+	readonly reportId: string | null;
+	readonly holdReason: string | null;
+	readonly controlPhase: "held" | null;
+}
+
+export interface WorkTaskDispositionNegative {
+	readonly kind: "validation_unavailable";
+	/** Original retained request scope, not new execution authority. */
+	readonly scope: WorkTaskKind;
+	readonly sourceId: string;
+	readonly corruptionFingerprint: string;
+	readonly firstObservedAt: string;
+}
+
+export interface WorkTaskDispositionBasisParams {
+	readonly taskId: string;
+	readonly callerSessionId?: string;
+}
+
+export type WorkTaskDispositionBasisResult =
+	| { readonly execution: "none"; readonly kind: "original"; readonly basis: WorkTaskDispositionBasis }
+	| { readonly execution: "none"; readonly kind: "validation_unavailable";
+		readonly basis: WorkTaskDispositionBasis; readonly qualification: WorkTaskDispositionNegative }
+	| { readonly execution: "none"; readonly kind: "unavailable"; readonly basis: null };
+
+export function validateWorkTaskDispositionNegative(value: unknown): WorkTaskDispositionNegative {
+	const input = taskRecord(value, ["kind", "scope", "sourceId", "corruptionFingerprint", "firstObservedAt"]);
+	if (input.kind !== "validation_unavailable" || typeof input.corruptionFingerprint !== "string" ||
+		!/^[0-9a-f]{64}$/.test(input.corruptionFingerprint) ||
+		input.sourceId !== `unavailability-${input.corruptionFingerprint}`)
+		throw new ProtocolError("invalid_params", "invalid negative disposition qualification");
+	return { kind: "validation_unavailable", scope: taskKind(input.scope), sourceId: input.sourceId as string,
+		corruptionFingerprint: input.corruptionFingerprint, firstObservedAt: dispositionTime(input.firstObservedAt) };
+}
+
+export function validateWorkTaskDispositionBasisParams(value: unknown): WorkTaskDispositionBasisParams {
+	const input = taskRecord(value, ["taskId", "callerSessionId"]);
+	return { taskId: taskUuid(input.taskId, "taskId"),
+		...("callerSessionId" in input ? { callerSessionId: dispositionText(input.callerSessionId, "callerSessionId") } : {}) };
+}
+
+export function validateWorkTaskDispositionBasisResult(value: unknown): WorkTaskDispositionBasisResult {
+	const input = taskRecord(value, ["execution", "kind", "basis", "qualification"]);
+	if (input.execution !== "none") throw new ProtocolError("invalid_params", "invalid basis execution");
+	if (input.kind === "validation_unavailable") return { execution: "none", kind: input.kind,
+		basis: validateWorkTaskDispositionBasis(input.basis),
+		qualification: validateWorkTaskDispositionNegative(input.qualification) };
+	taskRecord(input, ["execution", "kind", "basis"]);
+	if (input.kind === "unavailable" && input.basis === null)
+		return { execution: "none", kind: "unavailable", basis: null };
+	if (input.kind === "original") return { execution: "none", kind: "original",
+		basis: validateWorkTaskDispositionBasis(input.basis) };
+	throw new ProtocolError("invalid_params", "invalid disposition basis result");
+}
+
+/** Original administrative request fences. The mutation route must revalidate all of them. */
+export interface WorkTaskDispositionBasis {
+	readonly taskId: string;
+	readonly jobId: string;
+	readonly expectedOpRef: string;
+	readonly sessionId: string | null;
+	readonly epoch: number | null;
+	readonly cwd: string;
+	readonly requestHash: string;
+	readonly expectedTaskVersion: number;
+	readonly controls: readonly Extract<WorkTaskDispositionParams["target"], { kind: "control" }>[];
+	/** Only the first 20 controls are inspected; partial means later held targets may exist. */
+	readonly controlsCompleteness: "complete" | "partial";
+	readonly report: Extract<WorkTaskDispositionParams["target"], { kind: "report" }> | null;
+}
+
+export function validateWorkTaskDispositionBasis(value: unknown): WorkTaskDispositionBasis {
+	const input = taskRecord(value, ["taskId", "jobId", "expectedOpRef", "sessionId", "epoch",
+		"cwd", "requestHash", "expectedTaskVersion", "controls", "controlsCompleteness", "report"]);
+	const sessionId = input.sessionId === null ? null : dispositionText(input.sessionId, "sessionId");
+	const epoch = input.epoch === null ? null : dispositionInteger(input.epoch);
+	if ((sessionId === null) !== (epoch === null))
+		throw new ProtocolError("invalid_params", "session/epoch must be jointly known or unknown");
+	const cwd = dispositionText(input.cwd, "cwd", 4096);
+	if (!cwd.startsWith("/") || (cwd !== "/" && (cwd.endsWith("/") || cwd.split("/").slice(1).some(
+		(part) => part === "" || part === "." || part === ".."))))
+		throw new ProtocolError("invalid_params", "cwd must be canonical absolute path");
+	if (typeof input.requestHash !== "string" || !/^[0-9a-f]{64}$/.test(input.requestHash) ||
+		!Array.isArray(input.controls) || input.controls.length > 20 ||
+		(input.controlsCompleteness !== "complete" && input.controlsCompleteness !== "partial"))
+		throw new ProtocolError("invalid_params", "invalid disposition basis");
+	const controls = input.controls.map((value: unknown) => {
+		const target = taskRecord(value, ["kind", "controlId", "eventId", "clientRef"]);
+		if (target.kind !== "control") throw new ProtocolError("invalid_params", "invalid control target");
+		return { kind: "control" as const, controlId: dispositionText(target.controlId, "controlId"),
+			eventId: dispositionText(target.eventId, "original eventId"),
+			clientRef: target.clientRef === null ? null : dispositionText(target.clientRef, "clientRef") };
+	});
+	if (new Set(controls.map((control) => control.controlId)).size !== controls.length)
+		throw new ProtocolError("invalid_params", "duplicate control target");
+	let report: WorkTaskDispositionBasis["report"] = null;
+	if (input.report !== null) {
+		const target = taskRecord(input.report, ["kind", "reportId"]);
+		if (target.kind !== "report") throw new ProtocolError("invalid_params", "invalid report target");
+		report = { kind: "report", reportId: target.reportId === null ? null : dispositionText(target.reportId, "reportId") };
+	}
+	return { taskId: taskUuid(input.taskId, "taskId"), jobId: dispositionText(input.jobId, "jobId"),
+		expectedOpRef: taskOpRef(input.expectedOpRef), sessionId, epoch, cwd, requestHash: input.requestHash,
+		expectedTaskVersion: dispositionInteger(input.expectedTaskVersion), controls,
+		controlsCompleteness: input.controlsCompleteness, report };
+}
+
+export interface WorkTaskDispositionRecord {
+	readonly request: WorkTaskDispositionParams;
+	readonly principalId: string;
+	readonly origin: OriginRef;
+	readonly recordedAt: string;
+	readonly taskVersion: number;
+	/** Snapshot at recording time, not a live execution projection. */
+	readonly retained: WorkTaskDispositionRetained;
+}
+
+export interface WorkTaskDispositionResult {
+	readonly execution: "none";
+	readonly disposition: "recorded" | "duplicate";
+	/** The immutable source is also the administrative decision identity. */
+	readonly dispositionId: string;
+	readonly sourceId: string;
+	readonly deliveryId: string | null;
+	readonly record: WorkTaskDispositionRecord;
+}
+
+/** Observation/publication of the original obligation, never new execution. */
+export interface WorkTaskRecoverResult {
+	readonly taskId: string;
+	readonly jobId: string;
+	readonly opRef: string;
+	readonly sessionId: string | null;
+	readonly epoch: number | null;
+	readonly reportId: string | null;
+	readonly disposition: "reconciled" | "unchanged" | "held";
+	readonly completeness: "complete" | "partial" | "unavailable";
+	/** This recovery operation starts no execution; original execution is independent. */
+	readonly execution: "none";
+	readonly supplementalDeliveryId?: string;
+	readonly reason?: string;
+}
+
+export interface WorkTaskContextParams {
+	readonly taskId?: string;
+	readonly topic?: string;
+	/** Opaque prior snapshot continuation; never a transport/execution cursor. */
+	readonly continuation?: string;
+}
+
+export interface WorkTaskContextSource {
+	readonly sourceId: string;
+	readonly taskId: string;
+	readonly origin: OriginRef;
+	readonly revision: string;
+	readonly evidenceAt: string | null;
+	readonly observedAt: string;
+	readonly principalId?: string;
+	readonly completeness: "complete" | "partial" | "unavailable";
+	readonly race: "consistent" | "raced" | "stale" | "unavailable";
+}
+
+/** Read-only bounded evidence selection, not consumed inbox or instructions. */
+export interface WorkTaskContextResult {
+	readonly snapshotId: string;
+	readonly snapshot: "same" | "new";
+	readonly renderedAt: string;
+	readonly completeness: "complete" | "partial" | "unavailable";
+	readonly bounds: {
+		readonly maxTasks: typeof WORK_TASK_CONTEXT_MAX_TASKS;
+		readonly maxRecordsPerTask: typeof WORK_TASK_CONTEXT_MAX_RECORDS;
+		readonly maxBytes: typeof WORK_TASK_CONTEXT_MAX_BYTES;
+		readonly maxBytesPerTask: typeof WORK_TASK_CONTEXT_MAX_BYTES;
+	};
+	readonly manifest: readonly WorkTaskContextSource[];
+	readonly items: readonly {
+		readonly taskId: string;
+		readonly sourceId: string;
+		readonly revision: string;
+		readonly text: string;
+	}[];
+	readonly omission: {
+		readonly tasks: number | null;
+		readonly records: number | null;
+		readonly incomplete: number | null;
+		readonly overflow: boolean;
+	};
+	readonly continuation?: string;
+}
+
+/** These parsers validate wire structure only, not authority, transport or isolation. */
+function taskRecord(value: unknown, fields: readonly string[]): Record<string, unknown> {
+	if (!isTaskRecord(value)) throw new ProtocolError("invalid_params", "expected task object");
+	if (Object.keys(value).some((key) => !fields.includes(key))) {
+		throw new ProtocolError("invalid_params", "unknown task field");
+	}
+	return value;
+}
+
+function isTaskRecord(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	return prototype === Object.prototype || prototype === null;
+}
+
+function taskText(value: unknown, field: string, maxBytes: number): string {
+	if (typeof value !== "string" || value.trim().length === 0) {
+		throw new ProtocolError("invalid_params", `${field} must be nonempty text`);
+	}
+	if (value.length > maxBytes || new TextEncoder().encode(value).byteLength > maxBytes) {
+		throw new ProtocolError("invalid_params", `${field} exceeds its UTF-8 byte bound`);
+	}
+	return value;
+}
+
+function hasAsciiControlCharacter(value: string): boolean {
+	for (let index = 0; index < value.length; index++) {
+		const code = value.charCodeAt(index);
+		if (code <= 0x1f || code === 0x7f) return true;
+	}
+	return false;
+}
+
+const TASK_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function taskUuid(value: unknown, field: string): string {
+	const id = taskText(value, field, 36);
+	if (!TASK_UUID.test(id)) throw new ProtocolError("invalid_params", `${field} must be a canonical UUID`);
+	return id;
+}
+
+function taskKind(value: unknown): WorkTaskKind {
+	if (value !== "read_only" && value !== "code_mutating") {
+		throw new ProtocolError("invalid_params", "invalid task kind");
+	}
+	return value;
+}
+
+function taskOpRef(value: unknown): string {
+	const ref = taskText(value, "expectedOpRef", 128);
+	if (!/^[a-z0-9][a-z0-9._-]*$/.test(ref)) {
+		throw new ProtocolError("invalid_params", "invalid expectedOpRef");
+	}
+	return ref;
+}
+
+function dispositionText(value: unknown, field: string, bytes = WORK_TASK_EVENT_ID_MAX_BYTES): string {
+	const text = taskText(value, field, bytes);
+	if (text.includes("\0")) throw new ProtocolError("invalid_params", `${field} contains NUL`);
+	return text;
+}
+
+function dispositionInteger(value: unknown): number {
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value === Number.MAX_SAFE_INTEGER)
+		throw new ProtocolError("invalid_params", "invalid disposition version/epoch");
+	return value;
+}
+
+function dispositionTime(value: unknown): string {
+	if (typeof value !== "string" || !Number.isFinite(Date.parse(value)) || new Date(value).toISOString() !== value)
+		throw new ProtocolError("invalid_params", "expected canonical UTC timestamp");
+	return value;
+}
+
+export function validateWorkTaskDispositionParams(value: unknown): WorkTaskDispositionParams {
+	const input = taskRecord(value, ["taskId", "jobId", "expectedOpRef", "sessionId", "epoch", "cwd",
+		"requestHash", "target", "eventId", "expectedTaskVersion", "outcome", "reason", "evidence", "callerSessionId",
+		"validationUnavailable"]);
+	const target = taskRecord(input.target, ["kind", "controlId", "eventId", "clientRef", "reportId"]);
+	let parsedTarget: WorkTaskDispositionParams["target"];
+	if (target.kind === "control") {
+		taskRecord(target, ["kind", "controlId", "eventId", "clientRef"]);
+		parsedTarget = { kind: "control", controlId: dispositionText(target.controlId, "controlId"),
+			eventId: dispositionText(target.eventId, "original eventId"),
+			clientRef: target.clientRef === null ? null : dispositionText(target.clientRef, "clientRef") };
+	} else if (target.kind === "report") {
+		taskRecord(target, ["kind", "reportId"]);
+		parsedTarget = { kind: "report", reportId: target.reportId === null ? null : dispositionText(target.reportId, "reportId") };
+	} else throw new ProtocolError("invalid_params", "invalid disposition target");
+	const evidence = taskRecord(input.evidence, ["availability", "detail", "evidenceAt"]);
+	if (evidence.availability !== "partial" && evidence.availability !== "unavailable")
+		throw new ProtocolError("invalid_params", "invalid evidence qualification");
+	if (input.outcome !== "unresolved" && input.outcome !== "abandoned")
+		throw new ProtocolError("invalid_params", "invalid administrative outcome");
+	const sessionId = input.sessionId === null ? null : dispositionText(input.sessionId, "sessionId");
+	const epoch = input.epoch === null ? null : dispositionInteger(input.epoch);
+	if ((sessionId === null) !== (epoch === null))
+		throw new ProtocolError("invalid_params", "session/epoch must be jointly known or unknown");
+	const cwd = dispositionText(input.cwd, "cwd", 4096);
+	if (!cwd.startsWith("/") || (cwd !== "/" && (cwd.endsWith("/") || cwd.split("/").slice(1).some(
+		(part) => part === "" || part === "." || part === ".."))))
+		throw new ProtocolError("invalid_params", "cwd must be canonical absolute path");
+	if (typeof input.requestHash !== "string" || !/^[0-9a-f]{64}$/.test(input.requestHash))
+		throw new ProtocolError("invalid_params", "invalid requestHash");
+	const result: WorkTaskDispositionParams = {
+		taskId: taskUuid(input.taskId, "taskId"), jobId: dispositionText(input.jobId, "jobId"),
+		expectedOpRef: taskOpRef(input.expectedOpRef), sessionId, epoch, cwd, requestHash: input.requestHash,
+		target: parsedTarget, eventId: dispositionText(input.eventId, "eventId"),
+		expectedTaskVersion: dispositionInteger(input.expectedTaskVersion), outcome: input.outcome,
+		reason: dispositionText(input.reason, "reason", 2048),
+		evidence: { availability: evidence.availability, detail: dispositionText(evidence.detail, "detail", 4096),
+			evidenceAt: evidence.evidenceAt === null ? null : dispositionTime(evidence.evidenceAt) },
+		...("callerSessionId" in input ? { callerSessionId: dispositionText(input.callerSessionId, "callerSessionId") } : {}),
+		...("validationUnavailable" in input
+			? { validationUnavailable: validateWorkTaskDispositionNegative(input.validationUnavailable) } : {}),
+	};
+	if (new TextEncoder().encode(JSON.stringify(result)).byteLength > WORK_TASK_TEXT_MAX_BYTES)
+		throw new ProtocolError("invalid_params", "disposition exceeds byte bound");
+	return result;
+}
+
+export function validateWorkTaskDispositionRecord(value: unknown): WorkTaskDispositionRecord {
+	const input = taskRecord(value, ["request", "principalId", "origin", "recordedAt", "taskVersion", "retained"]);
+	if (new TextEncoder().encode(JSON.stringify(input)).byteLength > WORK_TASK_TEXT_MAX_BYTES)
+		throw new ProtocolError("invalid_params", "administrative record exceeds byte bound");
+	const request = validateWorkTaskDispositionParams(input.request);
+	const retained = taskRecord(input.retained, ["obligationState", "reportId", "holdReason", "controlPhase"]);
+	if (!["awaiting_final", "held", "final_admitted"].includes(retained.obligationState as string) ||
+		(retained.controlPhase !== null && retained.controlPhase !== "held") ||
+		(request.target.kind === "control") !== (retained.controlPhase === "held") ||
+		(request.target.kind === "report" && ((retained.obligationState !== "held" &&
+			!(request.validationUnavailable && retained.obligationState === "awaiting_final")) ||
+			retained.reportId !== request.target.reportId)) ||
+		(retained.obligationState === "held") !== (retained.holdReason !== null))
+		throw new ProtocolError("invalid_params", "invalid retained disposition state");
+	const origin = taskRecord(input.origin, ["platform", "kind", "conversationId", "parentId", "boundaryId", "peerId"]);
+	validateOriginRef(origin as unknown as OriginRef);
+	const taskVersion = dispositionInteger(input.taskVersion);
+	if (taskVersion !== request.expectedTaskVersion + 1)
+		throw new ProtocolError("invalid_params", "invalid recorded task version");
+	return { request, principalId: dispositionText(input.principalId, "principalId"), origin: origin as unknown as OriginRef,
+		recordedAt: dispositionTime(input.recordedAt), taskVersion,
+		retained: { obligationState: retained.obligationState as WorkTaskDispositionRetained["obligationState"],
+			reportId: retained.reportId === null ? null : dispositionText(retained.reportId, "reportId"),
+			holdReason: retained.holdReason === null ? null : dispositionText(retained.holdReason, "holdReason", 2048),
+			controlPhase: retained.controlPhase as "held" | null } };
+}
+
+export function validateWorkTaskDispositionResult(value: unknown): WorkTaskDispositionResult {
+	const input = taskRecord(value, ["execution", "disposition", "dispositionId", "sourceId", "deliveryId", "record"]);
+	if (input.execution !== "none" || (input.disposition !== "recorded" && input.disposition !== "duplicate") ||
+		typeof input.dispositionId !== "string" || !/^disposition-[0-9a-f]{64}$/.test(input.dispositionId) ||
+		input.sourceId !== input.dispositionId)
+		throw new ProtocolError("invalid_params", "invalid administrative result");
+	return { execution: "none", disposition: input.disposition, dispositionId: input.dispositionId,
+		sourceId: input.dispositionId,
+		deliveryId: input.deliveryId === null ? null : dispositionText(input.deliveryId, "deliveryId"),
+		record: validateWorkTaskDispositionRecord(input.record) };
+}
+
+function taskSnowflake(value: unknown, field: string): string {
+	const id = taskText(value, field, 20);
+	if (!/^[1-9][0-9]{0,19}$/.test(id) || BigInt(id) > 18446744073709551615n) {
+		throw new ProtocolError("invalid_params", `invalid Discord ${field}`);
+	}
+	return id;
+}
+
+function taskOrigin(value: unknown, kind: "thread"): WorkTaskThreadOrigin;
+function taskOrigin(value: unknown, kind: "channel"): WorkTaskParentOrigin;
+function taskOrigin(value: unknown, kind: "thread" | "channel"): WorkTaskThreadOrigin | WorkTaskParentOrigin {
+	const input = taskRecord(value, ["platform", "kind", "conversationId", "parentId", "boundaryId"]);
+	if (input.platform !== "discord" || input.kind !== kind) {
+		throw new ProtocolError("invalid_params", `task surface requires a Discord guild ${kind}`);
+	}
+	const conversationId = taskSnowflake(input.conversationId, "conversationId");
+	const boundaryId = taskSnowflake(input.boundaryId, "boundaryId");
+	if (boundaryId === conversationId) throw new ProtocolError("invalid_params", "conflicting Discord guild identity");
+	if (kind === "thread") {
+		const parentId = taskSnowflake(input.parentId, "parentId");
+		if (parentId === conversationId || parentId === boundaryId) {
+			throw new ProtocolError("invalid_params", "conflicting Discord thread identities");
+		}
+		const origin: WorkTaskThreadOrigin = { platform: "discord", kind, conversationId, parentId, boundaryId };
+		validateOriginRef(origin);
+		return origin;
+	}
+	if ("parentId" in input) throw new ProtocolError("invalid_params", "parent channel cannot carry parentId");
+	const origin: WorkTaskParentOrigin = { platform: "discord", kind, conversationId, boundaryId };
+	validateOriginRef(origin);
+	return origin;
+}
+
+export function validateWorkJobsParams(value: unknown): WorkJobsParams | undefined {
+	if (value === undefined) return undefined;
+	const input = taskRecord(value, ["afterTaskId"]);
+	return "afterTaskId" in input ? { afterTaskId: taskUuid(input.afterTaskId, "afterTaskId") } : {};
+}
+
+export function validateWorkTaskOriginSource(value: unknown, origin: OriginRef): WorkTaskOriginSource {
+	taskOrigin(origin, "thread");
+	const input = taskRecord(value, ["platformCreatedAt", "recovered"]);
+	if (typeof input.platformCreatedAt !== "number" || !Number.isSafeInteger(input.platformCreatedAt) ||
+		input.platformCreatedAt < 0 || input.platformCreatedAt > 8640000000000000) {
+		throw new ProtocolError("invalid_params", "platformCreatedAt must be a valid Unix millisecond timestamp");
+	}
+	if ("recovered" in input && typeof input.recovered !== "boolean") {
+		throw new ProtocolError("invalid_params", "recovered must be boolean");
+	}
+	return {
+		platformCreatedAt: input.platformCreatedAt,
+		...("recovered" in input ? { recovered: input.recovered as boolean } : {}),
+	};
+}
+
+export function validateWorkTaskMessageMetadata(
+	value: unknown,
+	context: { readonly origin: OriginRef; readonly taskId?: string; readonly opRef?: string; readonly sourceId?: string },
+): WorkTaskMessageMetadata {
+	taskOrigin(context.origin, "thread");
+	const input = taskRecord(value, ["taskId", "opRef", "sourceId", "mappedOnly", "bindingRevision"]);
+	const taskId = taskUuid(input.taskId, "taskId");
+	const opRef = taskOpRef(input.opRef);
+	const sourceId = taskText(input.sourceId, "sourceId", WORK_TASK_EVENT_ID_MAX_BYTES);
+	if (hasAsciiControlCharacter(sourceId) || input.mappedOnly !== true) {
+		throw new ProtocolError("invalid_params", "invalid mapped task metadata");
+	}
+	for (const [key, actual] of [["taskId", taskId], ["opRef", opRef], ["sourceId", sourceId]] as const) {
+		if (context[key] !== undefined && context[key] !== actual) {
+			throw new ProtocolError("invalid_params", `task metadata ${key} mismatch`);
+		}
+	}
+	const bindingRevision = "bindingRevision" in input ? taskText(input.bindingRevision, "bindingRevision", 64) : undefined;
+	if (bindingRevision !== undefined && !/^[0-9a-f]{64}$/.test(bindingRevision)) {
+		throw new ProtocolError("invalid_params", "bindingRevision must be a canonical SHA-256 hash");
+	}
+	return { taskId, opRef, sourceId, mappedOnly: true, ...(bindingRevision === undefined ? {} : { bindingRevision }) };
+}
+
+/** Structure only: server must match the persisted ledger/task and confirm atomically. */
+export function validateDeliveryConfirmParams(value: unknown): DeliveryConfirmParams {
+	const input = taskRecord(value, ["deliveryId", "platformReceipt"]);
+	let encoded: string;
+	try {
+		encoded = JSON.stringify(input);
+	} catch {
+		throw new ProtocolError("invalid_params", "delivery confirmation must be JSON");
+	}
+	if (new TextEncoder().encode(encoded).byteLength > DELIVERY_CONFIRM_MAX_BYTES) {
+		throw new ProtocolError("invalid_params", "delivery confirmation exceeds its UTF-8 byte bound");
+	}
+	const deliveryId = taskText(input.deliveryId, "deliveryId", WORK_TASK_EVENT_ID_MAX_BYTES);
+	if (!("platformReceipt" in input)) return { deliveryId };
+	const receipt = taskRecord(input.platformReceipt, ["origin", "messageIds"]);
+	const origin = taskOrigin(receipt.origin, "thread");
+	if (!Array.isArray(receipt.messageIds) || receipt.messageIds.length === 0 ||
+		receipt.messageIds.length > DELIVERY_RECEIPT_MAX_MESSAGE_IDS) {
+		throw new ProtocolError("invalid_params", "receipt requires 1..1024 messageIds");
+	}
+	const messageIds = Array.from(receipt.messageIds, (id) => taskSnowflake(id, "messageId"));
+	if (new Set(messageIds).size !== messageIds.length) {
+		throw new ProtocolError("invalid_params", "receipt messageIds must be unique");
+	}
+	return { deliveryId, platformReceipt: { origin, messageIds } };
+}
+
+export function validateWorkTaskSpec(value: unknown): WorkTaskSpec {
+	const input = taskRecord(value, ["taskId", "kind", "surface", "context"]);
+	const taskId = taskUuid(input.taskId, "taskId");
+	const kind = taskKind(input.kind);
+	const selected = taskRecord(input.surface, ["threadOrigin", "parentOrigin", "title"]);
+	let surface: WorkTaskSurface;
+	if ("threadOrigin" in selected && !("parentOrigin" in selected) && !("title" in selected)) {
+		surface = { threadOrigin: taskOrigin(selected.threadOrigin, "thread") };
+	} else if ("parentOrigin" in selected && !("threadOrigin" in selected)) {
+		const parentOrigin = taskOrigin(selected.parentOrigin, "channel");
+		const title = "title" in selected ? taskText(selected.title, "title", WORK_TASK_TITLE_MAX_LENGTH * 4) : undefined;
+		if (title !== undefined && (title.length > WORK_TASK_TITLE_MAX_LENGTH || hasAsciiControlCharacter(title))) {
+			throw new ProtocolError("invalid_params", "title must be bounded single-line text");
+		}
+		surface = { parentOrigin, ...(title === undefined ? {} : { title }) };
+	} else {
+		throw new ProtocolError("invalid_params", "task requires exactly one surface alternative");
+	}
+	const context = "context" in input ? taskText(input.context, "context", WORK_TASK_CONTEXT_MAX_BYTES) : undefined;
+	return { taskId, kind, surface, ...(context === undefined ? {} : { context }) };
+}
+
+export function validateWorkStartParams(value: unknown): WorkStartParams {
+	const input = taskRecord(value, ["name", "text", "cwd", "resume", "model", "callerSessionId", "task"]);
+	const name = taskText(input.name, "name", 96);
+	const text = taskText(input.text, "text", WORK_TASK_TEXT_MAX_BYTES);
+	const task = "task" in input ? validateWorkTaskSpec(input.task) : undefined;
+	if (task && name !== `fm-${task.taskId}`) {
+		throw new ProtocolError("invalid_params", "taskId does not match lane name");
+	}
+	if ("resume" in input && typeof input.resume !== "boolean") {
+		throw new ProtocolError("invalid_params", "resume must be boolean");
+	}
+	if (task && input.resume === true) throw new ProtocolError("invalid_params", "task admission cannot resume");
+	const cwd = "cwd" in input ? taskText(input.cwd, "cwd", 4096) : undefined;
+	const callerSessionId = "callerSessionId" in input ? taskText(input.callerSessionId, "callerSessionId", 256) : undefined;
+	let model: WorkRunParams["model"];
+	if ("model" in input) {
+		if (typeof input.model === "string") model = taskText(input.model, "model", 256);
+		else {
+			const choice = taskRecord(input.model, ["preset"]);
+			model = { preset: taskText(choice.preset, "preset", 256) };
+		}
+	}
+	return {
+		name, text,
+		...(task === undefined ? {} : { task }),
+		...(cwd === undefined ? {} : { cwd }),
+		...(typeof input.resume === "boolean" ? { resume: input.resume } : {}),
+		...(callerSessionId === undefined ? {} : { callerSessionId }),
+		...(model === undefined ? {} : { model }),
+	};
+}
+
+export function validateWorkSteerParams(value: unknown): WorkSteerParams {
+	const input = taskRecord(value, ["name", "text", "taskId", "eventId", "expectedOpRef", "kind", "callerSessionId"]);
+	const name = taskText(input.name, "name", 96);
+	const text = taskText(input.text, "text", WORK_TASK_TEXT_MAX_BYTES);
+	const callerSessionId = "callerSessionId" in input ? taskUuid(input.callerSessionId, "callerSessionId") : undefined;
+	const routing = callerSessionId === undefined ? {} : { callerSessionId };
+	const taskMode = ["taskId", "eventId", "expectedOpRef", "kind"].some((field) => field in input);
+	if (!taskMode) return { name, text, ...routing };
+	const taskId = taskUuid(input.taskId, "taskId");
+	const expectedOpRef = taskOpRef(input.expectedOpRef);
+	const eventId = taskText(input.eventId, "eventId", WORK_TASK_EVENT_ID_MAX_BYTES);
+	if (!TASK_UUID.test(eventId) && !/^[a-z][a-z0-9._-]*:[A-Za-z0-9._:/=@+-]+$/.test(eventId)) {
+		throw new ProtocolError("invalid_params", "eventId must be a UUID or namespaced stable ID");
+	}
+	if (name !== `fm-${taskId}`) throw new ProtocolError("invalid_params", "taskId does not match lane name");
+	const kind = "kind" in input ? taskKind(input.kind) : undefined;
+	return { name, text, taskId, expectedOpRef, eventId, ...(kind === undefined ? {} : { kind }), ...routing };
+}
+
+export function validateWorkStatusParams(value: unknown): WorkStatusParams {
+	const input = taskRecord(value, ["name", "taskId", "expectedOpRef"]);
+	const name = taskText(input.name, "name", 96);
+	if (!("taskId" in input) && !("expectedOpRef" in input)) return { name };
+	const taskId = taskUuid(input.taskId, "taskId");
+	if (name !== `fm-${taskId}`) throw new ProtocolError("invalid_params", "taskId does not match lane name");
+	const expectedOpRef = "expectedOpRef" in input ? taskOpRef(input.expectedOpRef) : undefined;
+	return { name, taskId, ...(expectedOpRef === undefined ? {} : { expectedOpRef }) };
+}
+
+export function validateWorkThreadClaimParams(value: unknown): WorkThreadClaimParams {
+	const input = taskRecord(value, ["taskId", "claimId"]);
+	return { taskId: taskUuid(input.taskId, "taskId"), claimId: taskUuid(input.claimId, "claimId") };
+}
+
+export function validateWorkThreadBindParams(value: unknown): WorkThreadBindParams {
+	const input = taskRecord(value, ["taskId", "claimId", "outcome"]);
+	const taskId = taskUuid(input.taskId, "taskId");
+	const claimId = taskUuid(input.claimId, "claimId");
+	const outcome = taskRecord(input.outcome, ["kind", "origin", "reason"]);
+	if (outcome.kind === "bound" && !("reason" in outcome)) {
+		return { taskId, claimId, outcome: { kind: "bound", origin: taskOrigin(outcome.origin, "thread") } };
+	}
+	if (outcome.kind === "held" && !("origin" in outcome)) {
+		return { taskId, claimId, outcome: { kind: "held", reason: taskText(outcome.reason, "reason", 1024) } };
+	}
+	throw new ProtocolError("invalid_params", "bind requires exactly one bound or held outcome");
+}
+
+export function validateWorkTaskRecoverParams(value: unknown): WorkTaskRecoverParams {
+	const input = taskRecord(value, ["taskId"]);
+	return { taskId: taskUuid(input.taskId, "taskId") };
+}
+
+export function validateWorkTaskContextParams(value: unknown): WorkTaskContextParams {
+	const input = taskRecord(value, ["taskId", "topic", "continuation"]);
+	const taskId = "taskId" in input ? taskUuid(input.taskId, "taskId") : undefined;
+	const topic = "topic" in input ? taskText(input.topic, "topic", 256) : undefined;
+	const continuation = "continuation" in input ? taskText(input.continuation, "continuation", 1024) : undefined;
+	return {
+		...(taskId === undefined ? {} : { taskId }),
+		...(topic === undefined ? {} : { topic }),
+		...(continuation === undefined ? {} : { continuation }),
+	};
+}
+
 /** A worker gjc session run: an isolated coding-register session doing delegated work. */
 export interface WorkRunParams {
 	/** Stable worker name; the same name resumes the same gjc session. */
@@ -621,23 +1377,42 @@ export interface WorkRunParams {
 	readonly callerSessionId?: string;
 }
 
-/** Asynchronous starts and synchronous runs share the same caller metadata. */
-export type WorkStartParams = WorkRunParams;
+/** Task admission is distinct from ordinary unbound lane execution. */
+export interface WorkStartParams extends WorkRunParams {
+	readonly task?: WorkTaskSpec;
+}
 
 export type WorkStartResult =
 	| {
 			readonly started: true;
+			readonly accepted?: never;
+			readonly execution?: never;
+			readonly held?: never;
 			readonly jobId: string;
 			readonly opRef: string;
 			readonly sessionKey: string;
 			readonly sessionId: string;
+			readonly taskId?: string;
+	  }
+	| {
+			readonly started: false;
+			readonly held?: never;
+			readonly accepted: "durable";
+			readonly execution: "pending_surface";
+			readonly taskId: string;
+			readonly jobId: string;
+			readonly opRef: string;
 	  }
 	| {
 			readonly started: false;
 			readonly held: true;
+			readonly accepted?: never;
+			readonly execution?: never;
 			readonly jobId: string;
 			readonly state: string;
 			readonly reason: string;
+			readonly taskId?: string;
+			readonly opRef?: string;
 	  };
 
 /** Public structural projection; protocol must not depend on subsession. */
@@ -662,6 +1437,8 @@ export interface PromptStatusBody {
 
 export interface WorkStatusParams {
 	readonly name: string;
+	readonly taskId?: string;
+	readonly expectedOpRef?: string;
 }
 
 /** Read-only durable snapshot plus a matching-binding live operation query. */
@@ -677,16 +1454,27 @@ export interface WorkStatusResult {
 		readonly endState?: string;
 	} | null;
 	readonly op: PromptStatusBody | null;
+	/** Binding/report completeness, never semantic task success or a steer receipt. */
+	readonly task?: WorkTaskProjection;
 }
 
 export interface WorkSteerParams {
 	readonly name: string;
 	readonly text: string;
+	/** Untrusted routing hint linking this request to the calling GJC session, not authority. */
+	readonly callerSessionId?: string;
+	/** These three identity fields must be supplied together. */
+	readonly taskId?: string;
+	readonly eventId?: string;
+	readonly expectedOpRef?: string;
+	/** Declared scope; runtime must refuse unsafe elevation before transport. */
+	readonly kind?: WorkTaskKind;
 }
 
 export type WorkSteerResult =
-	| { readonly steered: true; readonly clientRef: string }
-	| { readonly steered: false; readonly reason: string };
+	| { readonly steered: true; readonly clientRef: string; readonly route?: "unbound" }
+	| { readonly steered: false; readonly reason: string; readonly route?: "unbound" }
+	| WorkTaskSteerResult;
 
 export interface WorkRetireParams {
 	readonly name?: string;
@@ -740,8 +1528,18 @@ export type WorkRunResult =
 			readonly opRef: string;
 	  };
 
+export interface WorkJobsParams {
+	readonly afterTaskId?: string;
+}
+
 /** Operator projection over durable lane jobs (issue #10). */
 export interface WorkJobsResult {
+	/** At most 20 task surfaces per page; ordinary jobs are not paginated. */
+	readonly tasks: readonly WorkTaskProjection[];
+	/** Per-task projection failures retain the original task identity without inventing an operation reference. */
+	readonly taskErrors: { taskId: string; reason: string }[];
+	/** Last scanned durable task key, including tombstones; absent at the end. */
+	readonly nextTaskId?: string;
 	readonly jobs: Array<{
 		readonly job_id: string;
 		readonly lane_key: string;
@@ -1025,7 +1823,13 @@ export interface VerbCatalogV01 {
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
-	"work.jobs": { result: WorkJobsResult };
+	"work.thread.claim": { params: WorkThreadClaimParams; result: WorkThreadClaimResult };
+	"work.thread.bind": { params: WorkThreadBindParams; result: WorkThreadBindResult };
+	"work.task.recover": { params: WorkTaskRecoverParams; result: WorkTaskRecoverResult };
+	"work.task.disposition": { params: WorkTaskDispositionParams; result: WorkTaskDispositionResult };
+	"work.task.disposition.basis": { params: WorkTaskDispositionBasisParams; result: WorkTaskDispositionBasisResult };
+	"work.task.context": { params: WorkTaskContextParams; result: WorkTaskContextResult };
+	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
@@ -1067,6 +1871,12 @@ export const VERBS_V01 = [
 	"work.start",
 	"work.status",
 	"work.steer",
+	"work.thread.claim",
+	"work.thread.bind",
+	"work.task.recover",
+	"work.task.disposition",
+	"work.task.disposition.basis",
+	"work.task.context",
 	"work.jobs",
 	"work.retire",
 	"chat.react",

@@ -181,9 +181,15 @@ for (const outcome of ["complete", "incomplete", "in_flight"] as const)
 				stdout: JSON.stringify({
 					ok: true,
 					result: {
-						...report.status,
 						kind: "prompt",
+						status: "terminal_ok",
 						clientRef: send.opRef,
+						commandId: report.status.commandId,
+						turnId: report.status.turnId,
+						startedAt: report.status.startedAt,
+						terminalAt: report.status.terminalAt,
+						receiptState: "present",
+						outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 						content: {
 							version: 1,
 							type: "text",
@@ -283,9 +289,15 @@ for (const evidence of ["missing", "truncated", "mismatch"] as const)
 			stdout: JSON.stringify({
 				ok: true,
 				result: {
-					...status,
 					kind: "prompt",
+					status: "terminal_ok",
 					clientRef: evidence === "mismatch" ? "wrong-operation" : send.opRef,
+					commandId: status.commandId,
+					turnId: status.turnId,
+					startedAt: status.startedAt,
+					terminalAt: status.terminalAt,
+					receiptState: "present",
+					outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 					...(evidence === "missing"
 						? {}
 						: {
@@ -796,6 +808,24 @@ test("#424: a prompt that fails its submission phase twice gets exactly one fail
 	expect(failures).toHaveLength(1);
 	expect(database!.inboundTurnRow(last.opRef)).toMatchObject({ state: "done", turn_state: "done" });
 });
+
+const unqualifiedSubmissionOutcomes: readonly Record<string, string>[] = [
+	{ phase: "submission" },
+	{ phase: "submission", category: "agent_runtime", provenance: "unknown" },
+	{ phase: "submission", category: "unknown", provenance: "agent_failed" },
+];
+for (const outcome of unqualifiedSubmissionOutcomes) {
+	test(`submission retry requires positive runtime rejection evidence: ${JSON.stringify(outcome)}`, async () => {
+		const port = new ScriptedSessionPort({
+			onSend: (input, scripted) => scripted.fail(input.opRef, "unqualified failure", { code: "internal", outcome }),
+		});
+		const failures: string[] = [];
+		await harness(port, { failure: (message) => failures.push(message) });
+		await settleFailedInbound(port, "unqualified-submission");
+		expect(port.sends).toHaveLength(1);
+		expect(failures).toHaveLength(1);
+	});
+}
 
 test("#424: a failure outside the submission phase is reported without a re-send", async () => {
 	const port = new ScriptedSessionPort({

@@ -15,6 +15,7 @@ import {
 	handleSlashCommand,
 	isPresenceReaction,
 	LruSet,
+	maybeCreateThreadOnMention,
 	presenceEligibleTurn,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
@@ -25,6 +26,22 @@ import {
 import { discordMessageOrigin } from "../src/origin";
 
 const author = { id: "author-1" };
+
+test("channel auto-threading retains guild identity and never redirects an existing task thread", async () => {
+	let creates = 0;
+	const message = {
+		id: "123", content: "<@bot>", author, channel: { id: "456" },
+		startThread: async () => { creates++; return { id: "789" }; },
+	};
+	const engagement = { group: true, mentioned: true, authorId: author.id };
+	const channel = { platform: "discord", kind: "channel", conversationId: "456", boundaryId: "999" } as const;
+	const thread = await maybeCreateThreadOnMention(message, engagement, channel);
+	expect(thread).toEqual({
+		platform: "discord", kind: "thread", conversationId: "789", parentId: "456", boundaryId: "999",
+	});
+	expect(await maybeCreateThreadOnMention(message, engagement, thread)).toBe(thread);
+	expect(creates).toBe(1);
+});
 
 test("loads and trims the token credential file without exposing its value", async () => {
 	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-adapter-"));

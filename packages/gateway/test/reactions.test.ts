@@ -2,6 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase } from "../src/store/db";
@@ -86,7 +87,7 @@ async function gateway(reply: string, hold?: Promise<void>): Promise<Harness> {
 	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
 	server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
 	const client = await connect(config.socketPath);
-	client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	for (let attempt = 0; attempt < 60 && client.frames.length < 1; attempt++) await Bun.sleep(5);
 	return { client, database, turns, steers: sessionPort.steers };
 }
@@ -99,7 +100,7 @@ function sendMessage(
 	engagement: Record<string, unknown> = { mentioned: true, group: true, authorId: "human-1", authorName: "형님" },
 ): void {
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id,
 		verb: "chat.send",
@@ -195,7 +196,7 @@ test("the model's own [REACT:👀] on a steered message the gateway already ackn
 test("an inbound reaction is metadata: it never creates a turn", async () => {
 	const { client, database, turns } = await gateway("should never be produced");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "r1",
 		verb: "engagement.reaction",
@@ -228,7 +229,7 @@ test("a removed reaction is recorded as its own retraction, not as an erased add
 		["r2", "remove"],
 	] as const) {
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "engagement.reaction",
@@ -254,7 +255,7 @@ test("a removed reaction is recorded as its own retraction, not as an erased add
 test("reaction metadata reaches the next engaged turn as context", async () => {
 	const { client, turns } = await gateway("[SILENT]");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "r1",
 		verb: "engagement.reaction",
@@ -293,7 +294,7 @@ test("engagement.reaction rejects a missing target, a bad action and a loopback 
 		],
 		["e4", { origin: ORIGIN, targetMessageId: "m1", emoji: "👍", action: "add" }],
 	];
-	for (const [id, params] of cases) client.send({ v: "0.1", type: "request", id, verb: "engagement.reaction", params });
+	for (const [id, params] of cases) client.send({ v: PROFILE_VERSION, type: "request", id, verb: "engagement.reaction", params });
 	await settle();
 	for (const [id] of cases) {
 		const error = client.frames.find((frame) => frame.type === "error" && frame.id === id);
@@ -313,7 +314,7 @@ test("a reaction-only reply acknowledges without speaking, as a ledger delivery"
 	// It settles exactly like a message: the delivery is a real ledger row.
 	const deliveryId = reactions[0].payload.deliveryId as string;
 	expect(deliveryId).toBeString();
-	client.send({ v: "0.1", type: "request", id: "d1", verb: "delivery.confirm", params: { deliveryId } });
+	client.send({ v: PROFILE_VERSION, type: "request", id: "d1", verb: "delivery.confirm", params: { deliveryId } });
 	await settle();
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "d1").result).toEqual({
 		settled: true,
@@ -327,7 +328,7 @@ test("a reaction that fails on the platform is a reportable ledger failure, neve
 	await settle();
 	const deliveryId = reactionEvents(client.frames)[0].payload.deliveryId as string;
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "d1",
 		verb: "delivery.fail",
@@ -399,7 +400,7 @@ test("the per-message cap and duplicate detection bound reactions on one message
 test("chat.react reacts to one named message and returns its ledger delivery id", async () => {
 	const { client, database } = await gateway("unused");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "k1",
 		verb: "chat.react",
@@ -418,7 +419,7 @@ test("chat.react reacts to one named message and returns its ledger delivery id"
 test("chat.react rejects a disallowed emoji with an error that names the allowlist", async () => {
 	const { client } = await gateway("unused");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "k1",
 		verb: "chat.react",
@@ -442,7 +443,7 @@ test("chat.react refuses to react without a target message id", async () => {
 		["k4", { origin: ORIGIN, targetMessageId: "9".repeat(65), emoji: "👍" }],
 		["k5", { origin: ORIGIN, targetMessageId: "m1\nm2", emoji: "👍" }],
 	] as Array<[string, unknown]>)
-		client.send({ v: "0.1", type: "request", id, verb: "chat.react", params });
+		client.send({ v: PROFILE_VERSION, type: "request", id, verb: "chat.react", params });
 	await settle();
 	for (const id of ["k1", "k2", "k3", "k4", "k5"]) {
 		const error = client.frames.find((frame) => frame.type === "error" && frame.id === id);
@@ -460,7 +461,7 @@ test("chat.react reports cap violations instead of silently doing nothing", asyn
 		["k3", "🎉"],
 	] as const) {
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id,
 			verb: "chat.react",
@@ -480,7 +481,7 @@ test("chat.react reports cap violations instead of silently doing nothing", asyn
 test("chat.react is not available on loopback, which has no messages to react to", async () => {
 	const { client } = await gateway("unused");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "k1",
 		verb: "chat.react",
@@ -502,14 +503,14 @@ test("the reaction verbs refuse an origin no chat adapter can settle", async () 
 	const { client, database } = await gateway("unused");
 	const monitor = { platform: "monitor", kind: "eventtype", conversationId: "deploys" };
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "k1",
 		verb: "chat.react",
 		params: { origin: monitor, targetMessageId: "m1", emoji: "👍" },
 	});
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "k2",
 		verb: "engagement.reaction",
@@ -533,7 +534,7 @@ test("a reaction storm in one millisecond keeps every event instead of colliding
 	const { client, database, turns } = await gateway("unused");
 	for (let index = 0; index < 6; index++)
 		client.send({
-			v: "0.1",
+			v: PROFILE_VERSION,
 			type: "request",
 			id: `r${index}`,
 			verb: "engagement.reaction",
@@ -553,7 +554,7 @@ test("a reaction storm in one millisecond keeps every event instead of colliding
 test("a reactor cannot forge context lines through the emoji field", async () => {
 	const { client, database } = await gateway("unused");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "r1",
 		verb: "engagement.reaction",
@@ -577,14 +578,14 @@ test("a reaction Telegram cannot express is refused, not queued as a dead delive
 	const { client, database } = await gateway("unused");
 	const telegram = { platform: "telegram", kind: "channel", conversationId: "chan-1" };
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "k1",
 		verb: "chat.react",
 		params: { origin: telegram, targetMessageId: "77", emoji: "✅" },
 	});
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "k2",
 		verb: "chat.react",
@@ -604,7 +605,7 @@ test("a reaction Telegram cannot express is refused, not queued as a dead delive
 test("a reaction token Telegram cannot express is skipped while the reply still speaks", async () => {
 	const { client } = await gateway("[REACT:✅] 처리했습니다");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "c1",
 		verb: "chat.send",
@@ -629,7 +630,7 @@ test("a slack channel origin is a chat platform: send, react, and inbound reacti
 	const { client, database, turns } = await gateway("[REACT:✅] 확인했습니다");
 	const slack = { platform: "slack", kind: "channel", conversationId: "C1" };
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "s1",
 		verb: "chat.send",
@@ -648,14 +649,14 @@ test("a slack channel origin is a chat platform: send, react, and inbound reacti
 	expect(reactionEvents(client.frames)[0].payload.reaction.targetMessageId).toBe("C1:1726543210.123456");
 	expect(textEvents(client.frames)[0].payload.text).toBe("확인했습니다");
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "s2",
 		verb: "chat.react",
 		params: { origin: slack, targetMessageId: "C1:1726543210.223456", emoji: "🦞" },
 	});
 	client.send({
-		v: "0.1",
+		v: PROFILE_VERSION,
 		type: "request",
 		id: "s3",
 		verb: "engagement.reaction",

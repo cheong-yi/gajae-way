@@ -1,0 +1,27 @@
+# Consumer-owned facts: read before subsequent implementation and review briefs.
+# Standalone checks only; no automatic Bun preload or CI binding is adopted.
+required = ["ts-test", "ts-typecheck", "ts-lint"]
+advisory = []
+on_demand = ["mutation-testing", "profiling", "adversarial-review"]
+
+[conditional]
+input_parsing = "Changed external parsing: exercise valid, malformed, and boundary inputs."
+authorization_decisions = "Changed authority decisions: test allow and deny boundaries."
+file_writes_deletion = "Changed filesystem mutation: test confinement, refusal, and partial side effects."
+external_commands = "Changed subprocess invocation: test arguments, failures, and prohibited execution paths."
+
+[fact]
+schema_version = 1
+selected_components = ["typescript"]
+test_command = "bun test packages"
+affected_test_command = "bun test <affected-package-test-paths>"
+ci_jobs_added = false
+pcd_is_enforcement = false
+
+[typescript]
+schema_version = 1
+typecheck = true
+lint = true
+tsconfig = "tsconfig.json"
+biome_config = "biome.json"
+paths = ["packages", "scripts"]

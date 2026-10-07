@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -81,6 +81,8 @@ export interface SessionPort {
 	resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding>;
 	send(input: SessionSendInput): Promise<SendReceipt>;
 	steer(input: SessionSteerInput): Promise<void>;
+	/** Original steering receipt only; acceptance proves neither comprehension nor task completion. */
+	lookupSteerStatus(input: SessionSteerStatusInput): Promise<SessionSteerStatusResult>;
 	setModel(input: {
 		sessionId: string;
 		repo: string;
@@ -131,6 +133,8 @@ export interface SessionPort {
 	 * Closes a live session (`session.close`). Recoverable on the broker side and
 	 * never `session.delete`: gjc fences every later lifecycle op on one refused
 	 * delete, so the gateway retires lanes by closing and rebinding instead.
+	 * Resolves only for a correlated ordinary host-close receipt with unchanged
+	 * current ownership. This is not prompt terminal or subordinate-job proof.
 	 */
 	close(input: { sessionId: string; repo: string }): Promise<void>;
 }
@@ -195,6 +199,30 @@ export interface SessionSteerInput {
 	readonly clientRef: string;
 	readonly relay?: TailHandle;
 }
+
+export interface SessionSteerStatusInput {
+	readonly sessionId: string;
+	readonly repo: string;
+	/** Original canonical reference, never a prompt opRef or a freshly minted replacement. */
+	readonly clientRef: string;
+	readonly relay?: TailHandle;
+}
+
+export type SessionSteerStatusResult =
+	| {
+			readonly status: "accepted" | "rejected" | "uncertain";
+			readonly clientRef: string;
+			readonly acceptedAt: number;
+			readonly terminalAt?: number;
+			readonly errorCode?: string;
+	  }
+	| { readonly status: "unknown"; readonly clientRef: string }
+	| {
+			readonly status: "unavailable";
+			readonly clientRef: string;
+			readonly code: "identity_mismatch" | "invalid_evidence" | "query_refused" | "query_unavailable" | "transport_error";
+			readonly errorCode?: string;
+	  };
 
 export interface WorkerOutputInput {
 	readonly sessionId: string;
@@ -302,6 +330,21 @@ export class ModelNotSelectedError extends Error {
 		super("turn.prompt explicitly refused: model_not_selected");
 		this.name = "ModelNotSelectedError";
 		this.opRef = opRef;
+	}
+}
+
+/**
+ * Only this send call stopped before turn.prompt. Model side effects and any
+ * earlier attempt under the same opRef remain unknown; this is not retry authority.
+ */
+export class PromptNotSubmittedError extends Error {
+	readonly phase = "model_preflight";
+
+	constructor(readonly opRef: string, cause: unknown) {
+		super("turn.prompt was not submitted by this call: model preflight failed", {
+			cause: sanitizeDiagnostic(cause instanceof Error ? cause.message : String(cause)).slice(0, 512),
+		});
+		this.name = "PromptNotSubmittedError";
 	}
 }
 
@@ -705,10 +748,18 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async send(input: SessionSendInput): Promise<SendReceipt> {
-		this.#assertOwned(input);
+		const owned = this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
 		assertValidOpRef(input.opRef);
 		if (input.text.trim().length === 0) throw new OpRefError("prompt text must not be empty");
-		if (input.model) await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
+		if (input.model) {
+			try {
+				await this.setModel({ sessionId: input.sessionId, repo: input.repo, selection: input.model });
+			} catch (error) {
+				// Authority failures retain their existing fail-closed contract.
+				if (error instanceof BrokerAuthorityError) throw error;
+				throw new PromptNotSubmittedError(input.opRef, error);
+			}
+		}
 		const text = renderPrompt(input.systemPreamble, input.text);
 		// The prompt is submitted on the session's resident relay so that this
 		// connection OWNS the turn: the host streams the turn's content only to
@@ -716,25 +767,54 @@ export class BrokerSessionPort implements SessionPort {
 		// for the duration of the send.
 		const relay =
 			input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+		const assertRelayOwned = () => {
+			const current = this.#database.assertOwnedSession(input.sessionId, input.repo, this.#authority);
+			if (
+				relay.sessionId !== input.sessionId ||
+				current.originKey !== owned.originKey ||
+				current.epoch !== owned.epoch ||
+				current.repo !== owned.repo
+			)
+				throw uncertainPromptReceipt();
+		};
 		try {
 			const deadline = this.#now() + (input.busyWaitMs ?? DEFAULT_BUSY_WAIT_MS);
 			let waited = false;
 			for (;;) {
-				this.#database.assertBrokerAuthority(this.#authority);
+				assertRelayOwned();
 				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
-				this.#database.assertBrokerAuthority(this.#authority);
-				if (response.ok) {
-					const result = recordOf(response.result) ?? {};
-					const receipt = recordOf(result.receipt) ?? result;
+				assertRelayOwned();
+				if (!validReceiptEnvelope(response, "control", "turn.prompt"))
+					throw uncertainPromptReceipt();
+				if (response.ok === true) {
+					const receipt = recordOf(response.result);
+					// GJC v0.18.7 (f2bba356), session-runtime.ts submit():
+					// { accepted: true, commandId, turnId, clientRef }. No receipt
+					// wrapper, status, session ID or SDK acceptance timestamp.
+					if (
+						response.error !== undefined ||
+						response.page !== undefined ||
+						receipt?.accepted !== true ||
+						receipt.clientRef !== input.opRef ||
+						typeof receipt.commandId !== "string" ||
+						receipt.commandId.trim().length === 0 ||
+						typeof receipt.turnId !== "string" ||
+						receipt.turnId.trim().length === 0 ||
+						Object.keys(receipt).some((key) => !["accepted", "commandId", "turnId", "clientRef"].includes(key))
+					)
+						throw uncertainPromptReceipt();
 					return {
-						sessionId: input.sessionId,
-						operationRef: input.opRef,
-						...(typeof receipt.commandId === "string" ? { commandId: receipt.commandId } : {}),
-						...(typeof receipt.turnId === "string" ? { turnId: receipt.turnId } : {}),
+						sessionId: relay.sessionId,
+						operationRef: receipt.clientRef,
+						commandId: receipt.commandId,
+						turnId: receipt.turnId,
+						// SendReceipt's existing local observation time, not SDK event time.
 						acceptedAt: new Date(this.#now()).toISOString(),
 						taskKey: "gateway",
 					};
 				}
+				if (!isReceiptRefusal(response))
+					throw uncertainPromptReceipt();
 				const error = relayFailure("turn.prompt", response);
 				if (envelopeErrorCode(error.details) === MODEL_NOT_SELECTED_CODE) throw new ModelNotSelectedError(input.opRef);
 				if (envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE)
@@ -769,10 +849,17 @@ export class BrokerSessionPort implements SessionPort {
 		} finally {
 			if (!input.relay) await relay.close();
 		}
-		if (!response.ok) {
+		const uncertain = () =>
+			new GjcCliError("gjc sdk turn.steer acceptance unavailable", 0, "", {
+				code: "receipt_identity_mismatch",
+				outcomeCertainty: "unknown",
+			});
+		if (!validReceiptEnvelope(response, "control", "turn.steer")) throw uncertain();
+		if (response.ok !== true) {
 			// Recognized control refusals are decisions; anything else keeps its
 			// uncertain error contract (the steer may or may not have landed).
-			const code = response.error?.code;
+			if (!isReceiptRefusal(response)) throw uncertain();
+			const code = stableErrorCode(recordOf(response.error)?.code);
 			if (
 				code &&
 				[
@@ -785,18 +872,77 @@ export class BrokerSessionPort implements SessionPort {
 					"session_not_found",
 				].includes(code)
 			)
-				throw new GjcCliError("gjc sdk turn.steer refused acceptance", 0, "", { code, refused: true });
+				throw new GjcCliError("gjc sdk turn.steer refused acceptance", 0, "", {
+					...recordOf(response.error),
+					code,
+					refused: true,
+				});
 			throw relayFailure("turn.steer", response);
 		}
+		if (response.error !== undefined || response.page !== undefined) throw uncertain();
 		const body = workerRecord(response.result);
+		if (
+			!body ||
+			Object.keys(body).some(
+				(key) => !["accepted", "status", "clientRef", "commandId", "turnId", "acceptedAt", "terminalAt", "error", "ok"].includes(key),
+			) ||
+			(body.ok !== undefined && body.ok !== true) ||
+			((body.commandId !== undefined || body.turnId !== undefined) &&
+				![body.commandId, body.turnId].every(
+					(value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value,
+				)) ||
+			[body.acceptedAt, body.terminalAt].some(
+				(value) => value !== undefined &&
+					(typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 8_640_000_000_000_000),
+			) ||
+			(typeof body.acceptedAt === "number" && typeof body.terminalAt === "number" && body.terminalAt < body.acceptedAt)
+		)
+			throw uncertain();
 		// Synthetic negative receipts are not authoritative control rejections.
-		if (body?.clientRef !== input.clientRef)
-			throw new GjcCliError("gjc sdk turn.steer identity mismatch", 0, "", { code: "receipt_identity_mismatch" });
-		if (body?.clientRef === input.clientRef && body.accepted === false && body.status === "rejected") {
+		if (body.clientRef !== input.clientRef) throw uncertain();
+		if (body.accepted === false && body.status === "rejected") {
+			if (!isReceiptRefusal({ ok: false, error: body.error })) throw uncertain();
 			throw new GjcCliError("gjc sdk turn.steer rejected acceptance", 0, "", { code: "steer_refused", refused: true });
 		}
-		if (!isSteerAccepted(body))
-			throw new GjcCliError("gjc sdk turn.steer acceptance unavailable", 0, "", { code: "receipt_identity_mismatch" });
+		if (body.error !== undefined || body.terminalAt !== undefined || !isSteerAccepted(body))
+			throw uncertain();
+	}
+
+	async lookupSteerStatus(input: SessionSteerStatusInput): Promise<SessionSteerStatusResult> {
+		this.#assertOwned(input);
+		// Q31 trims its selector. Refuse noncanonical input rather than querying a
+		// different reference and attributing that answer to the original control.
+		if (
+			typeof input.clientRef !== "string" ||
+			input.clientRef.length === 0 ||
+			input.clientRef.length > 128 ||
+			input.clientRef.trim() !== input.clientRef
+		)
+			throw new OpRefError("steer clientRef must be a canonical non-empty string of at most 128 characters");
+		try {
+			const relay =
+				input.relay ?? (await this.attachTail({ sessionId: input.sessionId, brokerGeneration: 0, repo: input.repo }));
+			let result: SessionSteerStatusResult;
+			try {
+				this.#assertOwned(input);
+				if (relay.sessionId !== input.sessionId) {
+					result = { status: "unavailable", clientRef: input.clientRef, code: "identity_mismatch" };
+				} else {
+					const response = await relay.query("turn.steer_status", { clientRef: input.clientRef });
+					this.#assertOwned(input);
+					result = parseSteerStatus(input.clientRef, response);
+				}
+			} finally {
+				if (!input.relay) await relay.close();
+			}
+			this.#assertOwned(input);
+			return result;
+		} catch (error) {
+			// Failed awaits must not conceal a concurrent ownership/authority loss.
+			this.#assertOwned(input);
+			if (error instanceof BrokerAuthorityError) throw error;
+			return { status: "unavailable", clientRef: input.clientRef, code: "transport_error" };
+		}
 	}
 
 	async setModel(input: {
@@ -861,7 +1007,7 @@ export class BrokerSessionPort implements SessionPort {
 		this.#database.assertBrokerAuthority(this.#authority);
 		const response = await input.relay.query("turn.result", { kind: "prompt", clientRef: input.opRef });
 		this.#database.assertBrokerAuthority(this.#authority);
-		if (!response.ok) throw relayFailure("turn.result", response);
+		if (response.ok !== true) throw relayFailure("turn.result", response);
 		const status = recordOf(response.result) ?? {};
 		const raw = typeof status.status === "string" ? status.status : "unknown";
 		return parseStatusReport({
@@ -937,17 +1083,34 @@ export class BrokerSessionPort implements SessionPort {
 			["sdk", "session", "raw", "query", input.sessionId, "--query", "runtime.jobs.list", "--json-input", "{}"],
 			{ timeoutMs: 10_000 },
 		);
-		return parseRunningJobs(result.stdout);
+		return parseRunningJobs(result);
 	}
 
 	async close(input: { sessionId: string; repo: string }): Promise<void> {
-		this.#assertOwned(input);
+		const { sessionId, repo } = input;
+		const owned = this.#database.assertOwnedSession(sessionId, repo, this.#authority);
+		const assertCurrent = () => {
+			const current = this.#database.assertOwnedSession(sessionId, repo, this.#authority);
+			const binding = this.#database.getSessionRecord(owned.originKey);
+			if (
+				current.originKey !== owned.originKey ||
+				current.epoch !== owned.epoch ||
+				current.repo !== owned.repo ||
+				binding?.sessionId !== sessionId ||
+				binding.epoch !== owned.epoch
+			)
+				throw new BrokerAuthorityError("unowned_session");
+		};
+		assertCurrent();
 		assertControlAllowed("session.close", { operatorApproval: true });
 		// Lifecycle op: the per-session `control` route prohibits it for the
 		// daemon CLI (adapter_operation_prohibited on gjc 0.16.x); only the
 		// `global` route carries it, like session.create and session.delete.
-		parseEnvelope(
-			await this.#cli(
+		// A clock-derived key can replay a historical success on a later call.
+		// This identity belongs only to this invocation; failures remain unknown,
+		// not permission for a caller to retry or replace an uncertain attempt.
+		const requestKey = `gw-close-${randomUUID()}`;
+		const response = await this.#cli(
 				[
 					"sdk",
 					"session",
@@ -956,14 +1119,34 @@ export class BrokerSessionPort implements SessionPort {
 					"--op",
 					"session.close",
 					"--idempotency-key",
-					`gw-close-${this.#instanceId}-${input.sessionId}-${this.#now()}`,
+					requestKey,
 					"--json-input",
-					JSON.stringify({ sessionId: input.sessionId }),
+					JSON.stringify({ sessionId }),
 				],
 				{ timeoutMs: 30_000 },
-			),
-			"session.close",
-		);
+			);
+		assertCurrent();
+		parseEnvelope<unknown>(response, "session.close");
+		const envelope = recordOf(JSON.parse(response.stdout));
+		const result = recordOf(envelope?.result);
+		// GJC v0.18.7 lifecycle service/CLI projects ordinary waitForClose
+		// success as {ok:true, operation:"session.close", result:{sessionId,note?}}.
+		// Reject visible alternate/replay/uncertainty evidence. The upstream
+		// projection can discard metadata; this cannot recover hidden evidence
+		// or supply a historical endpoint-incarnation fence absent from input.
+		if (
+			!envelope ||
+			envelope.ok !== true ||
+			envelope.operation !== "session.close" ||
+			Object.keys(envelope).some((key) => !["ok", "operation", "result"].includes(key)) ||
+			!result ||
+			result.sessionId !== sessionId ||
+			Object.keys(result).some((key) => key !== "sessionId" && key !== "note") ||
+			(Object.hasOwn(result, "note") && typeof result.note !== "string")
+		)
+			throw new GjcCliError("session.close ordinary host closure is unproven", 0, "", {
+				code: "terminal_uncertain",
+			});
 	}
 
 	async fetchAssistantSince(input: {
@@ -1250,10 +1433,7 @@ export class BrokerSessionPort implements SessionPort {
 				exitCode: 0,
 				stdout: JSON.stringify({
 					...(kind === "query" ? { type: "query_response" } : {}),
-					ok: response.ok,
-					...(response.result === undefined ? {} : { result: response.result }),
-					...(response.page === undefined ? {} : { page: response.page }),
-					...(response.ok ? {} : { error: response.error ?? {} }),
+					...response,
 				}),
 				stderr: "",
 			};
@@ -1292,17 +1472,66 @@ async function lastAssistant(sdk: SdkTransport): Promise<LastAssistantResult> {
  * `running` matters to a caller about to end the host. Anything unparseable
  * throws: an unreadable job list is not an empty one.
  */
-export function parseRunningJobs(stdout: string): readonly RunningHostJob[] {
-	const envelope = JSON.parse(stdout) as { ok?: unknown; page?: { items?: unknown } };
-	const items = envelope.ok === true ? envelope.page?.items : undefined;
-	const running = Array.isArray(items) ? (recordOf(items[0])?.running as unknown) : undefined;
-	if (!Array.isArray(running)) throw new Error("runtime.jobs.list returned no running-job list");
+export function parseRunningJobs(response: CliResult): readonly RunningHostJob[] {
+	if (response.exitCode !== 0) throw new Error("runtime.jobs.list transport failed");
+	const envelope = recordOf(JSON.parse(response.stdout));
+	const page = recordOf(envelope?.page);
+	if (
+		!envelope ||
+		!validReceiptEnvelope(envelope, "query", "runtime.jobs.list") ||
+		envelope.ok !== true ||
+		envelope.error !== undefined ||
+		envelope.result !== undefined ||
+		!page ||
+		Object.keys(page).some((key) => !["items", "complete", "revision", "preview"].includes(key)) ||
+		page.complete !== true ||
+		(page.preview !== undefined && page.preview !== false) ||
+		(page.revision !== undefined && typeof page.revision !== "string") ||
+		!Array.isArray(page.items) ||
+		page.items.length !== 1
+	)
+		throw new Error("runtime.jobs.list returned incomplete or invalid evidence");
+	const snapshot = recordOf(page.items[0]);
+	const running = snapshot?.running;
+	if (
+		!snapshot ||
+		Object.keys(snapshot).some((key) => !["running", "recent", "delivery"].includes(key)) ||
+		(snapshot.recent !== undefined && !Array.isArray(snapshot.recent)) ||
+		(snapshot.delivery !== undefined && !recordOf(snapshot.delivery)) ||
+		!Array.isArray(running)
+	)
+		throw new Error("runtime.jobs.list returned no running-job list");
 	return running.map((entry) => {
-		const job = recordOf(entry) ?? {};
+		const job = recordOf(entry);
+		// Session snapshots use `type`; public runtime job projections use
+		// `kind`. Neither malformed entries nor unknown identities mean empty.
+		if (
+			!job ||
+			typeof job.id !== "string" ||
+			job.id.trim().length === 0 ||
+			typeof (job.type ?? job.kind) !== "string" ||
+			(job.type ?? job.kind) === "" ||
+			(job.type !== undefined && job.kind !== undefined && job.type !== job.kind) ||
+			typeof job.label !== "string" ||
+			(job.status !== undefined && job.status !== "running") ||
+			(job.startTime !== undefined && (typeof job.startTime !== "number" || !Number.isFinite(job.startTime))) ||
+			(job.endTime !== undefined && (typeof job.endTime !== "number" || !Number.isFinite(job.endTime))) ||
+			(job.metadata !== undefined && !recordOf(job.metadata)) ||
+			(job.generation !== undefined && (typeof job.generation !== "string" || job.generation.length === 0)) ||
+			(job.backgrounded !== undefined && typeof job.backgrounded !== "boolean") ||
+			(job.foldReason !== undefined && typeof job.foldReason !== "string") ||
+			(job.deliveryState !== undefined && (typeof job.deliveryState !== "string" ||
+				!["pending", "delivered", "failed-visible"].includes(job.deliveryState))) ||
+			Object.keys(job).some((key) => ![
+				"id", "type", "kind", "label", "status", "startTime", "endTime", "metadata",
+				"generation", "backgrounded", "foldReason", "deliveryState",
+			].includes(key))
+		)
+			throw new Error("runtime.jobs.list returned an invalid running job");
 		return {
-			id: typeof job.id === "string" ? job.id : "unknown",
-			type: typeof job.type === "string" ? job.type : "unknown",
-			label: typeof job.label === "string" ? job.label : "",
+			id: job.id,
+			type: (job.type ?? job.kind) as string,
+			label: job.label,
 		};
 	});
 }
@@ -1349,8 +1578,22 @@ export function parseWorkerOutputResponse(
 		return { status: "absent", code: "transport_error" };
 	}
 	if (response.exitCode !== 0) return { status: "absent", code: "transport_error" };
+	if (
+		!envelope ||
+		!validReceiptEnvelope(envelope, "query", "turn.result") ||
+		envelope.error !== undefined ||
+		envelope.page !== undefined
+	)
+		return { status: "unavailable", code: "invalid_evidence" };
 	const result = workerRecord(envelope?.result);
 	if (envelope?.ok !== true || !result) return { status: "unavailable", code: "invalid_evidence" };
+	if (
+		Object.keys(result).some((key) => ![
+			"status", "kind", "clientRef", "commandId", "turnId", "acceptedAt", "startedAt",
+			"terminalAt", "receiptState", "outcome", "content", "textSummary",
+		].includes(key))
+	)
+		return { status: "unavailable", code: "invalid_evidence" };
 	if (result.status === "unknown") return { status: "absent", code: "output_pending" };
 	if (result.kind !== "prompt" || result.clientRef !== input.opRef)
 		return { status: "unavailable", code: "identity_mismatch" };
@@ -1380,6 +1623,17 @@ export function parseWorkerOutputResponse(
 	)
 		return { status: "unavailable", code: "invalid_evidence" };
 	const content = workerRecord(result.content);
+	const outcome = workerRecord(result.outcome);
+	if (
+		result.outcome !== undefined &&
+		(!outcome ||
+			outcome.kind !== "stopped" ||
+			typeof outcome.reason !== "string" ||
+			!["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"].includes(outcome.reason) ||
+			(outcome.provenance !== "agent" && outcome.provenance !== "client_cancel") ||
+			Object.keys(outcome).some((key) => !["kind", "reason", "provenance"].includes(key)))
+	)
+		return { status: "unavailable", code: "invalid_evidence" };
 	if (!content) {
 		if (result.content !== undefined || result.textSummary !== undefined)
 			return { status: "unavailable", code: "invalid_evidence" };
@@ -1394,10 +1648,12 @@ export function parseWorkerOutputResponse(
 	if (content.truncated === true) return { status: "unavailable", code: "incomplete_body" };
 	if (
 		content.version !== 1 ||
+		Object.keys(content).some((key) => !["version", "type", "text", "byteLength", "truncated"].includes(key)) ||
 		content.type !== "text" ||
 		typeof content.text !== "string" ||
 		content.truncated !== false ||
 		content.byteLength !== new TextEncoder().encode(content.text).length ||
+		(content.byteLength as number) > 16_384 ||
 		(result.receiptState !== undefined && result.receiptState !== "present")
 	)
 		return { status: "unavailable", code: "invalid_evidence" };
@@ -1418,6 +1674,87 @@ export function parseWorkerOutputResponse(
 			contentVersion: 1,
 			byteLength: content.byteLength as number,
 		},
+	};
+}
+
+/**
+ * GJC 0.18.7 Q31, not prompt turn.result. Missing records can omit clientRef;
+ * that unknown answer is correlated by the exact query, never acceptance proof.
+ */
+function parseSteerStatus(clientRef: string, response: RelayResponse): SessionSteerStatusResult {
+	const unavailable = (
+		code: Extract<SessionSteerStatusResult, { status: "unavailable" }>["code"],
+		errorCode?: string,
+	): SessionSteerStatusResult => ({
+		status: "unavailable",
+		clientRef,
+		code,
+		...(errorCode === undefined ? {} : { errorCode }),
+	});
+	if (!validReceiptEnvelope(response, "query", "turn.steer_status")) return unavailable("invalid_evidence");
+	if (response.ok === false) {
+		if (!isReceiptRefusal(response)) return unavailable("invalid_evidence");
+		const code = stableErrorCode(recordOf(response.error)?.code);
+		return unavailable(code === "unavailable" ? "query_unavailable" : "query_refused", code);
+	}
+	if (response.ok !== true || response.error !== undefined || response.page !== undefined)
+		return unavailable("invalid_evidence");
+	const body = recordOf(response.result);
+	if (!body) return unavailable("invalid_evidence");
+	if (body.clientRef !== undefined && body.clientRef !== clientRef) return unavailable("identity_mismatch");
+	if (body.status === "unknown") {
+		if (Object.keys(body).some((key) => key !== "clientRef" && key !== "status"))
+			return unavailable("invalid_evidence");
+		return { status: "unknown", clientRef };
+	}
+	if (body.clientRef !== clientRef) return unavailable("identity_mismatch");
+	if (body.status !== "accepted" && body.status !== "rejected" && body.status !== "uncertain")
+		return unavailable("invalid_evidence");
+	if (
+		Object.keys(body).some(
+			(key) => !["clientRef", "status", "commandId", "turnId", "acceptedAt", "terminalAt", "error", "accepted", "ok"].includes(key),
+		) ||
+		(body.ok !== undefined && body.ok !== true) ||
+		(body.accepted !== undefined && body.accepted !== (body.status === "accepted")) ||
+		(body.status === "accepted" && !isSteerAccepted(body))
+	)
+		return unavailable("invalid_evidence");
+	// These SDK identities are not selectors supplied by this seam. Reject torn
+	// pairs, but do not invent prompt/task identity from them.
+	if (
+		(body.commandId !== undefined || body.turnId !== undefined) &&
+		![body.commandId, body.turnId].every(
+			(value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value,
+		)
+	)
+		return unavailable("invalid_evidence");
+	const timestamp = (value: unknown): value is number =>
+		typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= 8_640_000_000_000_000;
+	if (
+		!timestamp(body.acceptedAt) ||
+		(body.terminalAt !== undefined && (!timestamp(body.terminalAt) || body.terminalAt < body.acceptedAt)) ||
+		(body.status === "accepted" && (body.terminalAt !== undefined || body.error !== undefined))
+	)
+		return unavailable("invalid_evidence");
+	const error = body.error === undefined ? undefined : recordOf(body.error);
+	const errorCode = stableErrorCode(error?.code);
+	// Q31's nested error is exactly code/message, not a direct-control error.
+	// Dropping extra certainty/acceptance fields would turn uncertainty into a
+	// definitive refusal and let the manager dispatch the next control.
+	if (
+		body.error !== undefined &&
+		(!error ||
+			!errorCode ||
+			typeof error.message !== "string" ||
+			Object.keys(error).some((key) => key !== "code" && key !== "message"))
+	)
+		return unavailable("invalid_evidence");
+	return {
+		status: body.status,
+		clientRef,
+		acceptedAt: body.acceptedAt,
+		...(body.terminalAt === undefined ? {} : { terminalAt: body.terminalAt as number }),
+		...(errorCode === undefined ? {} : { errorCode }),
 	};
 }
 
@@ -1637,6 +1974,39 @@ export function isSessionBusy(error: unknown): boolean {
 function relayFailure(operation: string, response: RelayResponse): GjcCliError {
 	const details = response.error ?? {};
 	return new GjcCliError(`gjc sdk ${operation} reported failure: ${JSON.stringify(details)}`, 0, "", details);
+}
+
+/** SDK routing metadata is legitimate, but never overrides receipt evidence. */
+function validReceiptEnvelope(response: RelayResponse, kind: "control" | "query", name: string): boolean {
+	return (
+		recordOf(response) !== undefined &&
+		Object.keys(response).every((key) => ["type", "id", "operation", "query", "ok", "result", "page", "error"].includes(key)) &&
+		(response.type === undefined || response.type === `${kind}_response`) &&
+		(response.id === undefined || (typeof response.id === "string" && response.id.length > 0)) &&
+		(response.operation === undefined || (kind === "control" && response.operation === name)) &&
+		(response.query === undefined || (kind === "query" && response.query === name))
+	);
+}
+
+function isReceiptRefusal(response: RelayResponse): boolean {
+	const error = recordOf(response.error);
+	return (
+		response.ok === false &&
+		response.result === undefined &&
+		response.page === undefined &&
+		error !== undefined &&
+		stableErrorCode(error.code) !== undefined &&
+		typeof error.message === "string" &&
+		Object.keys(error).every((key) => ["code", "message", "outcomeCertainty"].includes(key)) &&
+		(error.outcomeCertainty === undefined || error.outcomeCertainty === "not-applied")
+	);
+}
+
+function uncertainPromptReceipt(): GjcCliError {
+	return new GjcCliError("gjc sdk turn.prompt acceptance could not be proven", 0, "", {
+		code: "prompt_receipt_uncertain",
+		outcomeCertainty: "unknown",
+	});
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {

@@ -5,8 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { GatewayDatabase } from "../src/store/db";
 
+/** Subtract only v33 fixture objects before rewinding receipts; missing objects are fixture errors. */
+function dropV33FixtureSchema(database: Database): void {
+	database.exec("DROP TABLE work_task_sources; DROP TABLE work_controls; DROP TABLE work_tasks;");
+}
+
 /** Remove broker-authority and v22-v24 schema objects before replaying historical DDL; missing objects are fixture errors. */
 function dropBrokerAuthoritySchema(database: Database): void {
+	dropV33FixtureSchema(database);
 	for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 		for (const action of ["update", "delete"]) database.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 	for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -36,7 +42,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await GatewayDatabase.open(path);
-		expect(database.schemaVersion).toBe(32);
+		expect(database.schemaVersion).toBe(33);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -60,6 +66,132 @@ test("migrates a migration-001 database to the latest schema", async () => {
 			migrated.query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'instance_id'").get()?.value,
 		).toBeString();
 		migrated.close();
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("upgrades constructed historical schema 32 to 33 and preserves rows and receipts across reopen", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-migration-v32-"));
+	const path = join(directory, "gateway.db");
+	try {
+		// Constructed schema-equivalent fixture, NOT a production snapshot.
+		// Provenance: 63ba579a8f9c9bddd56f7357b619c0457ee7e3b7's migrate()
+		// through v32 equals the candidate's historical prefix. That base has no
+		// Firstmate tables; v33 only adds these three tables, their indexes and receipt.
+		const current = await GatewayDatabase.open(path);
+		current.putSession("discord/channel/v32", "session-v32");
+		current.conversationModelSet("discord/channel/v32", { preset: "gpt-heavy" }, "owner-v32");
+		current.putLaneJob({
+			jobId: "job-v32",
+			laneKey: "work/task/v32",
+			state: "running",
+			createdAt: "2026-09-01T00:00:00.000Z",
+			updatedAt: "2026-09-01T00:01:00.000Z",
+			lane: { branch: "feat/v32", worktreePath: "/tmp/v32" },
+			json: '{"schemaVersion":1,"opRef":"op-v32","sessionId":"session-v32","epoch":3}',
+		});
+		current.memoryIntentCreate({
+			id: "memory-v32",
+			kind: "daily_capture",
+			payloadJson: '{"sessionId":"session-v32","text":"retain me"}',
+		});
+		current.memoryIntentBeginAttempt("memory-v32");
+		current.memoryIntentQuarantine("memory-v32", "preserve diagnostic");
+		expect(current.deliveryCreate({
+			id: "delivery-v32",
+			turnId: "op-v32",
+			originKey: "discord/channel/v32",
+			payloadJson: '{"text":"original result","sessionId":"session-v32"}',
+		})).toBe(true);
+		current.deliveryUpdate("delivery-v32", "pending", 2, "unconfirmed acknowledgement");
+		current.close();
+
+		type SchemaRow = { type: string; name: string; tbl_name: string; sql: string | null };
+		type Receipt = { version: number; applied_at: string };
+		const schema = (database: Database) =>
+			database.query<SchemaRow, []>("SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name").all();
+		const receipts = (database: Database) =>
+			database.query<Receipt, []>("SELECT version, applied_at FROM schema_migrations ORDER BY version").all();
+		const rows = (database: Database) =>
+			["sessions", "conversation_model", "lane_jobs", "memory_intents", "deliveries", "meta"].map((table) => ({
+				table,
+				rows: database.query(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+			}));
+		const firstmateTables = ["work_tasks", "work_controls", "work_task_sources"];
+		const firstmateIndexes = ["work_tasks_pending", "work_tasks_obligation", "work_controls_pending"];
+		const raw = new Database(path);
+		try {
+			const originalSchema = schema(raw);
+			const historicalSchema = originalSchema.filter((row) => !firstmateTables.includes(row.tbl_name));
+			const firstmateSchema = originalSchema.filter((row) => firstmateTables.includes(row.tbl_name));
+			const originalRows = rows(raw);
+			for (const seeded of originalRows) expect(seeded.rows.length).toBeGreaterThan(0);
+			const historicalReceipts = receipts(raw).filter((row) => row.version <= 32);
+			expect(historicalReceipts.map((row) => row.version)).toEqual(
+				Array.from({ length: 32 }, (_, index) => index + 1),
+			);
+			for (const table of firstmateTables)
+				expect(raw.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n).toBe(0);
+			raw.transaction(() => {
+				dropV33FixtureSchema(raw);
+				expect(raw.query("DELETE FROM schema_migrations WHERE version = 33").run().changes).toBe(1);
+			})();
+
+			expect(receipts(raw)).toEqual(historicalReceipts);
+			expect(raw.query<{ version: number }, []>(
+				"SELECT MAX(version) AS version FROM schema_migrations",
+			).get()?.version).toBe(32);
+			expect(schema(raw)).toEqual(historicalSchema);
+			expect(rows(raw)).toEqual(originalRows);
+			const boundaryNames = schema(raw).map((row) => row.name);
+			expect(boundaryNames).toContain("conversation_context_retention");
+			for (const name of [...firstmateTables, ...firstmateIndexes]) expect(boundaryNames).not.toContain(name);
+
+			let upgradedReceipts: Receipt[] | undefined;
+			for (const phase of ["upgrade", "reopen"]) {
+				const upgraded = await GatewayDatabase.open(path);
+				expect(upgraded.schemaVersion).toBe(33);
+				upgraded.close();
+				const observedReceipts = receipts(raw);
+				expect(observedReceipts.filter((row) => row.version <= 32)).toEqual(historicalReceipts);
+				expect(observedReceipts.map((row) => row.version)).toEqual(
+					Array.from({ length: 33 }, (_, index) => index + 1),
+				);
+				expect(observedReceipts.filter((row) => row.version === 33)).toHaveLength(1);
+				expect(observedReceipts[32]?.applied_at).toBeString();
+				if (phase === "upgrade") upgradedReceipts = observedReceipts;
+				else {
+					if (upgradedReceipts === undefined) throw new Error("Upgrade receipt snapshot is missing");
+					expect(observedReceipts).toEqual(upgradedReceipts);
+				}
+				expect(schema(raw)).toEqual(originalSchema);
+				expect(schema(raw).filter((row) => firstmateTables.includes(row.tbl_name))).toEqual(firstmateSchema);
+				expect(rows(raw)).toEqual(originalRows);
+				const objects = schema(raw);
+				for (const name of firstmateTables)
+					expect(objects.find((row) => row.name === name)?.type).toBe("table");
+				for (const name of firstmateIndexes)
+					expect(objects.find((row) => row.name === name)?.type).toBe("index");
+				const tableSql = (name: string) => objects.find((row) => row.name === name)?.sql;
+				for (const table of firstmateTables) {
+					expect(raw.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n).toBe(0);
+					expect(tableSql(table)).toContain("CHECK(json_valid(record_json))");
+				}
+				expect(tableSql("work_tasks")).toContain("job_id TEXT NOT NULL UNIQUE");
+				expect(tableSql("work_tasks")).toContain("op_ref TEXT NOT NULL UNIQUE");
+				expect(tableSql("work_tasks")).toContain("CHECK((surface_phase = 'bound') = (thread_origin_key IS NOT NULL))");
+				for (const table of ["work_controls", "work_task_sources"]) {
+					expect(tableSql(table)).toContain("REFERENCES work_tasks(task_id)");
+					expect(tableSql(table)).toContain("UNIQUE(task_id, sequence)");
+					expect(tableSql(table)).toContain("CHECK(typeof(sequence) = 'integer' AND sequence > 0)");
+				}
+				expect(tableSql("work_task_sources")).toContain("delivery_id TEXT UNIQUE REFERENCES deliveries(delivery_id)");
+				expect(tableSql("work_controls")).toContain("event_id TEXT NOT NULL UNIQUE");
+			}
+		} finally {
+			raw.close();
+		}
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -99,7 +231,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 
 		expect(upgraded.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
@@ -147,7 +279,7 @@ DELETE FROM schema_migrations WHERE version > 12;
 		v12.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 
 		expect(upgraded.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
@@ -194,7 +326,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 
 		const rows = upgraded.monitorRows();
 		expect(rows).toHaveLength(1);
@@ -250,7 +382,7 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await GatewayDatabase.open(path);
-	expect(upgraded.schemaVersion).toBe(32);
+	expect(upgraded.schemaVersion).toBe(33);
 
 	upgraded.conversationModelSet("discord:c1", { preset: "gpt-heavy" }, "owner");
 	expect(upgraded.conversationModelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
@@ -262,7 +394,7 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await GatewayDatabase.open(path);
-		expect(latest.schemaVersion).toBe(32);
+		expect(latest.schemaVersion).toBe(33);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
 		// v17 ALTERs + the v18 ALTERs), then seed the shapes an upgrade meets.
@@ -301,7 +433,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 
 		const after = new Database(path, { readonly: true });
 		const columns = after
@@ -407,6 +539,7 @@ test("upgrades schema 23 to the latest: overlap column, skipped stage, rows and 
 		(await GatewayDatabase.open(path)).close();
 		// Rebuild the deployed v23 shape: no overlap column, no skipped stage/skipped_by.
 		const raw = new Database(path);
+		dropV33FixtureSchema(raw);
 		raw.exec(`
 DROP TABLE monitor_events;
 DROP TABLE lane_reports;
@@ -421,7 +554,7 @@ DELETE FROM schema_migrations WHERE version > 23;
 `);
 		raw.close();
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 
 		expect(upgraded.monitorRows()[0]).toMatchObject({ monitor_id: "m1", overlap: "queue" });
 		expect(upgraded.monitorEventRows("m1")[0]).toMatchObject({
@@ -458,13 +591,14 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		// and `agents_md_digest` were added to it is in: the version row is
 		// recorded, the columns are missing, and no migration below 31 adds them.
 		const raw = new Database(path);
+		dropV33FixtureSchema(raw);
 		raw.exec(
 			"ALTER TABLE sessions DROP COLUMN agents_md_epoch; ALTER TABLE sessions DROP COLUMN agents_md_digest; DELETE FROM schema_migrations WHERE version > 30;",
 		);
 		raw.close();
 
 		const upgraded = await GatewayDatabase.open(path);
-		expect(upgraded.schemaVersion).toBe(32);
+		expect(upgraded.schemaVersion).toBe(33);
 		upgraded.close();
 
 		const after = new Database(path, { readonly: true });

@@ -3,7 +3,18 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { OpsCycleResult } from "@gajae-gateway/protocol";
+import {
+	type OpsCycleResult,
+	type ChatSendResult,
+	type WorkTaskProjection,
+	LOOPBACK_ORIGIN,
+	WORK_TASK_CONTEXT_MAX_BYTES,
+	WORK_TASK_CONTEXT_MAX_RECORDS,
+	WORK_TASK_CONTEXT_MAX_TASKS,
+	WORK_TASK_EVENT_ID_MAX_BYTES,
+	WORK_TASK_TEXT_MAX_BYTES,
+	WORK_TASK_TITLE_MAX_LENGTH,
+} from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import {
 	CLI_USAGE,
@@ -898,25 +909,95 @@ describe("usage exits the process instead of blocking", () => {
 	}, 30_000);
 });
 
+describe("chat result routing", () => {
+	async function run(result: ChatSendResult) {
+		const lines: string[] = [];
+		const errors: string[] = [];
+		let handler: Parameters<GajaewayClient["onChatMessage"]>[0] | undefined;
+		let closed = false;
+		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
+		client.onChatMessage = (callback) => {
+			handler = callback;
+			return () => {};
+		};
+		client.chatSend = async () => {
+			if (result.route !== "work_task" && result.turnId !== null) {
+				const turnId = result.turnId;
+				setTimeout(() => handler?.({
+					turnId, origin: LOOPBACK_ORIGIN, role: "assistant", text: "persona final", final: true,
+				}), 0);
+			}
+			return result;
+		};
+		client.close = async () => { closed = true; };
+		const connect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(client);
+		const stdin = spyOn(Bun.stdin, "stream").mockReturnValue(new ReadableStream<Uint8Array<ArrayBuffer>>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("inspect\n/quit\n"));
+				controller.close();
+			},
+		}));
+		const stdout = spyOn(process.stdout, "write").mockReturnValue(true);
+		const log = spyOn(console, "log").mockImplementation((line) => { lines.push(String(line)); });
+		const error = spyOn(console, "error").mockImplementation((line) => { errors.push(String(line)); });
+		try {
+			await main(["--socket", "/test/chat.sock", "chat"]);
+			return { lines, errors, closed };
+		} finally {
+			connect.mockRestore();
+			stdin.mockRestore();
+			stdout.mockRestore();
+			log.mockRestore();
+			error.mockRestore();
+		}
+	}
+
+	for (const delivery of ["pending", "accepted", "held", "refused"] as const) {
+		test(`mapped ${delivery} remains a control projection without waiting for a persona turn`, async () => {
+			const result = {
+				route: "work_task", taskId: "task-original", controlId: "control-original",
+				opRef: "gw-original", acceptance: "durable", delivery,
+			} satisfies ChatSendResult;
+			expect(await run(result)).toEqual({ lines: [JSON.stringify(result)], errors: [], closed: true });
+		});
+	}
+
+	test("persona results still wait for final delivery or report non-engagement", async () => {
+		expect(await run({ route: "persona", turnId: "persona-turn", engaged: true })).toEqual({
+			lines: ["persona final"], errors: [], closed: true,
+		});
+		expect(await run({ turnId: null, engaged: false })).toEqual({
+			lines: [], errors: ["(message was not engaged)"], closed: true,
+		});
+	});
+});
+
 describe("work operator commands", () => {
-	async function run(args: string[], result: unknown, sessionId?: string) {
+	async function run(args: string[], result: unknown, sessionId?: string, connectFailure?: Error) {
 		const previousSessionId = process.env.GJC_SESSION_ID;
 		if (sessionId === undefined) delete process.env.GJC_SESSION_ID;
 		else process.env.GJC_SESSION_ID = sessionId;
 		const requests: Array<{ verb: string; params: unknown }> = [];
 		const lines: string[] = [];
+		const linesAtRequest: string[][] = [];
+		const linesAtConnect: string[][] = [];
 		const errors: string[] = [];
 		let closed = false;
 		const client: GajaewayClient = Object.create(GajaewayClient.prototype);
 		client.request = async <T>(verb: string, params?: unknown): Promise<T> => {
-			requests.push({ verb, params });
+			requests.push({ verb, params: params === undefined ? undefined : JSON.parse(JSON.stringify(params)) });
+			linesAtRequest.push([...lines]);
 			if (result instanceof Error) throw result;
 			return result as T;
 		};
 		client.close = async () => {
 			closed = true;
 		};
-		const connect = spyOn(GajaewayClient, "connectSocket").mockResolvedValue(client);
+		const connect = spyOn(GajaewayClient, "connectSocket").mockImplementation(async () => {
+			linesAtConnect.push([...lines]);
+			if (connectFailure) throw connectFailure;
+			return client;
+		});
 		const log = spyOn(console, "log").mockImplementation((line) => {
 			lines.push(String(line));
 		});
@@ -925,10 +1006,13 @@ describe("work operator commands", () => {
 		});
 		const previousExit = process.exitCode;
 		try {
+			process.exitCode = 0;
 			await main(["--socket", "/test/work.sock", "work", ...args]);
 			return {
 				requests,
 				lines,
+				linesAtRequest,
+				linesAtConnect,
 				errors,
 				closed,
 				connections: connect.mock.calls.length,
@@ -944,6 +1028,328 @@ describe("work operator commands", () => {
 			else process.env.GJC_SESSION_ID = previousSessionId;
 		}
 	}
+
+	const taskId = "1a493f21-a00f-45ab-93b3-6727cc113245";
+	const name = `fm-${taskId}`;
+	const opRef = "gw-work-original-01";
+	const threadOrigin = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "1556589606403842128",
+		parentId: "1511673764574793798",
+		boundaryId: "1510336487894286436",
+	};
+	const parentOrigin = {
+		platform: "discord",
+		kind: "channel",
+		conversationId: threadOrigin.parentId,
+		boundaryId: threadOrigin.boundaryId,
+	};
+	const taskFlags = ["--task-id", taskId, "--kind", "read_only", "--thread-origin", JSON.stringify(threadOrigin)];
+	const steerFlags = ["--task-id", taskId, "--expected-op-ref", opRef];
+	const queued = {
+		started: false,
+		accepted: "durable",
+		execution: "pending_surface",
+		taskId,
+		jobId: "job-original",
+		opRef,
+	};
+
+	for (const surface of ["thread", "parent"] as const) {
+		test(`task start serializes ${surface} surface and Unicode context without inventing authority`, async () => {
+			const originFlags = surface === "thread"
+				? ["--thread-origin", JSON.stringify(threadOrigin)]
+				: ["--parent-origin", JSON.stringify(parentOrigin), "--title", "조사 — café"];
+			const output = await run(
+				["start", name, "--task-id", taskId, "--kind", "code_mutating", ...originFlags,
+					"--context", "근거: résumé\n선택된 문맥", "--cwd", "/repo/독립", "--preset", "reliable", "수정 검증"],
+				queued,
+				" caller-session-original ",
+			);
+			expect(output.requests).toEqual([{
+				verb: "work.start",
+				params: {
+					name, text: "수정 검증", cwd: "/repo/독립", model: { preset: "reliable" },
+					callerSessionId: "caller-session-original",
+					task: {
+						taskId, kind: "code_mutating",
+						surface: surface === "thread" ? { threadOrigin } : { parentOrigin, title: "조사 — café" },
+						context: "근거: résumé\n선택된 문맥",
+					},
+				},
+			}]);
+			expect(output.lines).toEqual([`accepted: durable execution=pending_surface task=${taskId} job=job-original op=${opRef}`]);
+			expect(output.lines.join("\n")).not.toMatch(/HELD|started:|session=/);
+			expect(output.errors).toEqual([]);
+			expect(output.exitCode).toBe(0);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	test("task start without a persona hint leaves refusal to the server, not an invented owner identity", async () => {
+		const output = await run(["start", name, ...taskFlags, "inspect"], new Error("caller persona required"));
+		expect(output.requests).toEqual([{
+			verb: "work.start",
+			params: { name, text: "inspect", task: { taskId, kind: "read_only", surface: { threadOrigin } } },
+		}]);
+		expect(output.errors).toEqual(["caller persona required"]);
+		expect(output.exitCode).toBe(1);
+	});
+
+	test("task start distinguishes actual port acceptance from durable pending", async () => {
+		const output = await run(["start", name, ...taskFlags, "inspect"], {
+			started: true, taskId, jobId: "job-original", opRef, sessionKey: "work/task/original", sessionId: "session-original",
+		});
+		expect(output.lines).toEqual([
+			`started: work/task/original session=session-original job=job-original op=${opRef} task=${taskId}`,
+		]);
+		expect(output.requests).toHaveLength(1);
+		expect(output.exitCode).toBe(0);
+	});
+
+	test("task start hold retains original IDs without fake session or acceptance", async () => {
+		const output = await run(["start", name, ...taskFlags, "inspect"], {
+			started: false, held: true, taskId, jobId: "job-original", opRef, state: "awaiting_operator", reason: "surface_unavailable",
+		});
+		expect(output.lines).toEqual([
+			`HELD: surface_unavailable\njob: job-original state: awaiting_operator task=${taskId} op=${opRef}`,
+		]);
+		expect(output.exitCode).toBe(1);
+	});
+
+	for (const delivery of ["pending", "accepted", "refused", "held"] as const) {
+		test(`task steer labels durable ${delivery} independently of task completion`, async () => {
+			const result = {
+				route: "work_task", taskId, controlId: "control-original", opRef, acceptance: "durable",
+				delivery, steered: delivery === "accepted",
+				...(delivery === "accepted" ? { clientRef: "client-original" } : { reason: "receipt_unavailable" }),
+			};
+			const args = ["steer", name, "수정 범위", ...steerFlags, "--event-id", "cli:owner-stable-01", "--kind", "code_mutating"];
+			const first = await run(args, result);
+			const retry = await run(args, result);
+			const request = {
+				verb: "work.steer",
+				params: {
+					name, text: "수정 범위", taskId, expectedOpRef: opRef, eventId: "cli:owner-stable-01", kind: "code_mutating",
+				},
+			};
+			expect(first.requests).toEqual([request]);
+			expect(retry.requests).toEqual([request]);
+			expect(first.lines).toEqual([
+				JSON.stringify({ taskId, expectedOpRef: opRef, eventId: "cli:owner-stable-01" }),
+				JSON.stringify(result),
+			]);
+			expect(first.lines.join("\n")).not.toMatch(/steered:|success|finished|understood/);
+			expect(first.exitCode).toBe(delivery === "held" || delivery === "refused" ? 1 : 0);
+		});
+	}
+
+	test("task steer prints one generated retry identity before a failed request and never resends", async () => {
+		const output = await run(["steer", name, "inspect", ...steerFlags], new Error("lost receipt"));
+		expect(output.lines).toHaveLength(1);
+		const identity = JSON.parse(output.lines[0]);
+		expect(identity).toEqual({ taskId, expectedOpRef: opRef, eventId: expect.stringMatching(/^cli:[0-9a-f-]{36}$/) });
+		expect(output.linesAtConnect).toEqual([output.lines]);
+		expect(output.linesAtRequest).toEqual([output.lines]);
+		expect(output.requests).toEqual([{
+			verb: "work.steer",
+			params: { name, text: "inspect", ...identity },
+		}]);
+		expect(output.errors).toEqual(["lost receipt"]);
+		expect(output.closed).toBe(true);
+		const retry = await run(
+			["steer", name, "inspect", ...steerFlags, "--event-id", identity.eventId],
+			new Error("still unavailable"),
+		);
+		expect(retry.requests).toEqual(output.requests);
+	});
+
+	test("task steer preserves the generated ID even when socket connection fails", async () => {
+		const output = await run(["steer", name, "inspect", ...steerFlags], {}, undefined, new Error("offline"));
+		expect(output.lines).toHaveLength(1);
+		expect(JSON.parse(output.lines[0]).eventId).toMatch(/^cli:[0-9a-f-]{36}$/);
+		expect(output.linesAtConnect).toEqual([output.lines]);
+		expect(output.requests).toEqual([]);
+		expect(output.connections).toBe(1);
+		expect(output.errors).toEqual(["offline"]);
+	});
+
+	test("task steer preserves a bare UUID event ID", async () => {
+		const eventId = "651ca9dc-5d82-43d0-8d2c-80a02c6c1641";
+		const output = await run(["steer", name, "inspect", ...steerFlags, "--event-id", eventId], new Error("unavailable"));
+		expect(output.requests).toEqual([{
+			verb: "work.steer", params: { name, text: "inspect", taskId, expectedOpRef: opRef, eventId },
+		}]);
+	});
+
+	for (const withRef of [false, true]) {
+		test(`task status preserves original identity with expected opRef=${withRef}`, async () => {
+			const result = { jobId: "job-original", state: "awaiting_operator", task: { taskId, opRef, obligation: "held" } };
+			const output = await run(
+				["status", name, "--task-id", taskId, ...(withRef ? ["--expected-op-ref", opRef] : [])],
+				result,
+			);
+			expect(output.requests).toEqual([{
+				verb: "work.status", params: { name, taskId, ...(withRef ? { expectedOpRef: opRef } : {}) },
+			}]);
+			expect(output.lines).toEqual([JSON.stringify(result)]);
+		});
+	}
+
+	test("wrong original opRef refusal is surfaced without fallback or retry", async () => {
+		const output = await run(["status", name, "--task-id", taskId, "--expected-op-ref", "wrong-op"], new Error("opRef mismatch"));
+		expect(output.requests).toEqual([{ verb: "work.status", params: { name, taskId, expectedOpRef: "wrong-op" } }]);
+		expect(output.errors).toEqual(["opRef mismatch"]);
+		expect(output.lines).toEqual([]);
+	});
+
+	for (const [disposition, completeness] of [["held", "unavailable"], ["unchanged", "partial"], ["reconciled", "complete"]] as const) {
+		test(`recover prints original ${disposition}/${completeness} evidence without execution or archive claims`, async () => {
+			const result = {
+				taskId, jobId: "job-original", opRef, sessionId: null, epoch: null, reportId: "report-original",
+				disposition, completeness, execution: "none",
+				...(disposition === "reconciled" ? { supplementalDeliveryId: "supplement-original" } : { reason: "original_output_unretained" }),
+			};
+			const output = await run(["recover", taskId], result);
+			expect(output.requests).toEqual([{ verb: "work.task.recover", params: { taskId } }]);
+			expect(output.lines).toEqual([JSON.stringify(result)]);
+			expect(output.lines.join("\n")).not.toMatch(/success|started|full archive/);
+			expect(output.closed).toBe(true);
+		});
+	}
+
+	const dispositionRequest = {
+		taskId, jobId: "job-original", expectedOpRef: opRef, sessionId: null, epoch: null,
+		cwd: "/original/repo", requestHash: "a".repeat(64), target: { kind: "report", reportId: null },
+		eventId: "cli:owner-disposition", expectedTaskVersion: 3, outcome: "unresolved",
+		reason: "Original evidence cannot be recovered",
+		evidence: { availability: "unavailable", detail: "Operator checked original records", evidenceAt: null },
+	};
+	for (const hint of [undefined, " \t ", "  a7077241-d848-4efa-b802-deaf9df889d0  "]) {
+		test(`disposition forwards exact fences and qualified receipt with caller ${JSON.stringify(hint)}`, async () => {
+			const result = { execution: "none", disposition: "recorded", dispositionId: "disposition-original",
+				sourceId: "disposition-original", deliveryId: null, record: { request: dispositionRequest } };
+			const output = await run(["disposition", "--request", JSON.stringify(dispositionRequest)], result, hint);
+			expect(output.requests).toEqual([{ verb: "work.task.disposition", params: {
+				...dispositionRequest, ...(hint?.trim() ? { callerSessionId: hint.trim() } : {}),
+			} }]);
+			expect(output.lines).toEqual([JSON.stringify(result)]);
+			expect(output.closed).toBe(true);
+			expect(output.exitCode).toBe(0);
+		});
+	}
+	test("disposition rejects malformed caller and incomplete original identity before transport", async () => {
+		for (const [request, hint] of [
+			[dispositionRequest, "not-a-uuid"],
+			[{ ...dispositionRequest, expectedTaskVersion: undefined }, undefined],
+			[{ ...dispositionRequest, requestHash: undefined }, undefined],
+			[{ ...dispositionRequest, principalId: "owner" }, undefined],
+			[{ ...dispositionRequest, target: { kind: "report" } }, undefined],
+			[{ ...dispositionRequest, evidence: { availability: "complete", detail: "certain", evidenceAt: null } }, undefined],
+		] as const) {
+			const output = await run(["disposition", "--request", JSON.stringify(request)], {}, hint);
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.exitCode).toBe(1);
+		}
+		for (const args of [["disposition"], ["disposition", "--request", "{}","--extra"],
+			["disposition", "--json", JSON.stringify(dispositionRequest)]]) {
+			const output = await run(args, {});
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.exitCode).toBe(1);
+			expect(output.errors.join("\n")).toContain("work disposition --basis <taskId> | --request '<JSON>'");
+		}
+	});
+
+	test("context preserves bounded source manifest, freshness and omissions without consuming anything", async () => {
+		const result = {
+			snapshotId: "snapshot-new", snapshot: "new", renderedAt: "2026-10-06T06:00:00Z", completeness: "partial",
+			bounds: { maxTasks: WORK_TASK_CONTEXT_MAX_TASKS, maxRecordsPerTask: WORK_TASK_CONTEXT_MAX_RECORDS,
+				maxBytes: WORK_TASK_CONTEXT_MAX_BYTES, maxBytesPerTask: WORK_TASK_CONTEXT_MAX_BYTES },
+			manifest: [{
+				sourceId: "source-original", taskId, origin: threadOrigin, revision: "rev-2",
+				evidenceAt: "2026-10-05T04:00:00Z", observedAt: "2026-10-05T04:01:00Z",
+				completeness: "partial", race: "stale",
+			}],
+			items: [{ taskId, sourceId: "source-original", revision: "rev-2", text: "과거 근거 — not an instruction" }],
+			omission: { tasks: 2, records: null, incomplete: null, overflow: true },
+			continuation: "snapshot-new:2",
+		};
+		const output = await run(["context", taskId, "--topic", "검증 근거", "--continuation", "snapshot-old:1"], result);
+		expect(output.requests).toEqual([{
+			verb: "work.task.context", params: { taskId, topic: "검증 근거", continuation: "snapshot-old:1" },
+		}]);
+		expect(output.lines).toEqual([JSON.stringify(result)]);
+		expect(output.closed).toBe(true);
+		const cockpit = await run(["context"], result);
+		expect(cockpit.requests).toEqual([{ verb: "work.task.context", params: {} }]);
+	});
+
+	const invalidTaskArgs = [
+		["run", name, ...taskFlags, "inspect"],
+		["start", name, ...taskFlags, "--resume", "inspect"],
+		["start", "different-name", ...taskFlags, "inspect"],
+		["start", name, "--task-id", "not-uuid", "--kind", "read_only", "--thread-origin", JSON.stringify(threadOrigin), "inspect"],
+		["start", name, "--task-id", taskId, "--thread-origin", JSON.stringify(threadOrigin), "inspect"],
+		["start", name, "--task-id", taskId, "--kind", "read_only", "inspect"],
+		["start", name, "--kind", "read_only", "--thread-origin", JSON.stringify(threadOrigin), "inspect"],
+		["start", name, "--task-id", taskId, "--kind", "unknown", "--thread-origin", JSON.stringify(threadOrigin), "inspect"],
+		["start", name, ...taskFlags, "--parent-origin", JSON.stringify(parentOrigin), "inspect"],
+		["start", name, ...taskFlags, "--title", "invalid for thread", "inspect"],
+		["start", name, ...taskFlags, "--kind", "code_mutating", "inspect"],
+		["start", name, ...taskFlags, "--context"],
+		["start", name, ...taskFlags, "--model", "x", "--preset", "y", "inspect"],
+		["start", name, ...taskFlags, "--context", "가".repeat(Math.floor(WORK_TASK_CONTEXT_MAX_BYTES / 3) + 1), "inspect"],
+		["start", name, ...taskFlags, "가".repeat(Math.floor(WORK_TASK_TEXT_MAX_BYTES / 3) + 1)],
+		["start", name, "--task-id", taskId, "--kind", "read_only", "--parent-origin", JSON.stringify(parentOrigin), "--title", "x".repeat(WORK_TASK_TITLE_MAX_LENGTH + 1), "inspect"],
+		...["{", "null", "[]", JSON.stringify({ ...threadOrigin, boundaryId: undefined }),
+			JSON.stringify({ ...threadOrigin, platform: "slack" }), JSON.stringify({ ...threadOrigin, conversationId: "unicode-한글" }),
+			JSON.stringify({ ...threadOrigin, peerId: "forged" })].map((origin) =>
+			["start", name, "--task-id", taskId, "--kind", "read_only", "--thread-origin", origin, "inspect"]),
+		["steer", name, "inspect", "--task-id", taskId],
+		["steer", name, "inspect", "--expected-op-ref", opRef],
+		["steer", name, "inspect", "--kind", "code_mutating"],
+		["steer", "different-name", "inspect", ...steerFlags],
+		["steer", name, "inspect", ...steerFlags, "--event-id", "unscoped"],
+		["steer", name, "inspect", ...steerFlags, "--event-id", "cli:with spaces"],
+		["steer", name, "inspect", ...steerFlags, "--event-id", `cli:${"x".repeat(WORK_TASK_EVENT_ID_MAX_BYTES)}`],
+		["steer", name, "inspect", ...steerFlags, "--kind", "unknown"],
+		["steer", name, "inspect", ...steerFlags, "--task-id", taskId],
+		["status", name, "--expected-op-ref", opRef],
+		["status", "different-name", "--task-id", taskId],
+		["status", name, "--task-id", taskId, "--expected-op-ref", "BAD/REF"],
+		["status", name, "--task-id", taskId, "--event-id", "cli:invalid"],
+		["recover"],
+		["recover", "invalid"],
+		["recover", taskId, taskId],
+		["recover", taskId, "--resume"],
+		["context", "invalid"],
+		["context", taskId, taskId],
+		["context", "--topic"],
+		["context", "--topic", "x", "--topic", "y"],
+		["context", "--continuation", ""],
+		["context", "--resume"],
+	];
+	for (const [index, args] of invalidTaskArgs.entries()) {
+		test(`invalid task arguments ${index} fail before connecting`, async () => {
+			const output = await run(args, {});
+			expect(output.connections).toBe(0);
+			expect(output.requests).toEqual([]);
+			expect(output.lines).toEqual([]);
+			expect(output.errors).toHaveLength(1);
+			expect(output.exitCode).toBe(1);
+		});
+	}
+
+	test("usage advertises implemented task flags and observational commands", () => {
+		for (const flag of ["--task-id", "--kind", "--thread-origin", "--parent-origin", "--title", "--context",
+			"--expected-op-ref", "--event-id", "--topic", "--continuation", "work recover", "work context"]) {
+			expect(CLI_USAGE).toContain(flag);
+		}
+		expect(CLI_USAGE).not.toContain("--notify");
+	});
 
 	for (const [flag, value, model] of [
 		["--preset", "reliable", { preset: "reliable" }],
@@ -987,6 +1393,42 @@ describe("work operator commands", () => {
 			expect(output.lines).toEqual(["started: work/task/fix session=session-1 job=job-1 op=op-1"]);
 			expect(output.connectOptions).toEqual({ requestTimeoutMs: 120_000 });
 			expect(output.closed).toBe(true);
+		});
+	}
+
+	for (const flags of [[], ["--task-id", taskId, "--expected-op-ref", opRef, "--event-id", "cli:caller-routing"]]) {
+		test(`work steer preserves caller routing with ${flags.length ? "explicit task" : "bare lane"} identity`, async () => {
+			const callerSessionId = crypto.randomUUID();
+			const output = await run(["steer", name, "inspect", ...flags], new Error("current non-work persona required"), ` ${callerSessionId} `);
+			expect(output.requests).toEqual([{
+				verb: "work.steer", params: {
+					name, text: "inspect", callerSessionId,
+					...(flags.length ? { taskId, expectedOpRef: opRef, eventId: "cli:caller-routing" } : {}),
+				},
+			}]);
+			expect(output.errors).toEqual(["current non-work persona required"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.connections).toBe(1);
+		});
+	}
+
+	test("work steer generated identity also preserves the persona routing hint", async () => {
+		const callerSessionId = crypto.randomUUID();
+		const output = await run(["steer", name, "inspect", ...steerFlags], new Error("lost receipt"), callerSessionId);
+		const identity = JSON.parse(output.lines[0]);
+		expect(output.requests).toEqual([{
+			verb: "work.steer", params: { name, text: "inspect", ...identity, callerSessionId },
+		}]);
+		expect(identity.eventId).toMatch(/^cli:[0-9a-f-]{36}$/);
+	});
+
+	for (const hint of [undefined, " \t "]) {
+		test(`work steer omits ${hint === undefined ? "unset" : "blank"} routing hint`, async () => {
+			const output = await run(["steer", name, "inspect", ...steerFlags, "--event-id", "cli:local-owner"],
+				new Error("held"), hint);
+			expect(output.requests).toEqual([{
+				verb: "work.steer", params: { name, text: "inspect", taskId, expectedOpRef: opRef, eventId: "cli:local-owner" },
+			}]);
 		});
 	}
 
@@ -1116,8 +1558,93 @@ describe("work operator commands", () => {
 		expect(output.closed).toBe(true);
 	});
 
+	const pendingTask: WorkTaskProjection = {
+		taskId,
+		name,
+		kind: "read_only",
+		jobId: "job-original",
+		opRef,
+		sessionId: null,
+		epoch: null,
+		surface: { phase: "pending", request: { parentOrigin: { ...parentOrigin, platform: "discord", kind: "channel" } } },
+		obligation: "awaiting_final",
+		finalReport: { reportId: null, completeness: "unavailable", disposition: "pending" },
+	};
+
+	test("work jobs exposes pending surface admission before any lane exists", async () => {
+		const output = await run(["jobs"], { jobs: [], tasks: [pendingTask], taskErrors: [] });
+		expect(output.lines).toEqual([
+			`task ${taskId} name=${name} job=job-original op=${opRef} mapping=pending obligation=awaiting_final final=pending/unavailable`,
+		]);
+		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
+		expect(output.errors).toEqual([]);
+		expect(output.exitCode).toBe(0);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work jobs exposes creation-receipt-loss hold without inventing a lane or replay", async () => {
+		const task: WorkTaskProjection = {
+			...pendingTask,
+			surface: { phase: "held", reason: "creation_receipt_lost", claimId: "claim-original" },
+			obligation: "held",
+			holdReason: "surface_held",
+			finalReport: { reportId: null, completeness: "unavailable", disposition: "held", reason: "surface_held" },
+		};
+		const output = await run(["jobs"], { jobs: [], tasks: [task], taskErrors: [] });
+		expect(output.lines).toEqual([
+			`task ${taskId} name=${name} job=job-original op=${opRef} mapping=held obligation=held final=held/unavailable mappingReason="creation_receipt_lost" holdReason="surface_held" finalReason="surface_held"`,
+		]);
+		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
+		expect(output.exitCode).toBe(0);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work jobs preserves corrupt tombstone identity beside a healthy task and lane", async () => {
+		const corruptId = "1a493f21-a00f-45ab-93b3-6727cc113246";
+		const output = await run(["jobs"], {
+			jobs: [{
+				job_id: pendingTask.jobId, lane_key: `work-${name}`, state: "running",
+				session_id: "session-original", last_activity_at: null, worktree_path: "/repo/task",
+			}],
+			tasks: [{ ...pendingTask, surface: { phase: "bound", origin: threadOrigin } }],
+			taskErrors: [{ taskId: corruptId, reason: "invalid_task_record" }],
+		});
+		expect(output.lines).toEqual([
+			`${name} running session=session-original accepted=- op=- last=- head=- /repo/task`,
+			`task ${taskId} name=${name} job=job-original op=${opRef} mapping=bound obligation=awaiting_final final=pending/unavailable`,
+			`task ${corruptId} projection=unavailable reason="invalid_task_record" op=unavailable`,
+		]);
+		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
+		expect(output.errors).toEqual([]);
+		expect(output.closed).toBe(true);
+	});
+
+	test("work jobs explicitly leaves more than twenty tasks incomplete without duplicate rows", async () => {
+		const tasks = Array.from({ length: 21 }, (_, index): WorkTaskProjection => {
+			const id = `1a493f21-a00f-45ab-93b3-${String(index).padStart(12, "0")}`;
+			return { ...pendingTask, taskId: id, name: `fm-${id}`, jobId: `job-${index}`, opRef: `op-${index}` };
+		});
+		const nextTaskId = tasks[19]!.taskId;
+		const output = await run(["jobs"], {
+			jobs: [], tasks: tasks.slice(0, 20), taskErrors: [], nextTaskId,
+		});
+		expect(output.lines).toHaveLength(21);
+		for (const task of tasks.slice(0, 20)) {
+			expect(output.lines.filter((line) => line.startsWith(`task ${task.taskId} `))).toHaveLength(1);
+		}
+		expect(output.lines.join("\n")).not.toContain(tasks[20]!.taskId);
+		expect(output.lines[20]).toBe(
+			`tasks incomplete: first page only (at most 20); nextTaskId=${nextTaskId}; more tasks or projection errors may remain`,
+		);
+		expect(output.requests).toEqual([{ verb: "work.jobs", params: undefined }]);
+		expect(output.errors).toEqual([]);
+		expect(output.closed).toBe(true);
+	});
+
 	test("work jobs renders bound and unbound lanes", async () => {
 		const output = await run(["jobs"], {
+			tasks: [],
+			taskErrors: [],
 			jobs: [
 				{
 					lane_key: "fix",
@@ -1147,6 +1674,8 @@ describe("work operator commands", () => {
 
 	test("work jobs shows the job first, its current attempt, and the lane's last commit (issue #67)", async () => {
 		const output = await run(["jobs"], {
+			tasks: [],
+			taskErrors: [],
 			jobs: [
 				{
 					lane_key: "work-fix",
@@ -1172,6 +1701,8 @@ describe("work operator commands", () => {
 
 	test("work jobs distinguishes quarantined history from current running lanes", async () => {
 		const output = await run(["jobs"], {
+			tasks: [],
+			taskErrors: [],
 			jobs: [
 				{
 					lane_key: "work-current",

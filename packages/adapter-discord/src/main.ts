@@ -3,6 +3,8 @@ import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
 	type ChatMessagePayload,
+	type ChatEditResult,
+	type ChatSendResult,
 	type ChatProgressPayload,
 	type EngagementContext,
 	type OriginRef,
@@ -13,9 +15,21 @@ import {
 	presenceTransition,
 	type ReactionAction,
 	type SessionModelChoicesResult,
+	type WorkJobsResult,
+	type WorkTaskThreadOrigin,
+	type WorkTaskOriginSource,
+	type WorkThreadClaimResult,
+	type WorkThreadBindParams,
+	type WorkThreadBindResult,
+	DELIVERY_RECEIPT_MAX_MESSAGE_IDS,
+	validateDeliveryConfirmParams,
+	validateWorkJobsParams,
+	validateWorkTaskMessageMetadata,
+	validateWorkTaskSpec,
+	validateWorkThreadBindParams,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
-import { AttachmentBuilder, Client, GatewayIntentBits, MessageFlags, Partials } from "discord.js";
+import { AttachmentBuilder, ChannelType, Client, GatewayIntentBits, MessageFlags, Partials, PermissionFlagsBits } from "discord.js";
 import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
@@ -179,7 +193,7 @@ export interface TypingPort {
 }
 
 export interface DiscordClientLike {
-	channels: { fetch(id: string): Promise<unknown> };
+	channels: { fetch(id: string, options?: { readonly force?: boolean }): Promise<unknown> };
 }
 
 export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike, AttachmentCarrier {
@@ -292,6 +306,7 @@ export interface PendingEdit {
 	readonly text: string;
 	readonly engagement: EngagementContext;
 	readonly receivedAt?: string;
+	readonly originSource?: WorkTaskOriginSource;
 }
 
 /** The chat.edit request an edited Discord message becomes, or undefined when it is not ours to forward. */
@@ -301,6 +316,7 @@ export interface DescribedMessageEdit {
 	readonly text: string;
 	readonly engagement: EngagementContext;
 	readonly receivedAt: string;
+	readonly originSource?: WorkTaskOriginSource;
 }
 
 /**
@@ -335,6 +351,9 @@ export function describeMessageEdit(
 		text,
 		engagement,
 		receivedAt: new Date(editedAt).toISOString(),
+		...(message.createdTimestamp === undefined ? {} : {
+			originSource: { platformCreatedAt: message.createdTimestamp },
+		}),
 	};
 }
 
@@ -358,7 +377,7 @@ export function presenceEligibleTurn(
  * Returns the thread's origin if thread creation succeeds, or the original origin if not or if conditions don't apply.
  * Implements Hermes-like contract: channel mention → auto-thread + new session.
  */
-async function maybeCreateThreadOnMention(
+export async function maybeCreateThreadOnMention(
 	message: DiscordInboundMessage,
 	engagement: EngagementContext,
 	origin: OriginRef,
@@ -382,6 +401,7 @@ async function maybeCreateThreadOnMention(
 			kind: "thread",
 			conversationId: thread.id,
 			parentId: origin.conversationId,
+			...(origin.boundaryId ? { boundaryId: origin.boundaryId } : {}),
 		};
 	} catch (error) {
 		// Thread creation failed (permissions, rate limits, etc.); continue with channel origin.
@@ -817,6 +837,199 @@ export function isPresenceReaction(unicode: string): boolean {
 	return PRESENCE_ALL_MARKERS.some((marker) => marker.unicode.replace(/\uFE0F/g, "") === bare);
 }
 
+interface TaskChannelLike extends DiscordTextChannelLike {
+	readonly id: string;
+	readonly guildId: string;
+	readonly parentId?: string | null;
+	readonly type: number;
+	readonly archived?: boolean | null;
+	readonly locked?: boolean | null;
+	readonly guild: { readonly members: { readonly me: unknown } };
+	isThread(): boolean;
+	permissionsFor(member: unknown): { has(permission: bigint): boolean } | null;
+	readonly threads?: {
+		create(options: { name: string; type: ChannelType.PublicThread }): Promise<unknown>;
+	};
+}
+
+function taskChannel(value: unknown): TaskChannelLike {
+	if (!isDiscordTextChannel(value) || !("isThread" in value) || typeof value.isThread !== "function" ||
+		!("permissionsFor" in value) || typeof value.permissionsFor !== "function")
+		throw new Error("Discord task surface is unavailable or unsupported");
+	return value as TaskChannelLike;
+}
+
+function requireTaskPermissions(channel: TaskChannelLike, flags: readonly bigint[]): void {
+	const me = channel.guild?.members.me;
+	const permissions = me ? channel.permissionsFor(me) : null;
+	if (!permissions || flags.some((flag) => !permissions.has(flag)))
+		throw new Error("Discord task surface is inaccessible or lacks required permissions");
+}
+
+function verifyMappedThread(value: unknown, origin: WorkTaskThreadOrigin): TaskChannelLike {
+	const channel = taskChannel(value);
+	if (!channel.isThread() || channel.id !== origin.conversationId ||
+		channel.parentId !== origin.parentId || channel.guildId !== origin.boundaryId ||
+		channel.archived !== false || channel.locked !== false)
+		throw new Error("Discord mapped thread identity or active state is invalid");
+	requireTaskPermissions(channel, [
+		PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessagesInThreads,
+	]);
+	return channel;
+}
+
+/** Fetches only the bound target. It never unarchives, creates, or redirects. */
+export async function fetchMappedThread(
+	discord: DiscordClientLike,
+	origin: WorkTaskThreadOrigin,
+	taskId: string,
+): Promise<DiscordTextChannelLike> {
+	// Reuse the protocol's exact origin validation before making an external call.
+	validateWorkThreadBindParams({
+		taskId,
+		claimId: taskId,
+		outcome: { kind: "bound", origin },
+	});
+	return verifyMappedThread(await discord.channels.fetch(origin.conversationId, { force: true }), origin);
+}
+
+/** One bounded pass in the adapter's existing reconciliation loop, not a scheduler. */
+export async function reconcileDiscordWorkTasks(
+	gateway: Pick<GatewayClientLike, "request">,
+	discord: DiscordClientLike,
+	log: Pick<Console, "error"> = console,
+	knownOrigins: ReadonlyMap<string, WorkTaskThreadOrigin> = new Map(),
+): Promise<{ readonly origins: ReadonlyMap<string, WorkTaskThreadOrigin>; readonly incomplete: boolean }> {
+	const origins = new Map<string, WorkTaskThreadOrigin>();
+	const cursors = new Set<string>();
+	let afterTaskId: string | undefined;
+	let incomplete = false;
+	let projectionDiagnostics = 0;
+	const projectionFailure = (message: string) => {
+		incomplete = true;
+		if (projectionDiagnostics++ < 20) log.error(`Discord task discovery incomplete: ${message}`);
+	};
+	for (let page = 0; page < 100; page++) {
+		const result = await gateway.request<WorkJobsResult>("work.jobs",
+			validateWorkJobsParams(afterTaskId === undefined ? undefined : { afterTaskId }));
+		if (!Array.isArray(result.tasks) || result.tasks.length > 20) throw new Error("Invalid work.jobs task page");
+		// Projection errors contain identities, not recoverable surface facts. Never
+		// turn a tombstone into a claim, an origin, or permission to create a thread.
+		if (!Array.isArray(result.taskErrors) || result.taskErrors.length + result.tasks.length > 20) {
+			projectionFailure("Invalid work.jobs taskErrors page");
+		}
+		const errorIds = new Set<string>();
+		if (Array.isArray(result.taskErrors)) for (const error of result.taskErrors.slice(0, 20)) {
+			try {
+				if (!error || typeof error !== "object" || Array.isArray(error) ||
+					Object.keys(error).length !== 2 || !Object.hasOwn(error, "taskId") || !Object.hasOwn(error, "reason") ||
+					typeof error.taskId !== "string" || typeof error.reason !== "string" || !error.reason.trim())
+					throw new Error("Invalid projection error");
+				validateWorkJobsParams({ afterTaskId: error.taskId });
+				const duplicate = errorIds.has(error.taskId);
+				errorIds.add(error.taskId);
+				if (duplicate || result.tasks.some((task) => task.taskId === error.taskId))
+					throw new Error("Conflicting projection error identity");
+				projectionFailure(`task ${error.taskId} projection unavailable: ${JSON.stringify(error.reason.slice(0, 256))}`);
+			} catch {
+				projectionFailure("Invalid work.jobs taskErrors entry");
+			}
+		}
+		for (const task of result.tasks) {
+			if (errorIds.has(task.taskId)) continue;
+			const surface = task.surface;
+			const claimId = "claimId" in surface && surface.claimId ? surface.claimId : task.taskId;
+			let mayHold = false;
+			try {
+				if (surface.phase === "held") continue;
+				if (surface.phase === "bound") {
+					origins.set(surface.origin.conversationId, surface.origin);
+					await fetchMappedThread(discord, surface.origin, task.taskId);
+					continue;
+				}
+				validateWorkTaskSpec({ taskId: task.taskId, kind: task.kind, surface: surface.request });
+				const claim = await gateway.request<WorkThreadClaimResult>("work.thread.claim", { taskId: task.taskId, claimId });
+				if (claim.taskId !== task.taskId || claim.claimId !== claimId) throw new Error("Task claim identity mismatch");
+				let origin: WorkTaskThreadOrigin;
+				if (claim.create === true) {
+					mayHold = true;
+					if (surface.phase !== "pending" || surface.request.parentOrigin === undefined ||
+						claim.parentOrigin.conversationId !== surface.request.parentOrigin.conversationId ||
+						claim.parentOrigin.boundaryId !== surface.request.parentOrigin.boundaryId)
+						throw new Error("Task create claim does not match the original pending parent");
+					// Only this fresh server authorization permits a single create attempt.
+					validateWorkTaskSpec({ taskId: task.taskId, kind: task.kind, surface: {
+						parentOrigin: claim.parentOrigin, ...(claim.title === undefined ? {} : { title: claim.title }),
+					} });
+					const parent = taskChannel(await discord.channels.fetch(claim.parentOrigin.conversationId, { force: true }));
+					if (parent.id !== claim.parentOrigin.conversationId || parent.guildId !== claim.parentOrigin.boundaryId ||
+						parent.type !== ChannelType.GuildText || parent.isThread() || !parent.threads?.create)
+						throw new Error("Unsupported Discord task parent; only guild text public threads are supported");
+					requireTaskPermissions(parent, [
+						PermissionFlagsBits.ViewChannel, PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.SendMessagesInThreads,
+					]);
+					const created = taskChannel(await parent.threads.create({
+						name: claim.title ?? task.name.slice(0, 100), type: ChannelType.PublicThread,
+					}));
+					origin = { platform: "discord", kind: "thread", conversationId: created.id,
+						parentId: parent.id, boundaryId: parent.guildId };
+					await fetchMappedThread(discord, origin, task.taskId);
+				} else {
+					if (claim.surface.phase === "bound") {
+						origins.set(claim.surface.origin.conversationId, claim.surface.origin);
+						await fetchMappedThread(discord, claim.surface.origin, task.taskId);
+						continue;
+					}
+					if (claim.disposition === "held" || claim.surface.phase === "held") continue;
+					// A persisted create claim is uncertain, never permission to create again.
+					if (surface.request.threadOrigin === undefined) {
+						if (surface.phase === "claimed") {
+							mayHold = true;
+							throw new Error("Persisted Discord creation claim has no verified binding");
+						}
+						continue;
+					}
+					mayHold = true;
+					origin = surface.request.threadOrigin;
+					await fetchMappedThread(discord, origin, task.taskId);
+				}
+				const params: WorkThreadBindParams = { taskId: task.taskId, claimId, outcome: { kind: "bound", origin } };
+				const bound = await gateway.request<WorkThreadBindResult>("work.thread.bind", validateWorkThreadBindParams(params));
+				if (bound.taskId !== task.taskId || bound.claimId !== claimId) throw new Error("Task bind identity mismatch");
+				if (bound.surface.phase === "bound") {
+					if (bound.surface.origin.conversationId !== origin.conversationId ||
+						bound.surface.origin.parentId !== origin.parentId || bound.surface.origin.boundaryId !== origin.boundaryId)
+						throw new Error("Task bind origin mismatch");
+					origins.set(origin.conversationId, origin);
+				}
+			} catch (error) {
+				incomplete = true;
+				log.error(`Discord task ${task.taskId} surface reconciliation failed: ${errorMessage(error)}`);
+				if (mayHold) {
+					try {
+						const params: WorkThreadBindParams = { taskId: task.taskId, claimId,
+							outcome: { kind: "held", reason: "Discord surface creation/verification/binding failed or is uncertain" } };
+						await gateway.request<WorkThreadBindResult>("work.thread.bind", params);
+					} catch (holdError) {
+						log.error(`Discord task ${task.taskId} hold not acknowledged: ${errorMessage(holdError)}`);
+					}
+				}
+			}
+		}
+		if (result.nextTaskId === undefined) return {
+			// An incomplete scan cannot establish that previously known addressing
+			// disappeared. Retention is not proof the target is currently usable.
+			origins: incomplete ? new Map([...knownOrigins, ...origins]) : origins,
+			incomplete,
+		};
+		validateWorkJobsParams({ afterTaskId: result.nextTaskId });
+		if (cursors.has(result.nextTaskId)) throw new Error("work.jobs cursor loop");
+		cursors.add(result.nextTaskId);
+		afterTaskId = result.nextTaskId;
+	}
+	throw new Error("work.jobs discovery page bound exceeded");
+}
+
 export async function settleDiscordDelivery(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
@@ -826,10 +1039,10 @@ export async function settleDiscordDelivery(
 	reactions: DiscordReactionPorts = createReactionPorts(),
 	speech?: DiscordSpeechPorts,
 ): Promise<void> {
-	if (message.origin.platform !== "discord" || !message.deliveryId) return;
+	if (!message.deliveryId || (message.origin.platform !== "discord" && message.workTask === undefined)) return;
 	const deliveryId = message.deliveryId;
 	// A reaction delivery reacts and posts nothing; it settles on the same ledger.
-	if (message.reaction) {
+	if (message.reaction && message.workTask === undefined) {
 		try {
 			await settleDiscordReaction(gateway, discord, message, reactions.resolver, reactions.limiter);
 		} finally {
@@ -837,34 +1050,67 @@ export async function settleDiscordDelivery(
 		}
 		return;
 	}
+	let posted = 0;
+	let sendAttempted = false;
 	try {
-		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
+		const mapped = message.workTask !== undefined;
+		if (mapped) {
+			validateDeliveryConfirmParams({ deliveryId });
+			validateWorkTaskMessageMetadata(message.workTask, { origin: message.origin });
+			if (message.reaction || message.voiceText) throw new Error("Mapped task delivery requires text only");
+		}
+		const { channel, notice } = mapped
+			? { channel: await fetchMappedThread(discord, message.origin as WorkTaskThreadOrigin, message.workTask!.taskId) }
+			: await resolveDeliveryChannel(discord, message.origin, deliveryId);
 		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${message.text}` : message.text;
 		const text = notice ? `${notice}\n${body}` : body;
 		const chunks = chunkDiscordMessage(text);
+		if (mapped && chunks.length > DELIVERY_RECEIPT_MAX_MESSAGE_IDS)
+			throw new Error("Mapped task delivery exceeds receipt chunk bound");
+		const messageIds: string[] = [];
 		for (let index = 0; index < chunks.length; index++) {
 			// Reply-threading applies to the first chunk only; failIfNotExists keeps a
 			// deleted target from failing the whole delivery.
 			const chunk = chunks[index] as string;
+			// Recheck between chunks as well; Discord may have archived/locked the thread.
+			const target = mapped && index > 0
+				? await fetchMappedThread(discord, message.origin as WorkTaskThreadOrigin, message.workTask!.taskId)
+				: channel;
+			sendAttempted = true;
 			// A reply reference points into the thread, so it is dropped on parent fallback.
-			if (index === 0 && message.replyToMessageId && !notice)
-				await channel.send({
+			const sent = index === 0 && message.replyToMessageId && !notice
+				? await target.send({
 					content: chunk,
 					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+				})
+				: await target.send(chunk);
+			posted++;
+			if (mapped) {
+				if (typeof sent === "object" && sent !== null && "channelId" in sent &&
+					sent.channelId !== message.origin.conversationId)
+					throw new Error("Mapped delivery receipt belongs to another Discord channel");
+				const id = typeof sent === "object" && sent !== null && "id" in sent ? sent.id : undefined;
+				// The validator rejects absent, noncanonical, duplicate and over-bound IDs.
+				const receipt = validateDeliveryConfirmParams({
+					deliveryId,
+					platformReceipt: { origin: message.origin, messageIds: [...messageIds, id] },
 				});
-			else await channel.send(chunk);
+				messageIds.push(receipt.platformReceipt!.messageIds.at(-1)!);
+			}
 		}
 		// Voice rides AFTER the text, and only after the text actually landed:
 		// pairing them is for a readable history, so the readable half must be
 		// the one that is guaranteed. A synthesis failure is logged and the
 		// delivery still confirms — the words arrived, which is the deliverable.
 		if (message.voiceText && speech) await sendVoiceMessage(channel, message.voiceText, speech);
-		await gateway.request("delivery.confirm", { deliveryId });
+		await gateway.request("delivery.confirm", mapped
+			? validateDeliveryConfirmParams({ deliveryId, platformReceipt: { origin: message.origin, messageIds } })
+			: { deliveryId });
 	} catch (error) {
 		await gateway.request("delivery.fail", {
 			deliveryId,
 			reason: error instanceof Error ? error.message : String(error),
-			ambiguous: deliveryFailureIsAmbiguous(error),
+			ambiguous: posted > 0 || ((message.workTask === undefined || sendAttempted) && deliveryFailureIsAmbiguous(error)),
 		});
 	} finally {
 		await settleTurnPresence(message, typing, status);
@@ -883,6 +1129,7 @@ async function settleTurnPresence(
 	typing: TypingPort | undefined,
 	status: WorkingStatus | undefined,
 ): Promise<void> {
+	if (message.workTask !== undefined) return;
 	if (!message.final) {
 		if (!message.reaction) typing?.refresh(message.origin.conversationId);
 		return;
@@ -1124,7 +1371,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
 			const spoken = firstVoiceMessage(message) !== undefined;
-			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken);
+			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, message.createdTimestamp);
 		});
 	});
 	// An edit is an update of a message the persona may already have read, not a
@@ -1138,7 +1385,7 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			const edit = describeMessageEdit(message, discord.user, config.channels, before);
 			if (!edit) return;
 			ingress.run(edit.origin.conversationId, async () => {
-				gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt);
+				gateway.sendEdit(edit.messageId, edit.origin, edit.text, edit.engagement, edit.receivedAt, edit.originSource);
 			});
 		})();
 	});
@@ -1345,9 +1592,11 @@ export async function handleSlashCommand(
 		// group surface) — never claim a reset that did not happen. `/model` never
 		// resets the session; the gateway posts the resulting selection itself.
 		await interaction.reply(
-			result?.engaged
-				? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
-				: { content: "not authorized for session commands here", ephemeral: true },
+			result?.route === "work_task"
+				? { content: `Task ${result.taskId} control recorded; delivery ${result.delivery}.`, ephemeral: true }
+				: result?.engaged
+					? { content: command === "model" ? "🦞 model command accepted" : "🦞 session reset", ephemeral: true }
+					: { content: "not authorized for session commands here", ephemeral: true },
 		);
 	} catch (error) {
 		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1375,6 +1624,7 @@ export class ReconnectingGateway {
 	#retryAttempt = 0;
 	readonly #unreadableRecoveryTargets = new Map<string, number>();
 	#recoverableIds = new Set<string>();
+	#mappedOrigins: ReadonlyMap<string, WorkTaskThreadOrigin> = new Map();
 
 	constructor(
 		readonly socketPath: string,
@@ -1461,14 +1711,22 @@ export class ReconnectingGateway {
 			const pruned = pruneKnownDms(this.#cursors, Date.now());
 			if (pruned !== this.#cursors) this.persist(pruned);
 			const configuredIds = Object.keys(this.config.channels ?? {});
-			const queue = [...configuredIds, ...Object.keys(this.#cursors.knownDms)];
+			let tasks: Awaited<ReturnType<typeof reconcileDiscordWorkTasks>>;
+			try {
+				tasks = await reconcileDiscordWorkTasks(this.#client, this.discord, console, this.#mappedOrigins);
+			} catch (error) {
+				console.error(`Discord task discovery incomplete: ${errorMessage(error)}`);
+				tasks = { origins: this.#mappedOrigins, incomplete: true };
+			}
+			this.#mappedOrigins = tasks.origins;
+			const queue = [...configuredIds, ...Object.keys(this.#cursors.knownDms), ...tasks.origins.keys()];
 			if (queue.length === 0) {
-				completed = true;
+				completed = !tasks.incomplete;
 				return;
 			}
 			const seen = new Set<string>();
 			this.#recoverableIds = new Set(queue);
-			let incomplete = false;
+			let incomplete = tasks.incomplete;
 			for (let index = 0; index < queue.length; index++) {
 				const conversationId = queue[index] as string;
 				if (seen.has(conversationId)) continue;
@@ -1540,7 +1798,7 @@ export class ReconnectingGateway {
 	): Promise<{ readonly incomplete: boolean; readonly threadIds: readonly string[] }> {
 		let fetched: unknown;
 		try {
-			fetched = await this.discord.channels.fetch(channelId);
+			fetched = await this.discord.channels.fetch(channelId, this.#mappedOrigins.has(channelId) ? { force: true } : undefined);
 		} catch (error) {
 			if (!isPermanentDiscordUnreadable(error)) {
 				console.error(
@@ -1562,6 +1820,8 @@ export class ReconnectingGateway {
 				threadIds: [],
 			};
 		}
+		const mappedOrigin = this.#mappedOrigins.get(channelId);
+		if (mappedOrigin) verifyMappedThread(fetched, mappedOrigin);
 		this.clearUnreadableRecoveryTarget(channelId);
 		const threadIds = discoverThreads ? await discoverRecoveryThreadIds(fetched, channelId, Date.now()) : [];
 
@@ -1581,7 +1841,7 @@ export class ReconnectingGateway {
 				let failure: RecoveryFailureClass = "write-path-unknown";
 				let summary = "unclassified chat.send failure";
 				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
-					const result = await this.requestRecovered(message.id, origin, message.content, engagement);
+					const result = await this.requestRecovered(message.id, origin, message.content, engagement, message.createdTimestamp);
 					if (result.verdict !== "unavailable") {
 						this.forgetAttempts(message.id);
 						return result.verdict;
@@ -1804,8 +2064,9 @@ export class ReconnectingGateway {
 		engagement: EngagementContext,
 		receivedAt?: string,
 		voice?: boolean,
+		platformCreatedAt?: number,
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice);
+		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice, platformCreatedAt);
 	}
 
 	/**
@@ -1830,8 +2091,10 @@ export class ReconnectingGateway {
 		text: string,
 		engagement: EngagementContext,
 		receivedAt?: string,
+		originSource?: WorkTaskOriginSource,
 	): void {
-		this.#editOutbox.set(messageId, { messageId, origin, text, engagement, ...(receivedAt ? { receivedAt } : {}) });
+		this.#editOutbox.set(messageId, { messageId, origin, text, engagement,
+			...(receivedAt ? { receivedAt } : {}), ...(originSource ? { originSource } : {}) });
 		if (this.#editOutbox.size > EDIT_OUTBOX_LIMIT) {
 			const oldest = this.#editOutbox.keys().next().value as string;
 			this.#editOutbox.delete(oldest);
@@ -1861,17 +2124,18 @@ export class ReconnectingGateway {
 					return;
 				}
 				try {
-					const result = await client.request<{ engaged?: boolean }>("chat.edit", {
+					const result = await client.request<ChatEditResult>("chat.edit", {
 						origin: edit.origin,
 						messageId: edit.messageId,
 						text: edit.text,
 						engagement: edit.engagement,
 						...(edit.receivedAt ? { receivedAt: edit.receivedAt } : {}),
+						...(edit.originSource ? { originSource: edit.originSource } : {}),
 					});
 					// Acknowledged: drop it unless a newer edit of the same message
 					// was queued behind this one meanwhile.
 					if (this.#editOutbox.get(edit.messageId) === edit) this.#editOutbox.delete(edit.messageId);
-					if (result?.engaged && presenceEligibleTurn(edit.origin, edit.engagement)) {
+					if (result?.route !== "work_task" && result?.engaged && presenceEligibleTurn(edit.origin, edit.engagement)) {
 						this.status?.arm(edit.origin.conversationId, edit.messageId, edit.engagement);
 						this.typing?.begin(edit.origin.conversationId);
 					}
@@ -1938,12 +2202,13 @@ export class ReconnectingGateway {
 		receivedAt?: string,
 		/** The message was spoken, so the reply is owed in both modalities. */
 		voice?: boolean,
-	): Promise<{ engaged?: boolean } | undefined> {
+		platformCreatedAt?: number,
+	): Promise<ChatSendResult | undefined> {
 		if (origin.platform === "discord" && origin.kind === "dm") {
 			await this.ensureCursors();
 			if (this.#cursors) this.persist(rememberKnownDm(this.#cursors, origin.conversationId, Date.now()));
 		}
-		let result: { engaged?: boolean } | undefined;
+		let result: ChatSendResult | undefined;
 		const verdict = await this.#inbound.join(messageId, async () => {
 			const client = this.#client;
 			if (!client) {
@@ -1953,20 +2218,21 @@ export class ReconnectingGateway {
 			try {
 				// The gateway acknowledges engagement before running the turn, so typing starts only for
 				// turns that will actually produce a reply and never outlives the delivery that clears it.
-				result = await client.request<{ engaged?: boolean }>("chat.send", {
+				result = await client.request<ChatSendResult>("chat.send", {
 					origin,
 					text,
 					engagement,
 					messageId,
 					...(receivedAt ? { receivedAt } : {}),
 					...(voice ? { voice: true } : {}),
+					...(platformCreatedAt === undefined ? {} : { originSource: { platformCreatedAt } }),
 				});
 				// No recovery-watermark write here on purpose: a live message is no evidence that
 				// the older messages behind it were ever backfilled (issue #33).
 				// An accepted thread follow-up is already engaged by the gateway and
 				// does not need another mention. DMs and addressed channel turns show
 				// presence as before; overheard channel traffic remains silent.
-				if (result?.engaged && presenceEligibleTurn(origin, engagement)) {
+				if (result?.route !== "work_task" && result?.engaged && presenceEligibleTurn(origin, engagement)) {
 					this.status?.arm(origin.conversationId, messageId, engagement);
 					this.typing?.begin(origin.conversationId);
 				}
@@ -2000,6 +2266,7 @@ export class ReconnectingGateway {
 		origin: OriginRef,
 		text: string,
 		engagement: EngagementContext,
+		platformCreatedAt?: number,
 	): Promise<RecoveredSendResult> {
 		let failure: RecoveryFailureClass | undefined;
 		let summary: string | undefined;
@@ -2011,7 +2278,9 @@ export class ReconnectingGateway {
 				return "unavailable";
 			}
 			try {
-				await client.request("chat.send", { origin, text, engagement, messageId });
+				await client.request("chat.send", { origin, text, engagement, messageId,
+					...(platformCreatedAt === undefined ? {} : { originSource: { platformCreatedAt, recovered: true } }),
+				});
 				return "acked";
 			} catch (error) {
 				failure = classifyRecoveryFailure(error);
@@ -2032,7 +2301,10 @@ export class ReconnectingGateway {
 			() => {
 				if (this.#client !== client) return;
 				void client.request("gateway.status").then(
-					() => this.monitor(client, 0),
+					() => {
+						void this.recoverMissedMessages();
+						this.monitor(client, 0);
+					},
 					() => {
 						const next = monitorFailureDecision(strikes);
 						if (next.action === "reconnect") this.scheduleReconnect();
