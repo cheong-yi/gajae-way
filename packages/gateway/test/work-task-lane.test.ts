@@ -1,27 +1,44 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey, type OriginRef } from "@gajae-gateway/protocol";
+import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
 import type { SessionPort, SessionSteerStatusInput, SessionSteerStatusResult } from "../src/orchestrator/session-port";
-import { WorkLaneManager, type MappedWorkEvent, type WorkLaneManagerOptions } from "../src/orchestrator/work-lane";
+import { type MappedWorkEvent, WorkLaneManager, type WorkLaneManagerOptions } from "../src/orchestrator/work-lane";
+import { buildWorkTaskContext, buildWorkTaskReviewTurnContext } from "../src/server/work-task-context";
 import { GatewayDatabase } from "../src/store/db";
-import { buildWorkTaskContext } from "../src/server/work-task-context";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
 
 const cleanup: Array<() => Promise<void>> = [];
-afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
+afterEach(async () => {
+	for (const close of cleanup.splice(0).reverse()) await close();
+});
 const coordinator: OriginRef = { platform: "discord", kind: "channel", conversationId: "100", boundaryId: "1" };
-const thread = { platform: "discord", kind: "thread", conversationId: "200", parentId: "100", boundaryId: "1" } as const;
+const thread = {
+	platform: "discord",
+	kind: "thread",
+	conversationId: "200",
+	parentId: "100",
+	boundaryId: "1",
+} as const;
 const taskId = "b7654d21-6806-4fdc-89ef-e2f9c038e4f9";
 const claimId = "29e0f8d7-b069-44bc-a747-5890b89ea174";
 const name = `fm-${taskId}`;
 const at = "2026-10-06T05:00:00.000Z";
-const context = { stableOrigin: coordinator, evidence: { principalId: "owner", origin: coordinator,
-	eventId: "assignment", editId: null, evidenceAt: at, observedAt: at } };
+const context = {
+	stableOrigin: coordinator,
+	evidence: {
+		principalId: "owner",
+		origin: coordinator,
+		eventId: "assignment",
+		editId: null,
+		evidenceAt: at,
+		observedAt: at,
+	},
+};
 class TaskPort extends ScriptedSessionPort {
 	readonly lookups: SessionSteerStatusInput[] = [];
 	lookup: SessionSteerStatusResult | undefined;
@@ -30,27 +47,60 @@ class TaskPort extends ScriptedSessionPort {
 		return this.lookup ?? { status: "unknown", clientRef: input.clientRef };
 	}
 }
-async function fixture(options: Partial<WorkLaneManagerOptions> = {}, portOptions: ConstructorParameters<typeof ScriptedSessionPort>[0] = {}, owned = false) {
+async function fixture(
+	options: Partial<WorkLaneManagerOptions> = {},
+	portOptions: ConstructorParameters<typeof ScriptedSessionPort>[0] = {},
+	owned = false,
+) {
 	const directory = await mkdtemp(join(tmpdir(), "firstmate-lane-"));
 	const db = await GatewayDatabase.open(join(directory, "gateway.db"));
-	const port = new TaskPort({ ...portOptions, onBind: (input) => {
-		const sessionId = db.getSessionRecord(input.originKey)?.sessionId ?? crypto.randomUUID();
-		if (!owned) db.putSession(input.originKey, sessionId);
-		return sessionId;
-	} });
+	const port = new TaskPort({
+		...portOptions,
+		onBind: (input) => {
+			const sessionId = db.getSessionRecord(input.originKey)?.sessionId ?? crypto.randomUUID();
+			if (!owned) db.putSession(input.originKey, sessionId);
+			return sessionId;
+		},
+	});
 	if (owned) {
 		attachTestBrokerOwnership(db, port, join(directory, "canonical-agent"));
-		db.recordOwnedBinding({ originKey: originKey(coordinator), sessionId: "persona-session",
-			epoch: 0, repo: directory, authority: db.inspectBrokerAuthority().authority! });
+		db.recordOwnedBinding({
+			originKey: originKey(coordinator),
+			sessionId: "persona-session",
+			epoch: 0,
+			repo: directory,
+			authority: db.inspectBrokerAuthority().authority!,
+		});
 	} else db.putSession(originKey(coordinator), "persona-session");
 	const lanes = new LaneGovernor({ database: db, sessionPort: port, maxLanes: 4 });
 	const settings = { database: db, port, lanes, pollMs: 5, taskSurfaceAvailable: () => true, ...options };
 	let manager = new WorkLaneManager(settings);
-	cleanup.push(async () => { await manager.stop(); db.close(); await rm(directory, { recursive: true, force: true }); });
-	const input = { name, text: "Investigate the issue without editing", cwd: directory, callerSessionId: "persona-session",
-		task: { taskId, kind: "read_only" as const, surface: { parentOrigin: coordinator } } };
-	return { directory, db, port, lanes, input, get manager() { return manager; },
-		restart: async () => { await manager.stop(); manager = new WorkLaneManager(settings); await manager.recover(); },
+	cleanup.push(async () => {
+		await manager.stop();
+		db.close();
+		await rm(directory, { recursive: true, force: true });
+	});
+	const input = {
+		name,
+		text: "Investigate the issue without editing",
+		cwd: directory,
+		callerSessionId: "persona-session",
+		task: { taskId, kind: "read_only" as const, surface: { parentOrigin: coordinator } },
+	};
+	return {
+		directory,
+		db,
+		port,
+		lanes,
+		input,
+		get manager() {
+			return manager;
+		},
+		restart: async () => {
+			await manager.stop();
+			manager = new WorkLaneManager(settings);
+			await manager.recover();
+		},
 		admit: () => manager.start(input, context),
 		bind: async (confirm = true) => {
 			await manager.threadClaim({ taskId, claimId });
@@ -60,8 +110,15 @@ async function fixture(options: Partial<WorkLaneManagerOptions> = {}, portOption
 				// Models a joined, authenticated adapter receipt; not a claim that the wire confirm supports it yet.
 				db.withTransaction(() => {
 					db.deliveryUpdate(marker.deliveryId!, "confirmed");
-					manager.recordTaskActivationInTransaction({ taskId, deliveryId: marker.deliveryId!, origin: thread,
-						messageId: "marker-1", evidenceAt: at, observedAt: at, principalId: "discord-adapter" });
+					manager.recordTaskActivationInTransaction({
+						taskId,
+						deliveryId: marker.deliveryId!,
+						origin: thread,
+						messageId: "marker-1",
+						evidenceAt: at,
+						observedAt: at,
+						principalId: "discord-adapter",
+					});
 				});
 				await manager.drainTaskControls(taskId);
 			}
@@ -70,12 +127,249 @@ async function fixture(options: Partial<WorkLaneManagerOptions> = {}, portOption
 	};
 }
 function event(eventId = "event-1", extra: Partial<MappedWorkEvent> = {}): MappedWorkEvent {
-	return { origin: thread, authorId: "owner", eventId, platformTimestamp: "2026-10-06T05:00:00.001Z", body: "Focus on the failure evidence", kind: "steer", ...extra };
+	return {
+		origin: thread,
+		authorId: "owner",
+		eventId,
+		platformTimestamp: "2026-10-06T05:00:00.001Z",
+		body: "Focus on the failure evidence",
+		kind: "steer",
+		...extra,
+	};
 }
 
 function executionSources(db: GatewayDatabase) {
 	return db.workTaskSources(taskId)!.sources.filter((source) => source.sourceId.startsWith("execution-"));
 }
+
+for (const availability of ["healthy", "held", "absent"] as const)
+	test(`original final is independent of ${availability} coordinator and missing original handoff recovers without replay`, async () => {
+		let held = availability === "held";
+		const wakes: string[] = [];
+		const f = await fixture({
+			personaHold: () => (held ? "fixture-held" : undefined),
+			notifyPersona: (key) => wakes.push(key),
+		});
+		await f.admit();
+		await f.bind();
+		const task = f.db.workTaskGet(taskId)!;
+		const raw = new Database(join(f.directory, "gateway.db"));
+		cleanup.push(async () => raw.close());
+		if (availability === "absent") raw.query("DELETE FROM sessions WHERE origin_key = ?").run(originKey(coordinator));
+		const answer = "한".repeat(5449) + "x\nOwner decision: choose red or blue?";
+		expect(Buffer.byteLength(answer)).toBe(16384);
+		f.port.complete(task.opRef, answer);
+		await until(() => f.db.workTaskGet(taskId)?.obligationState === "final_admitted");
+		const source = f.db.workTaskOriginalSource(taskId)!;
+		expect(source.body).toBe(answer);
+		expect(source.deliveryId).not.toBeNull();
+		const original = f.db.workAttemptGet(task.opRef)!;
+		expect(original.decision).toBe(availability === "healthy" ? "reported" : "fallback");
+		const historicalDelivery = f.db.deliveryGet(original.deliveryId);
+		held = false;
+		f.db.putSession(originKey(coordinator), "persona-session");
+		f.db.updateActivity(originKey(coordinator), JSON.stringify(coordinator));
+		await f.restart();
+		const report = raw
+			.query<{ body: string; state: string }, [string]>("SELECT body, state FROM inbound_messages WHERE message_id = ?")
+			.get(original.reportId)!;
+		expect(report.state).toBe("pending");
+		if (historicalDelivery) expect(report.body).toBe(JSON.parse(historicalDelivery.payload_json).text);
+		expect(f.db.workAttemptGet(task.opRef)).toEqual(original);
+		expect(f.db.deliveryGet(original.deliveryId)).toEqual(historicalDelivery);
+		const beforeWakes = wakes.length;
+		raw
+			.query("UPDATE inbound_messages SET state = 'done', turn_state = 'done' WHERE message_id = ?")
+			.run(original.reportId);
+		await f.restart();
+		await f.manager.recoverTaskReport(taskId);
+		expect(
+			raw
+				.query<{ state: string }, [string]>("SELECT state FROM inbound_messages WHERE message_id = ?")
+				.get(original.reportId)?.state,
+		).toBe("done");
+		expect(wakes.length).toBe(beforeWakes);
+		expect(f.db.workTaskPendingReviews(originKey(coordinator)).items[0]?.pending).toBe(true);
+		expect(f.db.workTaskOriginalSource(taskId)).toEqual(source);
+		expect(f.port.sends).toHaveLength(1);
+		expect(f.port.resumes).toHaveLength(0);
+	});
+
+test("coordinator review fences exact original and retains unanswered question independently of later quiet review", async () => {
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
+	const task = f.db.workTaskGet(taskId)!;
+	f.port.complete(task.opRef, "Original answer. Owner must select an option.");
+	await until(() => f.db.workTaskGet(taskId)?.obligationState === "final_admitted");
+	const settledTask = f.db.workTaskGet(taskId);
+	f.db.updateActivity(originKey(coordinator), JSON.stringify(coordinator));
+	const original = f.db.workTaskOriginalSource(taskId)!;
+	const input = {
+		taskId,
+		expectedOpRef: task.opRef,
+		reportId: original.reportId!,
+		sourceId: original.sourceId,
+		contentHash: original.contentHash,
+		reviewId: crypto.randomUUID(),
+		expectedReviewId: null,
+		callerSessionId: "persona-session",
+		callerEpoch: 0,
+		fullRead: true as const,
+		disposition: "owner_question" as const,
+		rationale: "Complete original inspected; scope requires owner's selection.",
+		question: "Choose red or blue?",
+	};
+	const deliveriesBefore = f.db.deliveryRows().length;
+	expect(() => f.db.workTaskReview({ ...input, callerEpoch: 1 })).toThrow("identity");
+	expect(() => f.db.workTaskReview({ ...input, contentHash: "0".repeat(64) })).toThrow("identity");
+	expect(() => f.db.workTaskReview({ ...input, expectedOpRef: "wrong-op" })).toThrow("identity");
+	expect(() => f.db.workTaskReview({ ...input, reportId: "wrong-report" })).toThrow("identity");
+	expect(() => f.db.workTaskReview({ ...input, callerSessionId: task.sessionId! })).toThrow("identity");
+	const foreign = { ...coordinator, conversationId: "999" } as OriginRef;
+	f.db.putSession(originKey(foreign), "foreign-persona");
+	f.db.updateActivity(originKey(foreign), JSON.stringify(foreign));
+	expect(() => f.db.workTaskReview({ ...input, callerSessionId: "foreign-persona" })).toThrow("identity");
+	const write = spyOn(f.db, "deliveryCreateInTransaction").mockImplementation(() => {
+		throw new Error("fixture notice crash");
+	});
+	expect(() => f.db.workTaskReview(input)).toThrow("fixture notice crash");
+	expect(f.db.workTaskSourceGet(`review-${input.reviewId}`)).toBeUndefined();
+	expect(f.db.workTaskReviewLocator(taskId)?.pending).toBe(true);
+	write.mockRestore();
+	const recorded = f.db.workTaskReview(input);
+	expect(recorded.execution).toBe("none");
+	expect(f.db.deliveryRows()).toHaveLength(deliveriesBefore + 1);
+	const notice = f.db.deliveryGet(recorded.deliveryId!)!;
+	expect(notice.origin_key).toBe(originKey(coordinator));
+	expect(JSON.parse(notice.payload_json).text).toContain(input.question);
+	expect(f.db.workTaskReview(input).disposition).toBe("duplicate");
+	expect(f.db.deliveryRows()).toHaveLength(deliveriesBefore + 1);
+	expect(() => f.db.workTaskReview({ ...input, question: "Changed?" })).toThrow("conflict");
+	expect(() => f.db.workTaskReview({ ...input, reviewId: crypto.randomUUID() })).toThrow("order");
+	const { question: _question, ...quiet } = input;
+	f.db.workTaskReview({
+		...quiet,
+		reviewId: crypto.randomUUID(),
+		expectedReviewId: input.reviewId,
+		disposition: "no_exception",
+		rationale: "Review correction only; not an answer to the earlier question.",
+	});
+	await f.restart();
+	const state = f.db.workTaskReviewLocator(taskId)!;
+	expect(state.pending).toBe(false);
+	expect(state.ownerQuestions).toEqual([
+		{ reviewId: input.reviewId, question: input.question, deliveryId: recorded.deliveryId! },
+	]);
+	expect(f.db.workTaskPendingReviews(originKey(coordinator)).items).toHaveLength(0);
+	expect(f.db.deliveryRows()).toHaveLength(deliveriesBefore + 1);
+	f.db.deliveryUpdate(recorded.deliveryId!, "confirmed");
+	f.db.retentionSweep(new Date("2099-01-01T00:00:00Z"));
+	expect(f.db.deliveryGet(recorded.deliveryId!)?.payload_json).toBe(notice.payload_json);
+	expect(f.db.workTaskReviewLocator(taskId)?.ownerQuestions).toHaveLength(1);
+	expect(f.db.workTaskGet(taskId)).toEqual(settledTask);
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("pending semantic review survives safe execution resource release", async () => {
+	const f = await fixture({}, {}, true);
+	await f.admit();
+	await f.bind();
+	const task = f.db.workTaskGet(taskId)!;
+	f.port.complete(task.opRef, "Complete original retained; no semantic review recorded.");
+	await until(() => f.db.workTaskGet(taskId)?.obligationState === "final_admitted");
+	const original = f.db.workTaskOriginalSource(taskId);
+	expect(f.db.workTaskReviewLocator(taskId)?.pending).toBe(true);
+	expect(f.manager.assessTaskRelease(name).kind).toBe("eligible");
+	expect(await f.lanes.retire(name, "operator")).toMatchObject({ retired: true, closed: true });
+	expect(f.lanes.activeLanes()).toHaveLength(0);
+	await f.restart();
+	expect(f.db.workTaskOriginalSource(taskId)).toEqual(original);
+	expect(f.db.workTaskPendingReviews(originKey(coordinator)).items.map((item) => item.taskId)).toContain(taskId);
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("pending review keysets reach later tasks and retained originals beyond source excerpt limits after restart", async () => {
+	const f = await fixture();
+	await f.manager.stop();
+	const lanes = new LaneGovernor({ database: f.db, sessionPort: f.port, maxLanes: 64 });
+	const manager = new WorkLaneManager({
+		database: f.db,
+		port: f.port,
+		lanes,
+		pollMs: 5,
+		taskSurfaceAvailable: () => true,
+	});
+	cleanup.push(async () => manager.stop());
+	const ids: string[] = [];
+	for (let index = 0; index < 23; index++) {
+		const id = `00000000-0000-4000-8000-${index.toString().padStart(12, "0")}`;
+		ids.push(id);
+		const localThread = { ...thread, conversationId: String(1000 + index) };
+		await manager.start(
+			{ ...f.input, name: `fm-${id}`, task: { ...f.input.task, taskId: id } },
+			{ ...context, evidence: { ...context.evidence, eventId: `assignment:${id}` } },
+		);
+		const localClaim = crypto.randomUUID();
+		await manager.threadClaim({ taskId: id, claimId: localClaim });
+		await manager.threadBind({ taskId: id, claimId: localClaim, outcome: { kind: "bound", origin: localThread } });
+		const task = f.db.workTaskGet(id)!;
+		f.port.complete(task.opRef, `Original report ${index}`);
+		await until(() => f.db.workTaskGet(id)?.obligationState === "final_admitted");
+	}
+	const original = f.db.workTaskOriginalSource(ids[0]!)!;
+	for (let index = 0; index < 55; index++)
+		f.db.withTransaction(() =>
+			f.db.workTaskSourceAppendInTransaction({
+				sourceId: `discussion-${index}`,
+				taskId: ids[0]!,
+				kind: "observation",
+				body: `Later evidence ${index}`,
+				evidence: { ...context.evidence, eventId: `discussion:${index}` },
+				supersedes: null,
+				completeness: "incomplete",
+				controlId: null,
+				reportId: null,
+			}),
+		);
+	await manager.stop();
+	const caller = { originKey: originKey(coordinator), sessionId: "persona-session", epoch: 0 };
+	const firstTurn = buildWorkTaskReviewTurnContext(f.db, caller);
+	expect(firstTurn).toContain(ids[0]!);
+	expect(firstTurn).not.toContain(ids[22]!);
+	const reopened = await GatewayDatabase.open(join(f.directory, "gateway.db"));
+	try {
+		const laterTurn = buildWorkTaskReviewTurnContext(reopened, caller);
+		expect(laterTurn).toContain(ids[22]!);
+		expect(laterTurn).not.toContain(ids[0]!);
+		expect(buildWorkTaskReviewTurnContext(reopened, caller)).toContain(ids[0]!);
+		const first = reopened.workTaskPendingReviews(originKey(coordinator));
+		expect(first.items).toHaveLength(20);
+		expect(first.items[0]?.sourceId).toBe(original.sourceId);
+		expect(first.nextTaskId).not.toBeNull();
+		const second = reopened.workTaskPendingReviews(originKey(coordinator), first.nextTaskId!);
+		expect(second.items).toHaveLength(3);
+		expect(second.nextTaskId).toBeNull();
+		expect([...first.items, ...second.items].map((item) => item.taskId)).toEqual(ids);
+		expect(reopened.workTaskPendingReviews("discord/channel/foreign").items).toHaveLength(0);
+		const raw = new Database(join(f.directory, "gateway.db"));
+		try {
+			raw.query("UPDATE work_tasks SET record_json = '{}' WHERE task_id = ?").run(ids[0]!);
+		} finally {
+			raw.close();
+		}
+		const damaged = reopened.workTaskPendingReviews(originKey(coordinator));
+		expect(damaged.unavailableTaskIds).toContain(ids[0]!);
+		expect(damaged.items.map((item) => item.taskId)).toContain(ids[19]!);
+		expect(
+			reopened.workTaskPendingReviews(originKey(coordinator), damaged.nextTaskId!).items.map((item) => item.taskId),
+		).toContain(ids[22]!);
+	} finally {
+		reopened.close();
+	}
+	expect(f.port.sends).toHaveLength(23);
+	expect(f.port.resumes).toHaveLength(0);
+});
 
 test("real repository reconciliation retains one original checkpoint with immutable evidence and mapped intent", async () => {
 	let clock = Date.parse(at);
@@ -86,14 +380,37 @@ test("real repository reconciliation retains one original checkpoint with immuta
 		return result.stdout.toString().trim();
 	};
 	git("init");
-	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "baseline");
-	await f.admit(); await f.bind();
+	git(
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"baseline",
+	);
+	await f.admit();
+	await f.bind();
 	const task = f.db.workTaskGet(taskId)!;
-	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "checkpoint");
+	git(
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"checkpoint",
+	);
 	const sha = git("rev-parse", "HEAD");
 	// A later settlement failure must not refresh the already observed checkpoint.
-	const settle = spyOn(f.db, "workAttemptSettleInTransaction").mockImplementation(() => { throw new Error("settlement unavailable"); });
-	cleanup.push(async () => { settle.mockRestore(); });
+	const settle = spyOn(f.db, "workAttemptSettleInTransaction").mockImplementation(() => {
+		throw new Error("settlement unavailable");
+	});
+	cleanup.push(async () => {
+		settle.mockRestore();
+	});
 	f.port.complete(task.opRef, "Original result");
 	await until(() => executionSources(f.db).some((source) => source.body.includes(sha)));
 	const source = executionSources(f.db).find((source) => source.body.includes(sha))!;
@@ -104,10 +421,21 @@ test("real repository reconciliation retains one original checkpoint with immuta
 	expect(source.body).toContain("not semantic progress");
 	const delivery = f.db.deliveryGet(source.deliveryId!)!;
 	expect(JSON.parse(delivery.payload_json)).toMatchObject({
-		origin: thread, text: source.body, workTask: { taskId, opRef: task.opRef, sourceId: source.sourceId, mappedOnly: true },
+		origin: thread,
+		text: source.body,
+		workTask: { taskId, opRef: task.opRef, sourceId: source.sourceId, mappedOnly: true },
 	});
 	clock += 60_000;
-	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "changed checkpoint");
+	git(
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"changed checkpoint",
+	);
 	const changedSha = git("rev-parse", "HEAD");
 	await until(() => executionSources(f.db).some((item) => item.body.includes(changedSha)));
 	const changed = executionSources(f.db).find((item) => item.body.includes(changedSha))!;
@@ -118,19 +446,29 @@ test("real repository reconciliation retains one original checkpoint with immuta
 	await f.restart();
 	expect(executionSources(f.db).filter((item) => item.body.includes(sha))).toEqual([source]);
 	const selected = buildWorkTaskContext(f.db, { taskId }, () => new Date(clock));
-	expect(selected.manifest.find((entry) => entry.sourceId === source.sourceId))
-		.toMatchObject({ evidenceAt: at, observedAt: at, completeness: "partial", revision: source.contentHash });
-	expect(selected.items.find((entry) => entry.sourceId === source.sourceId)?.text).toContain("source completeness incomplete");
+	expect(selected.manifest.find((entry) => entry.sourceId === source.sourceId)).toMatchObject({
+		evidenceAt: at,
+		observedAt: at,
+		completeness: "partial",
+		revision: source.contentHash,
+	});
+	expect(selected.items.find((entry) => entry.sourceId === source.sourceId)?.text).toContain(
+		"source completeness incomplete",
+	);
 	expect(selected.renderedAt).not.toBe(source.evidence.observedAt);
 	expect(f.port.sends).toHaveLength(1);
 });
 
 test("observer exception persists only a bounded original fact once across recovery and selection", async () => {
 	let clock = Date.parse(at);
-	const f = await fixture({ now: () => clock }); await f.admit(); await f.bind();
+	const f = await fixture({ now: () => clock });
+	await f.admit();
+	await f.bind();
 	const task = f.db.workTaskGet(taskId)!;
 	const status = spyOn(f.port, "status").mockRejectedValue(new Error("secret-token raw stdout private transcript"));
-	cleanup.push(async () => { status.mockRestore(); });
+	cleanup.push(async () => {
+		status.mockRestore();
+	});
 	await until(() => executionSources(f.db).length === 1);
 	const source = executionSources(f.db)[0]!;
 	expect(source.body).toContain("reconciliation unavailable");
@@ -150,10 +488,16 @@ test("observer exception persists only a bounded original fact once across recov
 	expect(f.port.sends).toHaveLength(1);
 	status.mockRestore();
 	const output = spyOn(f.port, "fetchWorkerOutput").mockRejectedValue(new Error("unavailable private output"));
-	cleanup.push(async () => { output.mockRestore(); });
+	cleanup.push(async () => {
+		output.mockRestore();
+	});
 	f.port.complete(task.opRef, "Independent original completion");
-	await until(() => executionSources(f.db).some((item) => item.body.includes("Observation category: output_unavailable")));
-	const outputFact = executionSources(f.db).find((item) => item.body.includes("Observation category: output_unavailable"))!;
+	await until(() =>
+		executionSources(f.db).some((item) => item.body.includes("Observation category: output_unavailable")),
+	);
+	const outputFact = executionSources(f.db).find((item) =>
+		item.body.includes("Observation category: output_unavailable"),
+	)!;
 	expect(outputFact.sourceId).not.toBe(source.sourceId);
 	expect(outputFact.evidence.observedAt).toBe(new Date(clock).toISOString());
 	expect(outputFact.body).not.toContain("private output");
@@ -163,17 +507,25 @@ test("observer exception persists only a bounded original fact once across recov
 });
 
 test("observation source and whole mapped intent roll back together before retry", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	const before = f.db.deliveryRows().map((row) => row.delivery_id);
 	const append = f.db.workTaskSourceAppendInTransaction.bind(f.db);
 	let failed = false;
 	const write = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation((input, payload) => {
 		const source = append(input, payload);
-		if (input.sourceId.startsWith("execution-")) { failed = true; throw new Error("rollback joined observation"); }
+		if (input.sourceId.startsWith("execution-")) {
+			failed = true;
+			throw new Error("rollback joined observation");
+		}
 		return source;
 	});
 	const status = spyOn(f.port, "status").mockRejectedValue(new Error("unavailable"));
-	cleanup.push(async () => { write.mockRestore(); status.mockRestore(); });
+	cleanup.push(async () => {
+		write.mockRestore();
+		status.mockRestore();
+	});
 	await until(() => failed);
 	expect(executionSources(f.db)).toHaveLength(0);
 	expect(f.db.deliveryRows().map((row) => row.delivery_id)).toEqual(before);
@@ -186,11 +538,15 @@ test("observation source and whole mapped intent roll back together before retry
 
 test("unavailable mapped surface keeps immutable null-intent audit without later fallback or resend", async () => {
 	let available = true;
-	const f = await fixture({ taskSurfaceAvailable: () => available }); await f.admit(); await f.bind();
+	const f = await fixture({ taskSurfaceAvailable: () => available });
+	await f.admit();
+	await f.bind();
 	available = false;
 	const before = f.db.deliveryRows().map((row) => row.delivery_id);
 	const status = spyOn(f.port, "status").mockRejectedValue(new Error("unavailable"));
-	cleanup.push(async () => { status.mockRestore(); });
+	cleanup.push(async () => {
+		status.mockRestore();
+	});
 	await until(() => executionSources(f.db).length === 1);
 	const source = executionSources(f.db)[0]!;
 	expect(source.deliveryId).toBeNull();
@@ -202,7 +558,9 @@ test("unavailable mapped surface keeps immutable null-intent audit without later
 });
 
 test("status exception after original binding replacement cannot publish against the replacement", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	let called = false;
 	const status = spyOn(f.port, "status").mockImplementation(async () => {
 		f.db.rebindEpoch(workSessionKey(name));
@@ -210,7 +568,9 @@ test("status exception after original binding replacement cannot publish against
 		called = true;
 		throw new Error("original query failed after replacement");
 	});
-	cleanup.push(async () => { status.mockRestore(); });
+	cleanup.push(async () => {
+		status.mockRestore();
+	});
 	await until(() => called);
 	await f.manager.stop();
 	expect(executionSources(f.db)).toHaveLength(0);
@@ -218,7 +578,9 @@ test("status exception after original binding replacement cannot publish against
 });
 
 test("task status discards original query evidence when binding epoch changes in flight", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	const task = f.db.workTaskGet(taskId)!;
 	f.port.complete(task.opRef, "Original terminal evidence");
 	await until(() => f.db.workAttemptGet(task.opRef)?.settledAt != null);
@@ -234,8 +596,13 @@ test("task status discards original query evidence when binding epoch changes in
 	expect(status).toHaveBeenCalledTimes(1);
 	expect(result.op).toBeNull();
 	expect(result.sessionId).toBe(task.sessionId!);
-	expect(result.task).toMatchObject({ taskId, opRef: task.opRef, sessionId: task.sessionId,
-		epoch: task.epoch, obligation: "final_admitted" });
+	expect(result.task).toMatchObject({
+		taskId,
+		opRef: task.opRef,
+		sessionId: task.sessionId,
+		epoch: task.epoch,
+		obligation: "final_admitted",
+	});
 	expect(f.db.workTaskGet(taskId)).toEqual(before);
 	status.mockClear();
 	expect((await f.manager.status({ name, taskId, expectedOpRef: task.opRef })).op).toBeNull();
@@ -247,50 +614,89 @@ test("task status discards original query evidence when binding epoch changes in
 });
 
 test("typed explicit steering preserves source, deduplicates across restart, and refuses missing authority", async () => {
-	const f = await fixture(); await f.admit(); await f.bind(false);
+	const f = await fixture();
+	await f.admit();
+	await f.bind(false);
 	const task = f.db.workTaskGet(taskId)!;
-	const params = { name, taskId, expectedOpRef: task.opRef, eventId: "cli:owner-steer", text: "Inspect original evidence" };
+	const params = {
+		name,
+		taskId,
+		expectedOpRef: task.opRef,
+		eventId: "cli:owner-steer",
+		text: "Inspect original evidence",
+	};
 	const local = { ...context, evidence: { ...context.evidence, eventId: params.eventId } };
 	await expect(f.manager.steer(params)).rejects.toThrow();
 	await expect(f.manager.steer(params, { ...local, stableOrigin: null })).rejects.toThrow();
 	await expect(f.manager.steer({ ...params, expectedOpRef: "gw-wrong" }, local)).rejects.toThrow();
-	expect(await f.manager.steer(params, local)).toMatchObject({ route: "work_task", delivery: "accepted", steered: true });
+	expect(await f.manager.steer(params, local)).toMatchObject({
+		route: "work_task",
+		delivery: "accepted",
+		steered: true,
+	});
 	const control = f.db.workControlList(taskId)[0]!;
 	expect(control.request.evidence.origin).toEqual(coordinator);
 	expect(f.db.workTaskSourceGet(`route-${control.controlId}`)?.kind).toBe("decision");
 	await f.restart();
-	expect(await f.manager.steer(params, { ...local, evidence: { ...local.evidence, observedAt: "2026-10-06T06:00:00Z" } }))
-		.toMatchObject({ delivery: "accepted", controlId: control.controlId });
+	expect(
+		await f.manager.steer(params, { ...local, evidence: { ...local.evidence, observedAt: "2026-10-06T06:00:00Z" } }),
+	).toMatchObject({ delivery: "accepted", controlId: control.controlId });
 	expect(f.port.steers).toHaveLength(1);
 	expect(f.port.sends).toHaveLength(1);
 });
 
 test("ambiguous equal-time mapped ingress cannot cross the marker floor", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
-	expect(await f.manager.admitMappedEvent(event("ambiguous", { platformTimestamp: at })))
-		.toMatchObject({ delivery: "refused", reason: "message_precedes_activation_marker" });
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
+	expect(await f.manager.admitMappedEvent(event("ambiguous", { platformTimestamp: at }))).toMatchObject({
+		delivery: "refused",
+		reason: "message_precedes_activation_marker",
+	});
 	expect(f.port.steers).toHaveLength(0);
 });
 
 test("one explicit source event has independent outcomes and identities for two named tasks", async () => {
 	let calls = 0;
-	const f = await fixture({}, { onSteer: () => { if (++calls === 2) throw steerRefused(); } });
-	await f.admit(); await f.bind(false);
+	const f = await fixture(
+		{},
+		{
+			onSteer: () => {
+				if (++calls === 2) throw steerRefused();
+			},
+		},
+	);
+	await f.admit();
+	await f.bind(false);
 	const secondId = "c7654d21-6806-4fdc-89ef-e2f9c038e4f9";
 	const secondName = `fm-${secondId}`;
 	await f.manager.start({ ...f.input, name: secondName, task: { ...f.input.task, taskId: secondId } }, context);
 	const secondClaim = crypto.randomUUID();
 	await f.manager.threadClaim({ taskId: secondId, claimId: secondClaim });
-	await f.manager.threadBind({ taskId: secondId, claimId: secondClaim, outcome: {
-		kind: "bound", origin: { ...thread, conversationId: "201" },
-	} });
+	await f.manager.threadBind({
+		taskId: secondId,
+		claimId: secondClaim,
+		outcome: {
+			kind: "bound",
+			origin: { ...thread, conversationId: "201" },
+		},
+	});
 	const eventId = "discord:wider-direction";
 	const evidence = { ...context, evidence: { ...context.evidence, eventId } };
 	for (const id of [taskId, secondId]) {
 		const task = f.db.workTaskGet(id)!;
-		expect(await f.manager.steer({ name: task.laneName, taskId: id, expectedOpRef: task.opRef,
-			eventId, text: "Inspect the same incident in your own scope" }, evidence))
-			.toMatchObject({ delivery: id === taskId ? "accepted" : "refused" });
+		expect(
+			await f.manager.steer(
+				{
+					name: task.laneName,
+					taskId: id,
+					expectedOpRef: task.opRef,
+					eventId,
+					text: "Inspect the same incident in your own scope",
+				},
+				evidence,
+			),
+		).toMatchObject({ delivery: id === taskId ? "accepted" : "refused" });
 	}
 	const first = f.db.workControlList(taskId)[0]!;
 	const second = f.db.workControlList(secondId)[0]!;
@@ -302,38 +708,60 @@ test("one explicit source event has independent outcomes and identities for two 
 });
 
 test("typed control source and admission roll back together", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	const task = f.db.workTaskGet(taskId)!;
-	const fail = spyOn(f.db, "workControlAdmitInTransaction").mockImplementation(() => { throw new Error("admission failed"); });
+	const fail = spyOn(f.db, "workControlAdmitInTransaction").mockImplementation(() => {
+		throw new Error("admission failed");
+	});
 	const params = { name, taskId, expectedOpRef: task.opRef, eventId: "cli:rollback", text: "Inspect evidence" };
-	await expect(f.manager.steer(params, { ...context, evidence: { ...context.evidence, eventId: params.eventId } })).rejects.toThrow();
+	await expect(
+		f.manager.steer(params, { ...context, evidence: { ...context.evidence, eventId: params.eventId } }),
+	).rejects.toThrow();
 	fail.mockRestore();
 	expect(f.db.workControlList(taskId)).toHaveLength(0);
 	expect(f.port.steers).toHaveLength(0);
-	expect(await f.manager.steer(params, { ...context, evidence: { ...context.evidence, eventId: params.eventId } }))
-		.toMatchObject({ delivery: "accepted" });
+	expect(
+		await f.manager.steer(params, { ...context, evidence: { ...context.evidence, eventId: params.eventId } }),
+	).toMatchObject({ delivery: "accepted" });
 });
 
 test("unavailable original result can later supplement once without rewriting settled history", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	const task = f.db.workTaskGet(taskId)!;
 	await f.manager.admitMappedEvent(event("local-cancel", { kind: "cancel_request" }));
 	expect(f.manager.taskDebt(name)).toMatchObject({ exactTerminal: false, safeToReleaseExecution: false });
-	const unavailable = spyOn(f.port, "fetchWorkerOutput").mockResolvedValue({ status: "unavailable", code: "output_unavailable" });
+	const unavailable = spyOn(f.port, "fetchWorkerOutput").mockResolvedValue({
+		status: "unavailable",
+		code: "output_unavailable",
+	});
 	f.port.complete(task.opRef, "Late complete original answer");
 	await until(() => f.db.workAttemptGet(task.opRef)?.settledAt != null);
 	const before = f.db.workAttemptGet(task.opRef)!;
 	expect(before.output.proof).toBeNull();
-	expect(f.manager.taskDebt(name)).toMatchObject({ exactTerminal: true, safeToReleaseExecution: false,
-		safeToCleanupWorktree: false, unresolvedControls: 1 });
+	expect(f.manager.taskDebt(name)).toMatchObject({
+		exactTerminal: true,
+		safeToReleaseExecution: false,
+		safeToCleanupWorktree: false,
+		unresolvedControls: 1,
+	});
 	expect(await f.manager.recoverTaskReport(taskId)).toMatchObject({ disposition: "held" });
 	unavailable.mockRestore();
-	const original = await f.port.fetchWorkerOutput({ sessionId: before.sessionId, repo: before.cwd,
-		opRef: before.opRef, notBeforeMs: Date.parse(before.startedAt), terminalIdentity: before.terminal!.status,
-		isCurrent: () => true });
+	const original = await f.port.fetchWorkerOutput({
+		sessionId: before.sessionId,
+		repo: before.cwd,
+		opRef: before.opRef,
+		notBeforeMs: Date.parse(before.startedAt),
+		terminalIdentity: before.terminal!.status,
+		isCurrent: () => true,
+	});
 	if (original.status !== "proven") throw new Error("fixture must retain original result");
 	const wrong = spyOn(f.port, "fetchWorkerOutput").mockResolvedValue({
-		...original, provenance: { ...original.provenance, sessionId: "wrong-session" },
+		...original,
+		provenance: { ...original.provenance, sessionId: "wrong-session" },
 	});
 	expect(await f.manager.recoverTaskReport(taskId)).toMatchObject({ disposition: "held" });
 	expect(f.db.workTaskSourceGet(`supplement-${taskId}-original`)).toBeUndefined();
@@ -364,7 +792,10 @@ test("durable intake deduplicates transport observations, conflicts cannot dispa
 	const f = await fixture();
 	const first = await f.admit();
 	expect(first).toMatchObject({ accepted: "durable", execution: "pending_surface", taskId });
-	const duplicate = await f.manager.start(f.input, { ...context, evidence: { ...context.evidence, observedAt: "2026-10-06T06:00:00Z" } });
+	const duplicate = await f.manager.start(f.input, {
+		...context,
+		evidence: { ...context.evidence, observedAt: "2026-10-06T06:00:00Z" },
+	});
 	expect(duplicate).toEqual(first);
 	await expect(f.manager.start({ ...f.input, text: "different assignment" }, context)).rejects.toThrow();
 	expect(f.port.binds).toHaveLength(0);
@@ -394,7 +825,9 @@ test("claim grants creation once, bind preserves reserved original operation and
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.sends[0]?.opRef).toBe(original.opRef!);
 	expect(f.db.workTaskGet(taskId)).toMatchObject({ dispatchPhase: "prepared", opRef: original.opRef!, thread });
-	await expect(f.manager.threadBind({ taskId, claimId, outcome: { kind: "bound", origin: { ...thread, conversationId: "201" } } })).rejects.toThrow();
+	await expect(
+		f.manager.threadBind({ taskId, claimId, outcome: { kind: "bound", origin: { ...thread, conversationId: "201" } } }),
+	).rejects.toThrow();
 });
 
 test("selected thread is verified and bound without any create authorization", async () => {
@@ -407,7 +840,8 @@ test("selected thread is verified and bound without any create authorization", a
 
 test("bare start/run/resume/steer cannot bypass original task mandate", async () => {
 	const f = await fixture();
-	await f.admit(); await f.bind();
+	await f.admit();
+	await f.bind();
 	const ordinary = { name, text: "retask", cwd: f.directory, resume: true };
 	await expect(f.manager.start(ordinary)).rejects.toThrow();
 	await expect(f.manager.run(ordinary, {})).rejects.toThrow();
@@ -425,9 +859,12 @@ test("surface guard refuses active/unverified thread before worker creation", as
 });
 
 test("binding and activation source roll back together on payload persistence failure", async () => {
-	const f = await fixture(); await f.admit();
+	const f = await fixture();
+	await f.admit();
 	await f.manager.threadClaim({ taskId, claimId });
-	const fail = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation(() => { throw new Error("disk failure"); });
+	const fail = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation(() => {
+		throw new Error("disk failure");
+	});
 	await expect(f.bind()).rejects.toThrow("disk failure");
 	fail.mockRestore();
 	expect(f.db.workTaskGet(taskId)?.surfacePhase).toBe("claimed");
@@ -436,7 +873,9 @@ test("binding and activation source roll back together on payload persistence fa
 });
 
 test("mapped concurrent duplicates are ordered, edited bodies require distinct edit identity", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	const [one, same] = await Promise.all([f.manager.admitMappedEvent(event()), f.manager.admitMappedEvent(event())]);
 	expect(one.controlId).toBe(same.controlId);
 	expect(one.delivery).toBe("accepted");
@@ -445,40 +884,135 @@ test("mapped concurrent duplicates are ordered, edited bodies require distinct e
 	await f.manager.admitMappedEvent(event("event-1", { editId: "edit-1", body: "changed" }));
 	expect(f.port.steers).toHaveLength(2);
 	expect(f.db.workControlList(taskId).map((c) => c.sequence)).toEqual([1, 2]);
-	expect(f.db.workControlList(taskId).every((c) => c.notificationDisposition !== null)).toBe(true);
+	expect(f.db.workControlList(taskId).every((c) => c.notificationDisposition === null)).toBe(true);
+	expect(f.db.inboundPendingOldest(originKey(coordinator))).toBeUndefined();
+});
+
+for (const held of [false, true]) {
+	test(`policy D quiet control dispositions retain detail and identities across recovery (persona held=${held})`, async () => {
+		let count = 0;
+		const f = await fixture(
+			{ personaHold: () => (held ? "test_hold" : undefined) },
+			{
+				onSteer: () => {
+					count++;
+					if (count === 2) throw steerRefused();
+					if (count === 3) throw new Error("receipt lost");
+				},
+			},
+		);
+		await f.admit();
+		await f.bind();
+		for (const id of ["accepted", "refused", "held"]) await f.manager.admitMappedEvent(event(id));
+		const before = f.db.workControlList(taskId);
+		expect(before.map((control) => control.phase)).toEqual(["accepted", "refused", "held"]);
+		for (const control of before) {
+			expect(control.notificationDisposition).toBeNull();
+			expect(f.db.deliveryGet(control.notificationId)).toBeUndefined();
+			const source = f.db.workTaskSourceGet(`disposition-${control.controlId}-${control.phase}`)!;
+			expect(source.controlId).toBe(control.controlId);
+			expect(source.body).toContain(control.phase);
+			expect(source.deliveryId).not.toBeNull();
+			expect(JSON.parse(f.db.deliveryGet(source.deliveryId!)!.payload_json).origin).toEqual(thread);
+		}
+		expect(f.db.inboundPendingOldest(originKey(coordinator))).toBeUndefined();
+		await f.restart();
+		for (const id of ["accepted", "refused", "held"]) await f.manager.admitMappedEvent(event(id));
+		expect(f.db.workControlList(taskId)).toEqual(before);
+		for (const control of before) expect(f.db.deliveryGet(control.notificationId)).toBeUndefined();
+		expect(f.db.inboundPendingOldest(originKey(coordinator))).toBeUndefined();
+		const view = buildWorkTaskContext(f.db, { taskId });
+		expect(view.items.some((item) => item.text.includes("Steering acceptance is not task completion."))).toBe(true);
+		expect(f.port.steers).toHaveLength(3);
+		expect(f.port.sends).toHaveLength(1);
+	});
+}
+
+test("recovered accepted steering stays quiet and retains the original held observation", async () => {
+	const f = await fixture(
+		{},
+		{
+			onSteer: () => {
+				throw new Error("lost receipt");
+			},
+		},
+	);
+	await f.admit();
+	await f.bind();
+	await f.manager.admitMappedEvent(event());
+	const control = f.db.workControlList(taskId)[0]!;
+	const heldSource = f.db.workTaskSourceGet(`disposition-${control.controlId}-held`)!;
+	f.port.lookup = { status: "accepted", clientRef: control.clientRef!, acceptedAt: Date.parse(at) };
+	await f.restart();
+	expect(f.db.workControlList(taskId)[0]).toMatchObject({
+		controlId: control.controlId,
+		clientRef: control.clientRef,
+		phase: "accepted",
+		notificationDisposition: null,
+	});
+	expect(f.db.inboundPendingOldest(originKey(coordinator))).toBeUndefined();
+	expect(f.db.deliveryGet(control.notificationId)).toBeUndefined();
+	expect(f.db.workTaskSourceGet(heldSource.sourceId)).toEqual(heldSource);
+	const acceptedSource = f.db.workTaskSourceGet(`disposition-${control.controlId}-accepted`)!;
+	expect(acceptedSource.controlId).toBe(control.controlId);
+	expect(acceptedSource.deliveryId).not.toBeNull();
+	expect(f.port.steers).toHaveLength(1);
 });
 
 test("prebinding, missing platform time and history cannot reach steering transport", async () => {
-	const f = await fixture(); await f.admit();
+	const f = await fixture();
+	await f.admit();
 	await expect(f.manager.admitMappedEvent(event())).rejects.toThrow();
 	await f.bind();
 	await expect(f.manager.admitMappedEvent(event("missing", { platformTimestamp: null }))).rejects.toThrow();
-	await expect(f.manager.admitMappedEvent(event("history", { platformTimestamp: "2026-10-06T04:59:59Z" }))).rejects.toThrow();
+	await expect(
+		f.manager.admitMappedEvent(event("history", { platformTimestamp: "2026-10-06T04:59:59Z" })),
+	).rejects.toThrow();
 	expect(f.port.steers).toHaveLength(0);
 });
 
 test("local cancel retains debt without blocking later steering; reset never rebinds", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
-	expect(await f.manager.admitMappedEvent(event("cancel", { kind: "cancel_request" }))).toMatchObject({ delivery: "held" });
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
+	expect(await f.manager.admitMappedEvent(event("cancel", { kind: "cancel_request" }))).toMatchObject({
+		delivery: "held",
+	});
 	expect(await f.manager.admitMappedEvent(event("later"))).toMatchObject({ delivery: "accepted" });
 	await f.manager.admitMappedEvent(event("reset", { kind: "reset_notice" }));
 	expect(f.port.steers).toHaveLength(1);
-	expect(f.db.workControlList(taskId)[0]).toMatchObject({ phase: "held", sendingAt: null,
-		receipt: null, reason: "local_operator_action_required" });
+	expect(f.db.workControlList(taskId)[0]).toMatchObject({
+		phase: "held",
+		sendingAt: null,
+		receipt: null,
+		reason: "local_operator_action_required",
+	});
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
 });
 
 test("shared read-only task cannot elevate typed scope before steer", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
-	expect(await f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).toMatchObject({ delivery: "refused" });
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
+	expect(await f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).toMatchObject({
+		delivery: "refused",
+	});
 	expect(f.port.steers).toHaveLength(0);
 	expect(f.db.workTaskGet(taskId)?.request.kind).toBe("read_only");
 });
 
 test("lost steer receipt stays held across restart with no resend and blocks successors", async () => {
-	const f = await fixture({}, { onSteer: () => { throw new Error("lost response"); } });
-	await f.admit(); await f.bind();
+	const f = await fixture(
+		{},
+		{
+			onSteer: () => {
+				throw new Error("lost response");
+			},
+		},
+	);
+	await f.admit();
+	await f.bind();
 	const first = await f.manager.admitMappedEvent(event());
 	expect(first.delivery).toBe("held");
 	await f.manager.admitMappedEvent(event("second"));
@@ -491,14 +1025,23 @@ test("lost steer receipt stays held across restart with no resend and blocks suc
 
 test("definitive steer refusal is not uncertain and permits next control", async () => {
 	let calls = 0;
-	const f = await fixture({}, { onSteer: () => { if (++calls === 1) throw steerRefused(); } });
-	await f.admit(); await f.bind();
+	const f = await fixture(
+		{},
+		{
+			onSteer: () => {
+				if (++calls === 1) throw steerRefused();
+			},
+		},
+	);
+	await f.admit();
+	await f.bind();
 	expect(await f.manager.admitMappedEvent(event())).toMatchObject({ delivery: "refused" });
 	expect(await f.manager.admitMappedEvent(event("next"))).toMatchObject({ delivery: "accepted" });
 });
 
 test("prepared send lost before receipt is never resent on recovery", async () => {
-	const f = await fixture(); await f.admit();
+	const f = await fixture();
+	await f.admit();
 	const send = spyOn(f.port, "send").mockRejectedValue(new Error("transport unknown"));
 	await expect(f.bind()).rejects.toThrow();
 	expect(f.db.workTaskGet(taskId)?.dispatchPhase).toBe("prepared");
@@ -509,7 +1052,8 @@ test("prepared send lost before receipt is never resent on recovery", async () =
 });
 
 test("pending original intent after bind commit can dispatch once on recovery", async () => {
-	const f = await fixture(); await f.admit();
+	const f = await fixture();
+	await f.admit();
 	const bind = spyOn(f.port, "bind").mockRejectedValue(new Error("before prepare"));
 	await expect(f.bind()).rejects.toThrow();
 	expect(f.db.workTaskGet(taskId)?.dispatchPhase).toBe("pending");
@@ -520,15 +1064,21 @@ test("pending original intent after bind commit can dispatch once on recovery", 
 });
 
 test("wrong current binding never steers another session", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	f.db.putSession(workSessionKey(name), "replacement-session");
 	await f.manager.admitMappedEvent(event());
 	expect(f.port.steers).toHaveLength(0);
 });
 
 test("source and notification transition rollback prevents unrecorded steering", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
-	const fail = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation(() => { throw new Error("source write failed"); });
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
+	const fail = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation(() => {
+		throw new Error("source write failed");
+	});
 	await expect(f.manager.admitMappedEvent(event())).rejects.toThrow();
 	fail.mockRestore();
 	expect(f.db.workControlList(taskId)).toHaveLength(0);
@@ -536,7 +1086,9 @@ test("source and notification transition rollback prevents unrecorded steering",
 });
 
 test("complete original result retains raw UTF-8 body separately from coordinator envelope", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	const task = f.db.workTaskGet(taskId)!;
 	const text = "결과".repeat(1000);
 	f.port.complete(task.opRef, text);
@@ -550,7 +1102,9 @@ test("complete original result retains raw UTF-8 body separately from coordinato
 });
 
 test("oversized original output honestly holds rather than archiving an excerpt", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	f.port.complete(f.db.workTaskGet(taskId)!.opRef, "x".repeat(16 * 1024 + 1));
 	await until(() => f.db.workTaskGet(taskId)?.obligationState === "held");
 	expect(f.db.workTaskSourceGet(`final-${taskId}-original`)).toBeUndefined();
@@ -559,7 +1113,9 @@ test("oversized original output honestly holds rather than archiving an excerpt"
 
 test("invalid mapping holds detail without redirecting full final to coordinator", async () => {
 	let available = true;
-	const f = await fixture({ taskSurfaceAvailable: () => available }); await f.admit(); await f.bind();
+	const f = await fixture({ taskSurfaceAvailable: () => available });
+	await f.admit();
+	await f.bind();
 	available = false;
 	f.port.complete(f.db.workTaskGet(taskId)!.opRef, "private final");
 	await until(() => f.db.workTaskGet(taskId)?.obligationState === "held");
@@ -578,7 +1134,9 @@ test("existing task-name history refuses assignment before reserving another ope
 });
 
 test("binding time is not an ingress floor: pending controls wait for the confirmed marker", async () => {
-	const f = await fixture(); await f.admit(); await f.bind(false);
+	const f = await fixture();
+	await f.admit();
+	await f.bind(false);
 	expect(f.db.workTaskSourceGet(`activation-floor-${taskId}`)).toBeUndefined();
 	expect(await f.manager.admitMappedEvent(event())).toMatchObject({ delivery: "pending", route: "work_task" });
 	expect(f.port.steers).toHaveLength(0);
@@ -588,16 +1146,27 @@ test("binding time is not an ingress floor: pending controls wait for the confir
 });
 
 test("post-marker edit cannot authorize an old message, and marker proof joins confirmation rollback", async () => {
-	const f = await fixture(); await f.admit(); await f.bind(false);
+	const f = await fixture();
+	await f.admit();
+	await f.bind(false);
 	await f.manager.admitMappedEvent(event("old", { platformTimestamp: "2026-10-06T04:59:59Z" }));
 	await f.manager.admitMappedEvent(event("old", { editId: "new-edit", platformTimestamp: "2026-10-06T04:59:59Z" }));
 	const marker = f.db.workTaskSourceGet(`activation-${taskId}`)!;
-	expect(() => f.db.withTransaction(() => {
-		f.db.deliveryUpdate(marker.deliveryId!, "confirmed");
-		f.manager.recordTaskActivationInTransaction({ taskId, deliveryId: marker.deliveryId!, origin: thread,
-			messageId: "marker-1", evidenceAt: at, observedAt: at, principalId: "discord-adapter" });
-		throw new Error("rollback");
-	})).toThrow("rollback");
+	expect(() =>
+		f.db.withTransaction(() => {
+			f.db.deliveryUpdate(marker.deliveryId!, "confirmed");
+			f.manager.recordTaskActivationInTransaction({
+				taskId,
+				deliveryId: marker.deliveryId!,
+				origin: thread,
+				messageId: "marker-1",
+				evidenceAt: at,
+				observedAt: at,
+				principalId: "discord-adapter",
+			});
+			throw new Error("rollback");
+		}),
+	).toThrow("rollback");
 	expect(f.db.workTaskSourceGet(`activation-floor-${taskId}`)).toBeUndefined();
 	expect(f.db.deliveryGet(marker.deliveryId!)?.state).not.toBe("confirmed");
 	await f.bind(true);
@@ -606,23 +1175,43 @@ test("post-marker edit cannot authorize an old message, and marker proof joins c
 });
 
 test("wrong marker delivery and origin cannot establish an activation floor", async () => {
-	const f = await fixture(); await f.admit(); await f.bind(false);
+	const f = await fixture();
+	await f.admit();
+	await f.bind(false);
 	const marker = f.db.workTaskSourceGet(`activation-${taskId}`)!;
-	for (const input of [{ deliveryId: "wrong", origin: thread },
-		{ deliveryId: marker.deliveryId!, origin: { ...thread, conversationId: "201" } }]) {
-		expect(() => f.db.withTransaction(() => {
-			f.db.deliveryUpdate(marker.deliveryId!, "confirmed");
-			f.manager.recordTaskActivationInTransaction({ taskId, ...input,
-				messageId: "marker-1", evidenceAt: at, observedAt: at, principalId: "discord-adapter" });
-		})).toThrow();
+	for (const input of [
+		{ deliveryId: "wrong", origin: thread },
+		{ deliveryId: marker.deliveryId!, origin: { ...thread, conversationId: "201" } },
+	]) {
+		expect(() =>
+			f.db.withTransaction(() => {
+				f.db.deliveryUpdate(marker.deliveryId!, "confirmed");
+				f.manager.recordTaskActivationInTransaction({
+					taskId,
+					...input,
+					messageId: "marker-1",
+					evidenceAt: at,
+					observedAt: at,
+					principalId: "discord-adapter",
+				});
+			}),
+		).toThrow();
 	}
 	expect(f.db.workTaskSourceGet(`activation-floor-${taskId}`)).toBeUndefined();
 });
 
 test("original steering lookup reconciles accepted, but wrong client reference never does", async () => {
 	let fail = true;
-	const f = await fixture({}, { onSteer: () => { if (fail) throw new Error("lost response"); } });
-	await f.admit(); await f.bind();
+	const f = await fixture(
+		{},
+		{
+			onSteer: () => {
+				if (fail) throw new Error("lost response");
+			},
+		},
+	);
+	await f.admit();
+	await f.bind();
 	await f.manager.admitMappedEvent(event());
 	const ref = f.db.workControlList(taskId)[0]!.clientRef!;
 	f.port.lookup = { status: "accepted", clientRef: "wrong", acceptedAt: Date.now() };
@@ -637,12 +1226,17 @@ test("original steering lookup reconciles accepted, but wrong client reference n
 });
 
 test("mapped final source failure rolls back logical report and delivery together", async () => {
-	const f = await fixture(); await f.admit(); await f.bind();
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
 	const task = f.db.workTaskGet(taskId)!;
 	const append = f.db.workTaskSourceAppendInTransaction.bind(f.db);
 	let rejected = false;
 	const fail = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation((source, delivery) => {
-		if (source.sourceId === `final-${taskId}-original`) { rejected = true; throw new Error("atomic failure"); }
+		if (source.sourceId === `final-${taskId}-original`) {
+			rejected = true;
+			throw new Error("atomic failure");
+		}
 		return append(source, delivery);
 	});
 	f.port.complete(task.opRef, "complete original");
@@ -656,98 +1250,146 @@ test("mapped final source failure rolls back logical report and delivery togethe
 	expect(f.port.sends).toHaveLength(1);
 });
 
-for (const mode of ["timer", "restart", "restart-runtime-torn", "restart-runtime-malformed"] as const) test(`corrupt mapped lane cannot stop healthy lane settlement (${mode})`, async () => {
-	const restart = mode !== "timer";
-	const invalidRuntime = mode.startsWith("restart-runtime");
-	const rejections: unknown[] = [];
-	const rejected = (reason: unknown) => rejections.push(reason);
-	process.on("unhandledRejection", rejected);
-	cleanup.push(async () => { process.off("unhandledRejection", rejected); });
-	const errors = spyOn(console, "error");
-	cleanup.push(async () => { errors.mockRestore(); });
-	const f = await fixture(); await f.admit(); await f.bind();
-	const bad = f.db.workTaskGet(taskId)!;
-	const good = await f.manager.start({ name: "healthy", text: "independent work", cwd: f.directory, callerSessionId: "persona-session" });
-	if (!good.started) throw new Error("healthy lane not started");
-	if (restart) await f.manager.stop();
-	const record = parseLaneJobRecord(f.db.laneJobJson(bad.jobId)!);
-	const raw = new Database(join(f.directory, "gateway.db"));
-	cleanup.push(async () => { raw.close(); });
-	const taskDebt = raw.query("SELECT * FROM work_tasks WHERE task_id = ?").get(taskId);
-	if (invalidRuntime) {
-		expect(record.attempts.find((attempt) => attempt.opRef === bad.opRef)?.endedAt).toBeUndefined();
-		if (mode === "restart-runtime-torn")
-			raw.query("UPDATE work_attempt_runtime SET version = version + 1 WHERE op_ref = ?").run(bad.opRef);
-		else
-			raw.query("UPDATE work_attempt_runtime SET record_json = '{' WHERE op_ref = ?").run(bad.opRef);
-	} else {
-		const closed = closeAttempt({ record, opRef: bad.opRef, endState: "attempt_ended",
-			errorCode: "host_lost", endedAt: new Date(Date.now() + 1000).toISOString() });
-		f.db.putLaneJob({ ...closed, laneKey: laneJobIdentity(name).laneKey, json: JSON.stringify(closed) });
-	}
-	const corruptRuntime = raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(bad.opRef);
-	const assertion = mode === "restart-runtime-torn" ? "runtime session and version match database columns"
-		: mode === "restart-runtime-malformed" ? "runtime record parsing" : "attempt.endedAt matches runtime.settledAt";
-	expect(() => f.db.workAttemptGet(bad.opRef)).toThrow(assertion);
-	const corruptHistory = f.db.laneJobJson(bad.jobId);
-	if (restart) await f.restart();
-	else await until(() => errors.mock.calls.some((call) => String(call[0]).includes("work_observer_failed")));
-	f.port.complete(good.opRef, "healthy original result");
-	await until(() => f.db.workAttemptGet(good.opRef)?.settledAt != null);
-	const settled = f.db.workAttemptGet(good.opRef)!;
-	expect(settled.terminal).toMatchObject({ kind: "broker", status: { status: "terminal_ok" } });
-	expect(settled.output).toMatchObject({ disposition: "available", excerpt: "healthy original result" });
-	expect(settled.decision).not.toBe("undecided");
-	// Containment must not repair the torn original or fabricate a task final.
-	expect(() => f.db.workTaskGet(taskId)).toThrow(assertion);
-	expect(() => f.db.workAttemptGet(bad.opRef)).toThrow(assertion);
-	expect(raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(bad.opRef)).toEqual(corruptRuntime);
-	expect(raw.query("SELECT * FROM work_tasks WHERE task_id = ?").get(taskId)).toEqual(taskDebt);
-	expect(f.db.laneJobJson(bad.jobId)).toBe(corruptHistory);
-	expect(f.db.workTaskSourceGet(`final-${taskId}-original`)).toBeUndefined();
-	// Normal source/execution authority remains unavailable. The separate negative
-	// observation asserts only retained admission provenance, never SDK truth.
-	expect(raw.query("SELECT COUNT(*) AS count FROM work_task_sources WHERE task_id = ? AND source_id LIKE 'execution-%'")
-		.get(taskId)).toEqual({ count: 0 });
-	const negative = f.db.withTransaction(() => f.db.workTaskLinkedUnavailableSourcesInTransaction(taskId));
-	expect(negative.sources).toHaveLength(1);
-	expect(negative.sources[0]?.body).toContain("stored admission is not GJC truth");
-	expect(negative.sources[0]?.deliveryId).not.toBeNull();
-	if (restart) {
-		expect(f.db.isBrokerQuarantined("work", bad.jobId)).toBe(true);
-		expect(errors.mock.calls.filter((call) => call[0] ===
-			`work_recovery_invalid_attempt opRef=${JSON.stringify(bad.opRef)} assertion=${assertion}`)).toHaveLength(1);
-		expect(errors.mock.calls.filter((call) => call[0] === `work_task_recovery_held taskId=${taskId}`)).toHaveLength(1);
-		expect(errors.mock.calls.filter((call) => call[0] === `lane_report_drain_failed parent=${name}`)).toHaveLength(1);
-	}
-	expect(rejections).toEqual([]);
-	expect(f.port.sendAttempts).toHaveLength(2);
-	expect(f.port.sendAttempts.filter((send) => send.opRef === bad.opRef)).toHaveLength(1);
-	expect(f.port.resumes).toHaveLength(0);
-});
+for (const mode of ["timer", "restart", "restart-runtime-torn", "restart-runtime-malformed"] as const)
+	test(`corrupt mapped lane cannot stop healthy lane settlement (${mode})`, async () => {
+		const restart = mode !== "timer";
+		const invalidRuntime = mode.startsWith("restart-runtime");
+		const rejections: unknown[] = [];
+		const rejected = (reason: unknown) => rejections.push(reason);
+		process.on("unhandledRejection", rejected);
+		cleanup.push(async () => {
+			process.off("unhandledRejection", rejected);
+		});
+		const errors = spyOn(console, "error");
+		cleanup.push(async () => {
+			errors.mockRestore();
+		});
+		const f = await fixture();
+		await f.admit();
+		await f.bind();
+		const bad = f.db.workTaskGet(taskId)!;
+		const good = await f.manager.start({
+			name: "healthy",
+			text: "independent work",
+			cwd: f.directory,
+			callerSessionId: "persona-session",
+		});
+		if (!good.started) throw new Error("healthy lane not started");
+		if (restart) await f.manager.stop();
+		const record = parseLaneJobRecord(f.db.laneJobJson(bad.jobId)!);
+		const raw = new Database(join(f.directory, "gateway.db"));
+		cleanup.push(async () => {
+			raw.close();
+		});
+		const taskDebt = raw.query("SELECT * FROM work_tasks WHERE task_id = ?").get(taskId);
+		if (invalidRuntime) {
+			expect(record.attempts.find((attempt) => attempt.opRef === bad.opRef)?.endedAt).toBeUndefined();
+			if (mode === "restart-runtime-torn")
+				raw.query("UPDATE work_attempt_runtime SET version = version + 1 WHERE op_ref = ?").run(bad.opRef);
+			else raw.query("UPDATE work_attempt_runtime SET record_json = '{' WHERE op_ref = ?").run(bad.opRef);
+		} else {
+			const closed = closeAttempt({
+				record,
+				opRef: bad.opRef,
+				endState: "attempt_ended",
+				errorCode: "host_lost",
+				endedAt: new Date(Date.now() + 1000).toISOString(),
+			});
+			f.db.putLaneJob({ ...closed, laneKey: laneJobIdentity(name).laneKey, json: JSON.stringify(closed) });
+		}
+		const corruptRuntime = raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(bad.opRef);
+		const assertion =
+			mode === "restart-runtime-torn"
+				? "runtime session and version match database columns"
+				: mode === "restart-runtime-malformed"
+					? "runtime record parsing"
+					: "attempt.endedAt matches runtime.settledAt";
+		expect(() => f.db.workAttemptGet(bad.opRef)).toThrow(assertion);
+		const corruptHistory = f.db.laneJobJson(bad.jobId);
+		if (restart) await f.restart();
+		else await until(() => errors.mock.calls.some((call) => String(call[0]).includes("work_observer_failed")));
+		f.port.complete(good.opRef, "healthy original result");
+		await until(() => f.db.workAttemptGet(good.opRef)?.settledAt != null);
+		const settled = f.db.workAttemptGet(good.opRef)!;
+		expect(settled.terminal).toMatchObject({ kind: "broker", status: { status: "terminal_ok" } });
+		expect(settled.output).toMatchObject({ disposition: "available", excerpt: "healthy original result" });
+		expect(settled.decision).not.toBe("undecided");
+		// Containment must not repair the torn original or fabricate a task final.
+		expect(() => f.db.workTaskGet(taskId)).toThrow(assertion);
+		expect(() => f.db.workAttemptGet(bad.opRef)).toThrow(assertion);
+		expect(raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(bad.opRef)).toEqual(corruptRuntime);
+		expect(raw.query("SELECT * FROM work_tasks WHERE task_id = ?").get(taskId)).toEqual(taskDebt);
+		expect(f.db.laneJobJson(bad.jobId)).toBe(corruptHistory);
+		expect(f.db.workTaskSourceGet(`final-${taskId}-original`)).toBeUndefined();
+		// Normal source/execution authority remains unavailable. The separate negative
+		// observation asserts only retained admission provenance, never SDK truth.
+		expect(
+			raw
+				.query("SELECT COUNT(*) AS count FROM work_task_sources WHERE task_id = ? AND source_id LIKE 'execution-%'")
+				.get(taskId),
+		).toEqual({ count: 0 });
+		const negative = f.db.withTransaction(() => f.db.workTaskLinkedUnavailableSourcesInTransaction(taskId));
+		expect(negative.sources).toHaveLength(1);
+		expect(negative.sources[0]?.body).toContain("stored admission is not GJC truth");
+		expect(negative.sources[0]?.deliveryId).not.toBeNull();
+		if (restart) {
+			expect(f.db.isBrokerQuarantined("work", bad.jobId)).toBe(true);
+			expect(
+				errors.mock.calls.filter(
+					(call) =>
+						call[0] === `work_recovery_invalid_attempt opRef=${JSON.stringify(bad.opRef)} assertion=${assertion}`,
+				),
+			).toHaveLength(1);
+			expect(errors.mock.calls.filter((call) => call[0] === `work_task_recovery_held taskId=${taskId}`)).toHaveLength(
+				1,
+			);
+			expect(errors.mock.calls.filter((call) => call[0] === `lane_report_drain_failed parent=${name}`)).toHaveLength(1);
+		}
+		expect(rejections).toEqual([]);
+		expect(f.port.sendAttempts).toHaveLength(2);
+		expect(f.port.sendAttempts.filter((send) => send.opRef === bad.opRef)).toHaveLength(1);
+		expect(f.port.resumes).toHaveLength(0);
+	});
 
 for (const mode of ["timer-runtime", "restart-runtime", "restart-job"] as const)
 	test(`actual malformed linked rows retain bounded negative evidence without blocking healthy work (${mode})`, async () => {
 		let clock = Date.parse(at);
-		const f = await fixture({ now: () => clock }, { onSteer: () => { throw new Error("lost original steer receipt"); } });
-		await f.admit(); await f.bind();
+		const f = await fixture(
+			{ now: () => clock },
+			{
+				onSteer: () => {
+					throw new Error("lost original steer receipt");
+				},
+			},
+		);
+		await f.admit();
+		await f.bind();
 		const bad = f.db.workTaskGet(taskId)!;
 		expect((await f.manager.admitMappedEvent(event("remote-held"))).delivery).toBe("held");
 		await f.manager.admitMappedEvent(event("blocked-successor"));
 		const controls = f.db.workControlList(taskId);
 		expect(controls.map((control) => control.phase)).toEqual(["held", "pending"]);
-		const good = await f.manager.start({ name: "healthy-negative", text: "independent work", cwd: f.directory,
-			callerSessionId: "persona-session" });
+		const good = await f.manager.start({
+			name: "healthy-negative",
+			text: "independent work",
+			cwd: f.directory,
+			callerSessionId: "persona-session",
+		});
 		if (!good.started) throw new Error("healthy lane not started");
 		if (mode.startsWith("restart")) await f.manager.stop();
 		const raw = new Database(join(f.directory, "gateway.db"));
-		cleanup.push(async () => { raw.close(); });
+		cleanup.push(async () => {
+			raw.close();
+		});
 		const binding = f.db.getSessionRecord(workSessionKey(name));
 		const taskBefore = raw.query("SELECT * FROM work_tasks WHERE task_id = ?").get(taskId);
 		// Deliberately invalid persisted bytes, not a declared terminal or host-loss event.
 		if (mode === "restart-job")
 			raw.query("UPDATE lane_jobs SET record_json = '{private-job-secret' WHERE job_id = ?").run(bad.jobId);
-		else raw.query("UPDATE work_attempt_runtime SET record_json = '{private-runtime-secret' WHERE op_ref = ?").run(bad.opRef);
+		else
+			raw
+				.query("UPDATE work_attempt_runtime SET record_json = '{private-runtime-secret' WHERE op_ref = ?")
+				.run(bad.opRef);
 		const runtimeBefore = raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(bad.opRef);
 		const jobBefore = raw.query("SELECT * FROM lane_jobs WHERE job_id = ?").get(bad.jobId);
 		const read = () => f.db.withTransaction(() => f.db.workTaskLinkedUnavailableSourcesInTransaction(taskId));
@@ -761,9 +1403,15 @@ for (const mode of ["timer-runtime", "restart-runtime", "restart-job"] as const)
 		const view = buildWorkTaskContext(f.db, { taskId }, () => new Date(clock));
 		expect(view.completeness).toBe("partial");
 		expect(view.omission.records).toBeNull();
-		expect(view.manifest).toContainEqual(expect.objectContaining({
-			sourceId: source.sourceId, revision: source.contentHash, evidenceAt: at, observedAt: at, completeness: "partial",
-		}));
+		expect(view.manifest).toContainEqual(
+			expect.objectContaining({
+				sourceId: source.sourceId,
+				revision: source.contentHash,
+				evidenceAt: at,
+				observedAt: at,
+				completeness: "partial",
+			}),
+		);
 		expect(view.items.find((item) => item.sourceId === source.sourceId)?.text).toContain("Current runtime coverage");
 		f.port.complete(good.opRef, "healthy independent result");
 		await until(() => f.db.workAttemptGet(good.opRef)?.settledAt != null);
@@ -788,77 +1436,107 @@ for (const mode of ["timer-runtime", "restart-runtime", "restart-job"] as const)
 		expect(f.port.resumes).toHaveLength(0);
 	});
 
-for (const kind of ["read_only", "code_mutating"] as const) test(`${kind} task permits dedicated original scope and rejects shared-area drift`, async () => {
-	let coordinatorCwd = "";
-	const f = await fixture({ coordinatorCwd: () => coordinatorCwd });
-	const primary = join(f.directory, "primary");
-	const worker = join(f.directory, "worker");
-	await mkdir(primary);
-	const git = (...args: string[]) => {
-		const result = Bun.spawnSync(["git", "-C", primary, ...args], { stdout: "pipe", stderr: "pipe" });
-		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
-	};
-	git("init");
-	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture");
-	git("worktree", "add", "-b", "worker", worker);
-	coordinatorCwd = primary;
-	await f.manager.start({ ...f.input, cwd: worker, task: { ...f.input.task, kind } }, context);
-	await f.bind();
-	expect(f.port.sends[0]?.repo).toBe(worker);
-	const append = f.db.workTaskSourceAppendInTransaction.bind(f.db);
-	const rollback = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation((input, delivery) => {
-		if (input.sourceId.startsWith("scope-control-")) throw new Error("scope proof failed");
-		return append(input, delivery);
+for (const kind of ["read_only", "code_mutating"] as const)
+	test(`${kind} task permits dedicated original scope and rejects shared-area drift`, async () => {
+		let coordinatorCwd = "";
+		const f = await fixture({ coordinatorCwd: () => coordinatorCwd });
+		const primary = join(f.directory, "primary");
+		const worker = join(f.directory, "worker");
+		await mkdir(primary);
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["git", "-C", primary, ...args], { stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		};
+		git("init");
+		git(
+			"-c",
+			"user.name=Fixture",
+			"-c",
+			"user.email=fixture@example.invalid",
+			"commit",
+			"--allow-empty",
+			"-m",
+			"fixture",
+		);
+		git("worktree", "add", "-b", "worker", worker);
+		coordinatorCwd = primary;
+		await f.manager.start({ ...f.input, cwd: worker, task: { ...f.input.task, kind } }, context);
+		await f.bind();
+		expect(f.port.sends[0]?.repo).toBe(worker);
+		const append = f.db.workTaskSourceAppendInTransaction.bind(f.db);
+		const rollback = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation((input, delivery) => {
+			if (input.sourceId.startsWith("scope-control-")) throw new Error("scope proof failed");
+			return append(input, delivery);
+		});
+		await expect(f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).rejects.toThrow(
+			"scope proof failed",
+		);
+		rollback.mockRestore();
+		expect(f.db.workControlList(taskId)).toHaveLength(0);
+		expect(f.db.workTaskSources(taskId)?.sources.some((source) => source.evidence.eventId === "mutation")).toBe(false);
+		expect(f.port.steers).toHaveLength(0);
+		expect(await f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).toMatchObject({
+			delivery: "accepted",
+		});
+		expect(f.db.workControlList(taskId)[0]?.request.scope).toBe("code_mutating");
+		expect(f.db.workTaskGet(taskId)?.request.kind).toBe(kind);
+		await f.restart();
+		expect(await f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).toMatchObject({
+			delivery: "accepted",
+		});
+		expect(f.port.steers).toHaveLength(1);
+		const transition = f.db.workControlTransitionInTransaction.bind(f.db);
+		const race = spyOn(f.db, "workControlTransitionInTransaction").mockImplementation((id, version, input) => {
+			const result = transition(id, version, input);
+			if (input.phase === "sending") coordinatorCwd = worker;
+			return result;
+		});
+		expect(await f.manager.admitMappedEvent(event("pretransport-race", { scope: "code_mutating" }))).toMatchObject({
+			delivery: "held",
+			reason: "pretransport_scope_changed",
+		});
+		race.mockRestore();
+		expect(f.port.steers).toHaveLength(1);
+		const held = f.db.workControlList(taskId)[1]!;
+		expect(held).toMatchObject({ phase: "held", reason: "pretransport_scope_changed" });
+		expect(held.sendingAt).not.toBeNull();
+		coordinatorCwd = worker;
+		const refusal = await f.manager.admitMappedEvent(event("scope-race", { scope: "code_mutating" }));
+		expect(refusal).toMatchObject({
+			acceptance: "durable",
+			delivery: "refused",
+			reason: kind === "read_only" ? "scope_elevation_refused" : "dedicated_worktree_required",
+		});
+		const refused = f.db.workControlGet(refusal.controlId)!;
+		expect(refused).toMatchObject({ phase: "refused", sendingAt: null, receipt: null, sequence: held.sequence + 1 });
+		expect(f.db.workTaskSourceGet(`disposition-${refused.controlId}-refused`)).toMatchObject({
+			controlId: refused.controlId,
+			kind: "observation",
+			completeness: "complete",
+		});
+		expect(f.db.workTaskSourceGet(`worktree-${refused.controlId}`)).toBeUndefined();
+		expect(f.db.workControlGet(held.controlId)).toEqual(held);
+		coordinatorCwd = primary;
+		expect(await f.manager.admitMappedEvent(event("scope-race", { scope: "code_mutating" }))).toMatchObject({
+			controlId: refusal.controlId,
+			acceptance: "durable",
+			delivery: "refused",
+		});
+		expect(await f.manager.admitMappedEvent(event("valid-behind-held", { scope: "code_mutating" }))).toMatchObject({
+			acceptance: "durable",
+			delivery: "pending",
+		});
+		expect(f.db.workControlGet(held.controlId)).toEqual(held);
+		expect(f.db.workTaskGet(taskId)?.request.kind).toBe(kind);
+		expect(f.port.steers).toHaveLength(1);
+		expect(f.port.binds).toHaveLength(1);
 	});
-	await expect(f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).rejects.toThrow("scope proof failed");
-	rollback.mockRestore();
-	expect(f.db.workControlList(taskId)).toHaveLength(0);
-	expect(f.db.workTaskSources(taskId)?.sources.some((source) => source.evidence.eventId === "mutation")).toBe(false);
-	expect(f.port.steers).toHaveLength(0);
-	expect(await f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).toMatchObject({ delivery: "accepted" });
-	expect(f.db.workControlList(taskId)[0]?.request.scope).toBe("code_mutating");
-	expect(f.db.workTaskGet(taskId)?.request.kind).toBe(kind);
-	await f.restart();
-	expect(await f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).toMatchObject({ delivery: "accepted" });
-	expect(f.port.steers).toHaveLength(1);
-	const transition = f.db.workControlTransitionInTransaction.bind(f.db);
-	const race = spyOn(f.db, "workControlTransitionInTransaction").mockImplementation((id, version, input) => {
-		const result = transition(id, version, input);
-		if (input.phase === "sending") coordinatorCwd = worker;
-		return result;
-	});
-	expect(await f.manager.admitMappedEvent(event("pretransport-race", { scope: "code_mutating" })))
-		.toMatchObject({ delivery: "held", reason: "pretransport_scope_changed" });
-	race.mockRestore();
-	expect(f.port.steers).toHaveLength(1);
-	const held = f.db.workControlList(taskId)[1]!;
-	expect(held).toMatchObject({ phase: "held", reason: "pretransport_scope_changed" });
-	expect(held.sendingAt).not.toBeNull();
-	coordinatorCwd = worker;
-	const refusal = await f.manager.admitMappedEvent(event("scope-race", { scope: "code_mutating" }));
-	expect(refusal).toMatchObject({ acceptance: "durable", delivery: "refused",
-		reason: kind === "read_only" ? "scope_elevation_refused" : "dedicated_worktree_required" });
-	const refused = f.db.workControlGet(refusal.controlId)!;
-	expect(refused).toMatchObject({ phase: "refused", sendingAt: null, receipt: null,
-		sequence: held.sequence + 1 });
-	expect(f.db.workTaskSourceGet(`disposition-${refused.controlId}-refused`))
-		.toMatchObject({ controlId: refused.controlId, kind: "observation", completeness: "complete" });
-	expect(f.db.workTaskSourceGet(`worktree-${refused.controlId}`)).toBeUndefined();
-	expect(f.db.workControlGet(held.controlId)).toEqual(held);
-	coordinatorCwd = primary;
-	expect(await f.manager.admitMappedEvent(event("scope-race", { scope: "code_mutating" })))
-		.toMatchObject({ controlId: refusal.controlId, acceptance: "durable", delivery: "refused" });
-	expect(await f.manager.admitMappedEvent(event("valid-behind-held", { scope: "code_mutating" })))
-		.toMatchObject({ acceptance: "durable", delivery: "pending" });
-	expect(f.db.workControlGet(held.controlId)).toEqual(held);
-	expect(f.db.workTaskGet(taskId)?.request.kind).toBe(kind);
-	expect(f.port.steers).toHaveLength(1);
-	expect(f.port.binds).toHaveLength(1);
-});
 
 test("unfenced mutation admission never creates a worker or authorizes thread creation", async () => {
 	const f = await fixture();
-	await expect(f.manager.start({ ...f.input, task: { ...f.input.task, kind: "code_mutating" } }, context)).rejects.toThrow();
+	await expect(
+		f.manager.start({ ...f.input, task: { ...f.input.task, kind: "code_mutating" } }, context),
+	).rejects.toThrow();
 	await expect(f.manager.threadClaim({ taskId, claimId })).rejects.toThrow();
 	expect(f.port.binds).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(0);
@@ -866,8 +1544,17 @@ test("unfenced mutation admission never creates a worker or authorizes thread cr
 
 async function releaseFixture(remote = false, scope: "dedicated" | "shared" | "ordinary" = "dedicated") {
 	let coordinatorCwd = "";
-	const f = await fixture({ coordinatorCwd: () => coordinatorCwd },
-		remote ? { onSteer: () => { throw new Error("remote outcome unknown"); } } : {}, true);
+	const f = await fixture(
+		{ coordinatorCwd: () => coordinatorCwd },
+		remote
+			? {
+					onSteer: () => {
+						throw new Error("remote outcome unknown");
+					},
+				}
+			: {},
+		true,
+	);
 	const primary = join(f.directory, "primary");
 	const worker = scope === "shared" ? primary : scope === "ordinary" ? f.directory : join(f.directory, "worker");
 	await mkdir(primary);
@@ -876,206 +1563,321 @@ async function releaseFixture(remote = false, scope: "dedicated" | "shared" | "o
 		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
 	};
 	git("init");
-	git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture");
+	git(
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"fixture",
+	);
 	if (scope === "dedicated") git("worktree", "add", "-b", "worker", worker);
 	coordinatorCwd = primary;
 	await f.manager.start({ ...f.input, cwd: worker }, context);
 	await f.bind();
 	await f.manager.admitMappedEvent(event("retained-control", { kind: remote ? "steer" : "cancel_request" }));
 	const task = f.db.workTaskGet(taskId)!;
-	const missing = spyOn(f.port, "fetchWorkerOutput").mockResolvedValue({ status: "unavailable", code: "output_unavailable" });
-	cleanup.push(async () => { missing.mockRestore(); });
-	return { ...f, worker, primary, task, drift: () => { coordinatorCwd = worker; },
+	const missing = spyOn(f.port, "fetchWorkerOutput").mockResolvedValue({
+		status: "unavailable",
+		code: "output_unavailable",
+	});
+	cleanup.push(async () => {
+		missing.mockRestore();
+	});
+	return {
+		...f,
+		worker,
+		primary,
+		task,
+		drift: () => {
+			coordinatorCwd = worker;
+		},
 		finish: async () => {
 			f.port.complete(task.opRef, "Original result unavailable to the gateway");
 			await until(() => f.db.workAttemptGet(task.opRef)?.settledAt != null);
-		} };
+		},
+	};
 }
 
 for (const scope of ["dedicated", "shared", "ordinary"] as const)
-for (const route of ["normal", "force", "all-dead"] as const) {
-	test(`real manager and governor release only owned capacity with retained final/local-cancel debt (${scope}, ${route})`, async () => {
-		const f = await releaseFixture(false, scope);
-		const sentinel = join(f.worker, "retained-owner-file");
-		await writeFile(sentinel, "Owner data must survive host release");
-		expect(f.db.workTaskSourceGet(`worktree-admission-${taskId}`) !== undefined).toBe(scope === "dedicated");
-		const healthy = await f.manager.start({ name: "healthy", text: "Independent work", cwd: f.primary,
-			callerSessionId: "persona-session" });
-		if (!healthy.started) throw new Error("healthy lane did not start");
+	for (const route of ["normal", "force", "all-dead"] as const) {
+		test(`real manager and governor release only owned capacity with retained final/local-cancel debt (${scope}, ${route})`, async () => {
+			const f = await releaseFixture(false, scope);
+			const sentinel = join(f.worker, "retained-owner-file");
+			await writeFile(sentinel, "Owner data must survive host release");
+			expect(f.db.workTaskSourceGet(`worktree-admission-${taskId}`) !== undefined).toBe(scope === "dedicated");
+			const healthy = await f.manager.start({
+				name: "healthy",
+				text: "Independent work",
+				cwd: f.primary,
+				callerSessionId: "persona-session",
+			});
+			if (!healthy.started) throw new Error("healthy lane did not start");
+			await f.finish();
+			expect(f.manager.assessTaskRelease(name)).toMatchObject({
+				kind: "eligible",
+				taskId,
+				opRef: f.task.opRef,
+				sessionId: f.task.sessionId,
+				epoch: f.task.epoch,
+				cwd: f.worker,
+			});
+			expect(f.manager.taskDebt(name)).toMatchObject({
+				exactTerminal: true,
+				safeToReleaseExecution: true,
+				unresolvedControls: 1,
+				unresolvedSteers: 0,
+				safeToCleanupWorktree: false,
+			});
+			const taskBefore = f.db.workTaskGet(taskId);
+			const controlsBefore = f.db.workControlList(taskId);
+			const runtimeBefore = f.db.workAttemptGet(f.task.opRef);
+			const sourcesBefore = f.db.workTaskSources(taskId);
+			const deliveriesBefore = sourcesBefore!.sources
+				.filter((source) => source.deliveryId !== null)
+				.map((source) => f.db.deliveryGet(source.deliveryId!));
+			const marker = f.db.workTaskSourceGet(`activation-${taskId}`)!;
+			const deliveryBefore = f.db.deliveryGet(marker.deliveryId!);
+			const healthyBinding = f.db.getSessionRecord(workSessionKey("healthy"));
+			const jobs = spyOn(f.port, "runningJobs");
+			const live = spyOn(f.port, "liveness").mockImplementation(async ({ sessionId }) => ({
+				live: sessionId !== f.task.sessionId,
+				disowned: false,
+			}));
+			if (route === "all-dead") expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: [name] });
+			else
+				expect(await (route === "force" ? f.lanes.forceRetire(name) : f.lanes.retire(name, "operator"))).toMatchObject({
+					retired: true,
+					closed: true,
+					sessionId: f.task.sessionId,
+				});
+			live.mockRestore();
+			expect(jobs).toHaveBeenCalledWith({ sessionId: f.task.sessionId!, repo: f.worker });
+			jobs.mockRestore();
+			expect(f.port.closes).toEqual([{ sessionId: f.task.sessionId!, repo: f.worker }]);
+			expect(await readFile(sentinel, "utf8")).toBe("Owner data must survive host release");
+			expect(f.lanes.activeLanes().map((lane) => lane.name)).toEqual(["healthy"]);
+			expect(f.db.getSessionRecord(workSessionKey(name))).toEqual({ sessionId: "", epoch: f.task.epoch! + 1 });
+			expect(f.db.getSessionRecord(workSessionKey("healthy"))).toEqual(healthyBinding);
+			expect(f.db.workTaskGet(taskId)).toEqual(taskBefore);
+			expect(f.db.workControlList(taskId)).toEqual(controlsBefore);
+			expect(f.db.workAttemptGet(f.task.opRef)).toEqual(runtimeBefore);
+			expect(f.db.workTaskSources(taskId)).toEqual(sourcesBefore);
+			expect(
+				sourcesBefore!.sources
+					.filter((source) => source.deliveryId !== null)
+					.map((source) => f.db.deliveryGet(source.deliveryId!)),
+			).toEqual(deliveriesBefore);
+			expect(f.db.deliveryGet(marker.deliveryId!)).toEqual(deliveryBefore);
+			expect(f.db.workTaskDiscordLocator(thread.conversationId)).toEqual({ taskId });
+			expect(f.db.workTaskByThread(originKey(thread))?.taskId).toBe(taskId);
+			expect(await f.manager.admitMappedEvent(event("retained-control", { kind: "cancel_request" }))).toMatchObject({
+				controlId: controlsBefore[0]!.controlId,
+				delivery: "held",
+			});
+			expect(f.db.workControlList(taskId)).toEqual(controlsBefore);
+			expect(f.manager.assessTaskRelease(name).kind).toBe("hold");
+			f.port.complete(healthy.opRef, "Healthy original result");
+			await until(() => f.db.workAttemptGet(healthy.opRef)?.settledAt != null);
+			expect(f.port.sends).toHaveLength(2);
+			expect(f.port.steers).toHaveLength(0);
+			expect(f.port.resumes).toHaveLength(0);
+		});
+	}
+
+for (const scope of ["dedicated", "shared", "ordinary"] as const)
+	for (const obstacle of [
+		"remote-held",
+		"uncertain-execution",
+		"unsupported-jobs",
+		"unreadable-jobs",
+		"live-jobs",
+		"false-close",
+		"worktree-drift",
+		"epoch-race",
+		"authority-race",
+		"worktree-race",
+		"postclose-race",
+		"release-write-failure",
+	] as const) {
+		if (scope !== "dedicated" && ["worktree-drift", "worktree-race"].includes(obstacle)) continue;
+		test(`mapped normal, force and all-dead routes retain capacity on ${obstacle} (${scope})`, async () => {
+			const f = await releaseFixture(obstacle === "remote-held", scope);
+			if (obstacle !== "uncertain-execution") await f.finish();
+			if (obstacle === "remote-held") {
+				expect(f.manager.assessTaskRelease(name)).toMatchObject({
+					kind: "hold",
+					reason: "task_remote_control_unresolved",
+				});
+				expect(f.manager.taskDebt(name)?.safeToReleaseExecution).toBe(false);
+			}
+			if (obstacle === "worktree-drift") f.drift();
+			if (obstacle === "unsupported-jobs") (f.port as SessionPort).runningJobs = undefined;
+			if (obstacle === "unreadable-jobs") f.port.hostJobs.set(f.task.sessionId!, new Error("host cannot answer"));
+			if (obstacle === "live-jobs")
+				f.port.hostJobs.set(f.task.sessionId!, [{ id: "child", type: "task", label: "still running" }]);
+			const bindingBefore = f.db.getSessionRecord(workSessionKey(name));
+			const controlsBefore = f.db.workControlList(taskId);
+			const spies: Array<{ mockRestore(): void }> = [];
+			if (obstacle === "false-close")
+				spies.push(
+					spyOn(f.port, "close").mockImplementation(async (input): Promise<void> => {
+						f.port.closes.push(input);
+						// Promise<void> rejects unsupported/false closure, never resolves a fabricated false DTO.
+						throw new Error("session.close ordinary host closure is unproven: closed:false");
+					}),
+				);
+			let raced = false;
+			if (["epoch-race", "authority-race", "worktree-race"].includes(obstacle)) {
+				spies.push(
+					spyOn(f.port, "runningJobs").mockImplementation(async () => {
+						if (!raced) {
+							raced = true;
+							if (obstacle === "worktree-race") f.drift();
+							else if (obstacle === "epoch-race") f.db.rebindEpoch(workSessionKey(name));
+							else {
+								const authority = f.db.inspectBrokerAuthority().authority!;
+								f.db.cutoverBrokerAuthority({
+									expectedAuthority: authority,
+									targetAuthority: { ...authority, identity: `${authority.identity}:replacement` },
+									evidence: "fixture authority replacement",
+									disposition: "quarantine",
+								});
+							}
+						}
+						return [];
+					}),
+				);
+			}
+			if (obstacle === "postclose-race")
+				spies.push(
+					spyOn(f.port, "close").mockImplementation(async (input) => {
+						f.port.closes.push(input);
+						if (scope === "dedicated") f.drift();
+						else reviseDebt();
+					}),
+				);
+			function reviseDebt() {
+				const task = f.db.workTaskGet(taskId)!;
+				f.db.withTransaction(() =>
+					f.db.workTaskObligationInTransaction(taskId, task.version, {
+						identity: { opRef: task.opRef, sessionId: task.sessionId!, epoch: task.epoch! },
+						state: "held",
+						reason: "new debt after host closure",
+						at,
+					}),
+				);
+			}
+			if (obstacle === "release-write-failure")
+				spies.push(
+					spyOn(f.db, "rebindEpoch").mockImplementation(() => {
+						throw new Error("release transaction failed after host closure");
+					}),
+				);
+			spies.push(spyOn(f.port, "liveness").mockResolvedValue({ live: false, disowned: true }));
+			try {
+				expect(await f.lanes.retire(name, "operator")).toMatchObject({ retired: false });
+				expect(await f.lanes.forceRetire(name)).toMatchObject({ retired: false });
+				expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
+			} finally {
+				for (const spy of spies.reverse()) spy.mockRestore();
+			}
+			if (!["epoch-race", "authority-race"].includes(obstacle))
+				expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(bindingBefore);
+			expect(f.db.workControlList(taskId)).toEqual(controlsBefore);
+			expect(f.db.workTaskDiscordLocator(thread.conversationId)).toEqual({ taskId });
+			expect(f.port.sends).toHaveLength(1);
+			expect(f.port.resumes).toHaveLength(0);
+			if (!["false-close", "postclose-race", "release-write-failure"].includes(obstacle))
+				expect(f.port.closes).toHaveLength(0);
+		});
+	}
+
+for (const boundary of ["jobs", "close"] as const)
+	test(`task version is rechecked after awaited ${boundary}`, async () => {
+		const f = await releaseFixture();
 		await f.finish();
-		expect(f.manager.assessTaskRelease(name)).toMatchObject({ kind: "eligible", taskId,
-			opRef: f.task.opRef, sessionId: f.task.sessionId, epoch: f.task.epoch, cwd: f.worker });
-		expect(f.manager.taskDebt(name)).toMatchObject({ exactTerminal: true, safeToReleaseExecution: true,
-			unresolvedControls: 1, unresolvedSteers: 0, safeToCleanupWorktree: false });
-		const taskBefore = f.db.workTaskGet(taskId);
-		const controlsBefore = f.db.workControlList(taskId);
-		const runtimeBefore = f.db.workAttemptGet(f.task.opRef);
-		const sourcesBefore = f.db.workTaskSources(taskId);
-		const deliveriesBefore = sourcesBefore!.sources.filter((source) => source.deliveryId !== null)
-			.map((source) => f.db.deliveryGet(source.deliveryId!));
-		const marker = f.db.workTaskSourceGet(`activation-${taskId}`)!;
-		const deliveryBefore = f.db.deliveryGet(marker.deliveryId!);
-		const healthyBinding = f.db.getSessionRecord(workSessionKey("healthy"));
-		const jobs = spyOn(f.port, "runningJobs");
-		const live = spyOn(f.port, "liveness").mockImplementation(async ({ sessionId }) => ({
-			live: sessionId !== f.task.sessionId, disowned: false,
-		}));
-		if (route === "all-dead") expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: [name] });
-		else expect(await (route === "force" ? f.lanes.forceRetire(name) : f.lanes.retire(name, "operator")))
-			.toMatchObject({ retired: true, closed: true, sessionId: f.task.sessionId });
-		live.mockRestore();
-		expect(jobs).toHaveBeenCalledWith({ sessionId: f.task.sessionId!, repo: f.worker });
-		jobs.mockRestore();
-		expect(f.port.closes).toEqual([{ sessionId: f.task.sessionId!, repo: f.worker }]);
-		expect(await readFile(sentinel, "utf8")).toBe("Owner data must survive host release");
-		expect(f.lanes.activeLanes().map((lane) => lane.name)).toEqual(["healthy"]);
-		expect(f.db.getSessionRecord(workSessionKey(name))).toEqual({ sessionId: "", epoch: f.task.epoch! + 1 });
-		expect(f.db.getSessionRecord(workSessionKey("healthy"))).toEqual(healthyBinding);
-		expect(f.db.workTaskGet(taskId)).toEqual(taskBefore);
-		expect(f.db.workControlList(taskId)).toEqual(controlsBefore);
-		expect(f.db.workAttemptGet(f.task.opRef)).toEqual(runtimeBefore);
-		expect(f.db.workTaskSources(taskId)).toEqual(sourcesBefore);
-		expect(sourcesBefore!.sources.filter((source) => source.deliveryId !== null)
-			.map((source) => f.db.deliveryGet(source.deliveryId!))).toEqual(deliveriesBefore);
-		expect(f.db.deliveryGet(marker.deliveryId!)).toEqual(deliveryBefore);
-		expect(f.db.workTaskDiscordLocator(thread.conversationId)).toEqual({ taskId });
-		expect(f.db.workTaskByThread(originKey(thread))?.taskId).toBe(taskId);
-		expect(await f.manager.admitMappedEvent(event("retained-control", { kind: "cancel_request" })))
-			.toMatchObject({ controlId: controlsBefore[0]!.controlId, delivery: "held" });
-		expect(f.db.workControlList(taskId)).toEqual(controlsBefore);
-		expect(f.manager.assessTaskRelease(name).kind).toBe("hold");
-		f.port.complete(healthy.opRef, "Healthy original result");
-		await until(() => f.db.workAttemptGet(healthy.opRef)?.settledAt != null);
-		expect(f.port.sends).toHaveLength(2);
-		expect(f.port.steers).toHaveLength(0);
-		expect(f.port.resumes).toHaveLength(0);
-	});
-}
-
-for (const scope of ["dedicated", "shared", "ordinary"] as const)
-for (const obstacle of ["remote-held", "uncertain-execution", "unsupported-jobs", "unreadable-jobs", "live-jobs",
-	"false-close", "worktree-drift", "epoch-race", "authority-race", "worktree-race", "postclose-race", "release-write-failure"] as const) {
-	if (scope !== "dedicated" && ["worktree-drift", "worktree-race"].includes(obstacle)) continue;
-	test(`mapped normal, force and all-dead routes retain capacity on ${obstacle} (${scope})`, async () => {
-		const f = await releaseFixture(obstacle === "remote-held", scope);
-		if (obstacle !== "uncertain-execution") await f.finish();
-		if (obstacle === "remote-held") {
-			expect(f.manager.assessTaskRelease(name)).toMatchObject({ kind: "hold", reason: "task_remote_control_unresolved" });
-			expect(f.manager.taskDebt(name)?.safeToReleaseExecution).toBe(false);
-		}
-		if (obstacle === "worktree-drift") f.drift();
-		if (obstacle === "unsupported-jobs") (f.port as SessionPort).runningJobs = undefined;
-		if (obstacle === "unreadable-jobs") f.port.hostJobs.set(f.task.sessionId!, new Error("host cannot answer"));
-		if (obstacle === "live-jobs") f.port.hostJobs.set(f.task.sessionId!, [{ id: "child", type: "task", label: "still running" }]);
-		const bindingBefore = f.db.getSessionRecord(workSessionKey(name));
-		const controlsBefore = f.db.workControlList(taskId);
-		const spies: Array<{ mockRestore(): void }> = [];
-		if (obstacle === "false-close") spies.push(spyOn(f.port, "close").mockImplementation(async (input): Promise<void> => {
-			f.port.closes.push(input);
-			// Promise<void> rejects unsupported/false closure, never resolves a fabricated false DTO.
-			throw new Error("session.close ordinary host closure is unproven: closed:false");
-		}));
-		let raced = false;
-		if (["epoch-race", "authority-race", "worktree-race"].includes(obstacle)) {
-			spies.push(spyOn(f.port, "runningJobs").mockImplementation(async () => {
-				if (!raced) {
-					raced = true;
-					if (obstacle === "worktree-race") f.drift();
-					else if (obstacle === "epoch-race") f.db.rebindEpoch(workSessionKey(name));
-					else {
-						const authority = f.db.inspectBrokerAuthority().authority!;
-						f.db.cutoverBrokerAuthority({ expectedAuthority: authority,
-							targetAuthority: { ...authority, identity: `${authority.identity}:replacement` },
-							evidence: "fixture authority replacement", disposition: "quarantine" });
-					}
-				}
-				return [];
-			}));
-		}
-		if (obstacle === "postclose-race") spies.push(spyOn(f.port, "close").mockImplementation(async (input) => {
-			f.port.closes.push(input);
-			if (scope === "dedicated") f.drift();
-			else reviseDebt();
-		}));
-		function reviseDebt() {
-			const task = f.db.workTaskGet(taskId)!;
-			f.db.withTransaction(() => f.db.workTaskObligationInTransaction(taskId, task.version, {
-				identity: { opRef: task.opRef, sessionId: task.sessionId!, epoch: task.epoch! },
-				state: "held", reason: "new debt after host closure", at,
-			}));
-		}
-		if (obstacle === "release-write-failure") spies.push(spyOn(f.db, "rebindEpoch").mockImplementation(() => {
-			throw new Error("release transaction failed after host closure");
-		}));
-		spies.push(spyOn(f.port, "liveness").mockResolvedValue({ live: false, disowned: true }));
+		const before = f.db.getSessionRecord(workSessionKey(name));
+		const reviseDebt = () => {
+			const current = f.db.workTaskGet(taskId)!;
+			f.db.withTransaction(() => {
+				expect(
+					f.db.workTaskObligationInTransaction(taskId, current.version, {
+						identity: { opRef: current.opRef, sessionId: current.sessionId!, epoch: current.epoch! },
+						state: "held",
+						reason: "new original report debt observation",
+						at: new Date().toISOString(),
+					}),
+				).toBeDefined();
+			});
+		};
+		const probe =
+			boundary === "jobs"
+				? spyOn(f.port, "runningJobs").mockImplementation(async () => {
+						reviseDebt();
+						return [];
+					})
+				: spyOn(f.port, "close").mockImplementation(async (input) => {
+						f.port.closes.push(input);
+						reviseDebt();
+					});
 		try {
+			expect(await f.lanes.retire(name, "operator")).toMatchObject({
+				retired: false,
+				reason:
+					boundary === "jobs"
+						? "task_release_identity_changed"
+						: "task_release_changed_after_close_closure_effect_retained",
+			});
+		} finally {
+			probe.mockRestore();
+		}
+		expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(before);
+		expect(f.port.closes).toHaveLength(boundary === "jobs" ? 0 : 1);
+		expect(f.db.workTaskGet(taskId)?.holdReason).toBe("new original report debt observation");
+		expect(f.port.sends).toHaveLength(1);
+	});
+
+for (const damage of ["op", "session", "receipt"] as const)
+	test(`wrong original ${damage} proof never releases a mapped task`, async () => {
+		const f = await releaseFixture();
+		await f.finish();
+		const runtime = f.db.workAttemptGet(f.task.opRef)!;
+		const raw = new Database(join(f.directory, "gateway.db"));
+		cleanup.push(async () => {
+			raw.close();
+		});
+		const controlsBefore = raw.query("SELECT * FROM work_controls WHERE task_id = ?").all(taskId);
+		const record =
+			damage === "op"
+				? { ...runtime, opRef: "wrong-original-operation" }
+				: damage === "session"
+					? { ...runtime, sessionId: "wrong-original-session" }
+					: {
+							...runtime,
+							terminal: { ...runtime.terminal, status: { ...runtime.terminal!.status, receiptState: "missing" } },
+						};
+		raw
+			.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
+			.run(JSON.stringify(record), runtime.opRef);
+		const damaged = raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(runtime.opRef);
+		const before = f.db.getSessionRecord(workSessionKey(name));
+		const live = spyOn(f.port, "liveness").mockResolvedValue({ live: false, disowned: true });
+		try {
+			expect(f.manager.assessTaskRelease(name).kind).toBe("hold");
 			expect(await f.lanes.retire(name, "operator")).toMatchObject({ retired: false });
 			expect(await f.lanes.forceRetire(name)).toMatchObject({ retired: false });
 			expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
-		} finally { for (const spy of spies.reverse()) spy.mockRestore(); }
-		if (!["epoch-race", "authority-race"].includes(obstacle))
-			expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(bindingBefore);
-		expect(f.db.workControlList(taskId)).toEqual(controlsBefore);
+		} finally {
+			live.mockRestore();
+		}
+		expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(before);
+		expect(raw.query("SELECT * FROM work_controls WHERE task_id = ?").all(taskId)).toEqual(controlsBefore);
+		expect(raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(runtime.opRef)).toEqual(damaged);
 		expect(f.db.workTaskDiscordLocator(thread.conversationId)).toEqual({ taskId });
+		expect(f.port.closes).toHaveLength(0);
 		expect(f.port.sends).toHaveLength(1);
 		expect(f.port.resumes).toHaveLength(0);
-		if (!["false-close", "postclose-race", "release-write-failure"].includes(obstacle))
-			expect(f.port.closes).toHaveLength(0);
 	});
-}
-
-for (const boundary of ["jobs", "close"] as const) test(`task version is rechecked after awaited ${boundary}`, async () => {
-	const f = await releaseFixture();
-	await f.finish();
-	const before = f.db.getSessionRecord(workSessionKey(name));
-	const reviseDebt = () => {
-		const current = f.db.workTaskGet(taskId)!;
-		f.db.withTransaction(() => {
-			expect(f.db.workTaskObligationInTransaction(taskId, current.version, {
-				identity: { opRef: current.opRef, sessionId: current.sessionId!, epoch: current.epoch! },
-				state: "held", reason: "new original report debt observation", at: new Date().toISOString(),
-			})).toBeDefined();
-		});
-	};
-	const probe = boundary === "jobs"
-		? spyOn(f.port, "runningJobs").mockImplementation(async () => { reviseDebt(); return []; })
-		: spyOn(f.port, "close").mockImplementation(async (input) => { f.port.closes.push(input); reviseDebt(); });
-	try {
-		expect(await f.lanes.retire(name, "operator")).toMatchObject({ retired: false,
-			reason: boundary === "jobs" ? "task_release_identity_changed" : "task_release_changed_after_close_closure_effect_retained" });
-	} finally { probe.mockRestore(); }
-	expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(before);
-	expect(f.port.closes).toHaveLength(boundary === "jobs" ? 0 : 1);
-	expect(f.db.workTaskGet(taskId)?.holdReason).toBe("new original report debt observation");
-	expect(f.port.sends).toHaveLength(1);
-});
-
-for (const damage of ["op", "session", "receipt"] as const) test(`wrong original ${damage} proof never releases a mapped task`, async () => {
-	const f = await releaseFixture();
-	await f.finish();
-	const runtime = f.db.workAttemptGet(f.task.opRef)!;
-	const raw = new Database(join(f.directory, "gateway.db"));
-	cleanup.push(async () => { raw.close(); });
-	const controlsBefore = raw.query("SELECT * FROM work_controls WHERE task_id = ?").all(taskId);
-	const record = damage === "op" ? { ...runtime, opRef: "wrong-original-operation" }
-		: damage === "session" ? { ...runtime, sessionId: "wrong-original-session" }
-			: { ...runtime, terminal: { ...runtime.terminal, status: { ...runtime.terminal!.status, receiptState: "missing" } } };
-	raw.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
-		.run(JSON.stringify(record), runtime.opRef);
-	const damaged = raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(runtime.opRef);
-	const before = f.db.getSessionRecord(workSessionKey(name));
-	const live = spyOn(f.port, "liveness").mockResolvedValue({ live: false, disowned: true });
-	try {
-		expect(f.manager.assessTaskRelease(name).kind).toBe("hold");
-		expect(await f.lanes.retire(name, "operator")).toMatchObject({ retired: false });
-		expect(await f.lanes.forceRetire(name)).toMatchObject({ retired: false });
-		expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
-	} finally { live.mockRestore(); }
-	expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(before);
-	expect(raw.query("SELECT * FROM work_controls WHERE task_id = ?").all(taskId)).toEqual(controlsBefore);
-	expect(raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(runtime.opRef)).toEqual(damaged);
-	expect(f.db.workTaskDiscordLocator(thread.conversationId)).toEqual({ taskId });
-	expect(f.port.closes).toHaveLength(0);
-	expect(f.port.sends).toHaveLength(1);
-	expect(f.port.resumes).toHaveLength(0);
-});

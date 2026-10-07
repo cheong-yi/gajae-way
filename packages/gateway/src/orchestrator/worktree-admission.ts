@@ -19,7 +19,8 @@ export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): Ded
 		const coordinator = realpathSync(coordinatorCwd);
 		const git = (...args: string[]): string => {
 			const result = Bun.spawnSync(["git", "-C", target, ...args], {
-				stdout: "pipe", stderr: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
 				// Repository-selection environment cannot override the inspected directory.
 				env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
 			});
@@ -29,7 +30,12 @@ export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): Ded
 		if (realpathSync(git("rev-parse", "--show-toplevel")) !== target) throw new Error();
 		const commonDir = realpathSync(resolve(target, git("rev-parse", "--git-common-dir")));
 		const gitDir = realpathSync(resolve(target, git("rev-parse", "--git-dir")));
-		if (commonDir === gitDir || dirname(dirname(gitDir)) !== commonDir || dirname(gitDir) !== resolve(commonDir, "worktrees")) throw new Error();
+		if (
+			commonDir === gitDir ||
+			dirname(dirname(gitDir)) !== commonDir ||
+			dirname(gitDir) !== resolve(commonDir, "worktrees")
+		)
+			throw new Error();
 		const records = git("worktree", "list", "--porcelain", "-z").split("\0\0").filter(Boolean);
 		const paths = records.map((record) => {
 			const fields = record.split("\0");
@@ -38,10 +44,26 @@ export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): Ded
 			return realpathSync(field.slice(9));
 		});
 		const primary = paths[0];
-		if (!primary || paths.filter((path) => path === target).length !== 1 || target === primary || overlaps(target, coordinator) || overlaps(target, primary)) throw new Error();
+		if (
+			!primary ||
+			paths.filter((path) => path === target).length !== 1 ||
+			target === primary ||
+			overlaps(target, coordinator) ||
+			overlaps(target, primary)
+		)
+			throw new Error();
 		// The linked administrative directory must point back to this exact worktree.
-		if (realpathSync(readFileSync(resolve(gitDir, "gitdir"), "utf8").trim()) !== realpathSync(resolve(target, ".git"))) throw new Error();
-		return { requestedCwd: cwd, requestedCoordinator: coordinatorCwd, cwd: target, coordinator, primary, commonDir, gitDir };
+		if (realpathSync(readFileSync(resolve(gitDir, "gitdir"), "utf8").trim()) !== realpathSync(resolve(target, ".git")))
+			throw new Error();
+		return {
+			requestedCwd: cwd,
+			requestedCoordinator: coordinatorCwd,
+			cwd: target,
+			coordinator,
+			primary,
+			commonDir,
+			gitDir,
+		};
 	} catch {
 		throw new Error("dedicated_worktree_required");
 	}

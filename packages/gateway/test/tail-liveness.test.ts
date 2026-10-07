@@ -251,7 +251,9 @@ test("chat.progress is emitted only from observed tail activity and preserves ta
 				},
 			},
 		});
-		socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+		socket.write(
+			`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+		);
 		await eventually(() => frames.length >= 1, "gateway negotiation did not complete");
 		expect(frames[0]).toMatchObject({
 			type: "negotiated",

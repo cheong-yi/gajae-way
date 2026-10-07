@@ -196,12 +196,14 @@ export interface ChatEditParams {
 	readonly engagement?: EngagementContext;
 }
 
-export type ChatEditResult = {
-	/** Gateway-assigned turn id for the update, or null when it was declined or the message is unknown. */
-	readonly turnId: string | null;
-	readonly engaged: boolean;
-	readonly route?: "persona";
-} | WorkTaskControlProjection;
+export type ChatEditResult =
+	| {
+			/** Gateway-assigned turn id for the update, or null when it was declined or the message is unknown. */
+			readonly turnId: string | null;
+			readonly engaged: boolean;
+			readonly route?: "persona";
+	  }
+	| WorkTaskControlProjection;
 
 /**
  * What a working turn is doing right now, for the presence hint. `tool` names
@@ -240,16 +242,18 @@ export interface ChatProgressPayload {
 	readonly final?: boolean;
 }
 
-export type ChatSendResult = {
-	/**
-	 * Gateway-assigned turn id, or null when engagement policy declined the
-	 * message (not mentioned in a mention-gated group). Declined messages are
-	 * still context, never commands.
-	 */
-	readonly turnId: string | null;
-	readonly engaged: boolean;
-	readonly route?: "persona";
-} | WorkTaskControlProjection;
+export type ChatSendResult =
+	| {
+			/**
+			 * Gateway-assigned turn id, or null when engagement policy declined the
+			 * message (not mentioned in a mention-gated group). Declined messages are
+			 * still context, never commands.
+			 */
+			readonly turnId: string | null;
+			readonly engaged: boolean;
+			readonly route?: "persona";
+	  }
+	| WorkTaskControlProjection;
 
 export interface ChatMessagePayload {
 	readonly turnId: string;
@@ -711,10 +715,11 @@ export interface WorkTaskControlProjection {
 	readonly reason?: string;
 }
 
-export type WorkTaskSteerResult = WorkTaskControlProjection & (
-	| { readonly delivery: "accepted"; readonly steered: true; readonly clientRef: string }
-	| { readonly delivery: "pending" | "refused" | "held"; readonly steered: false }
-);
+export type WorkTaskSteerResult = WorkTaskControlProjection &
+	(
+		| { readonly delivery: "accepted"; readonly steered: true; readonly clientRef: string }
+		| { readonly delivery: "pending" | "refused" | "held"; readonly steered: false }
+	);
 
 export interface WorkThreadClaimParams {
 	readonly taskId: string;
@@ -766,7 +771,12 @@ export interface WorkTaskDispositionParams {
 	readonly cwd: string;
 	readonly requestHash: string;
 	readonly target:
-		| { readonly kind: "control"; readonly controlId: string; readonly eventId: string; readonly clientRef: string | null }
+		| {
+				readonly kind: "control";
+				readonly controlId: string;
+				readonly eventId: string;
+				readonly clientRef: string | null;
+		  }
 		| { readonly kind: "report"; readonly reportId: string | null };
 	readonly eventId: string;
 	readonly expectedTaskVersion: number;
@@ -805,37 +815,57 @@ export interface WorkTaskDispositionBasisParams {
 
 export type WorkTaskDispositionBasisResult =
 	| { readonly execution: "none"; readonly kind: "original"; readonly basis: WorkTaskDispositionBasis }
-	| { readonly execution: "none"; readonly kind: "validation_unavailable";
-		readonly basis: WorkTaskDispositionBasis; readonly qualification: WorkTaskDispositionNegative }
+	| {
+			readonly execution: "none";
+			readonly kind: "validation_unavailable";
+			readonly basis: WorkTaskDispositionBasis;
+			readonly qualification: WorkTaskDispositionNegative;
+	  }
 	| { readonly execution: "none"; readonly kind: "unavailable"; readonly basis: null };
 
 export function validateWorkTaskDispositionNegative(value: unknown): WorkTaskDispositionNegative {
 	const input = taskRecord(value, ["kind", "scope", "sourceId", "corruptionFingerprint", "firstObservedAt"]);
-	if (input.kind !== "validation_unavailable" || typeof input.corruptionFingerprint !== "string" ||
+	if (
+		input.kind !== "validation_unavailable" ||
+		typeof input.corruptionFingerprint !== "string" ||
 		!/^[0-9a-f]{64}$/.test(input.corruptionFingerprint) ||
-		input.sourceId !== `unavailability-${input.corruptionFingerprint}`)
+		input.sourceId !== `unavailability-${input.corruptionFingerprint}`
+	)
 		throw new ProtocolError("invalid_params", "invalid negative disposition qualification");
-	return { kind: "validation_unavailable", scope: taskKind(input.scope), sourceId: input.sourceId as string,
-		corruptionFingerprint: input.corruptionFingerprint, firstObservedAt: dispositionTime(input.firstObservedAt) };
+	return {
+		kind: "validation_unavailable",
+		scope: taskKind(input.scope),
+		sourceId: input.sourceId as string,
+		corruptionFingerprint: input.corruptionFingerprint,
+		firstObservedAt: dispositionTime(input.firstObservedAt),
+	};
 }
 
 export function validateWorkTaskDispositionBasisParams(value: unknown): WorkTaskDispositionBasisParams {
 	const input = taskRecord(value, ["taskId", "callerSessionId"]);
-	return { taskId: taskUuid(input.taskId, "taskId"),
-		...("callerSessionId" in input ? { callerSessionId: dispositionText(input.callerSessionId, "callerSessionId") } : {}) };
+	return {
+		taskId: taskUuid(input.taskId, "taskId"),
+		...("callerSessionId" in input
+			? { callerSessionId: dispositionText(input.callerSessionId, "callerSessionId") }
+			: {}),
+	};
 }
 
 export function validateWorkTaskDispositionBasisResult(value: unknown): WorkTaskDispositionBasisResult {
 	const input = taskRecord(value, ["execution", "kind", "basis", "qualification"]);
 	if (input.execution !== "none") throw new ProtocolError("invalid_params", "invalid basis execution");
-	if (input.kind === "validation_unavailable") return { execution: "none", kind: input.kind,
-		basis: validateWorkTaskDispositionBasis(input.basis),
-		qualification: validateWorkTaskDispositionNegative(input.qualification) };
+	if (input.kind === "validation_unavailable")
+		return {
+			execution: "none",
+			kind: input.kind,
+			basis: validateWorkTaskDispositionBasis(input.basis),
+			qualification: validateWorkTaskDispositionNegative(input.qualification),
+		};
 	taskRecord(input, ["execution", "kind", "basis"]);
 	if (input.kind === "unavailable" && input.basis === null)
 		return { execution: "none", kind: "unavailable", basis: null };
-	if (input.kind === "original") return { execution: "none", kind: "original",
-		basis: validateWorkTaskDispositionBasis(input.basis) };
+	if (input.kind === "original")
+		return { execution: "none", kind: "original", basis: validateWorkTaskDispositionBasis(input.basis) };
 	throw new ProtocolError("invalid_params", "invalid disposition basis result");
 }
 
@@ -850,32 +880,57 @@ export interface WorkTaskDispositionBasis {
 	readonly requestHash: string;
 	readonly expectedTaskVersion: number;
 	readonly controls: readonly Extract<WorkTaskDispositionParams["target"], { kind: "control" }>[];
-	/** Only the first 20 controls are inspected; partial means later held targets may exist. */
+	/** Only the first 20 held candidates are inspected; partial means overflow or an unvalidated held proof. */
 	readonly controlsCompleteness: "complete" | "partial";
 	readonly report: Extract<WorkTaskDispositionParams["target"], { kind: "report" }> | null;
 }
 
 export function validateWorkTaskDispositionBasis(value: unknown): WorkTaskDispositionBasis {
-	const input = taskRecord(value, ["taskId", "jobId", "expectedOpRef", "sessionId", "epoch",
-		"cwd", "requestHash", "expectedTaskVersion", "controls", "controlsCompleteness", "report"]);
+	const input = taskRecord(value, [
+		"taskId",
+		"jobId",
+		"expectedOpRef",
+		"sessionId",
+		"epoch",
+		"cwd",
+		"requestHash",
+		"expectedTaskVersion",
+		"controls",
+		"controlsCompleteness",
+		"report",
+	]);
 	const sessionId = input.sessionId === null ? null : dispositionText(input.sessionId, "sessionId");
 	const epoch = input.epoch === null ? null : dispositionInteger(input.epoch);
 	if ((sessionId === null) !== (epoch === null))
 		throw new ProtocolError("invalid_params", "session/epoch must be jointly known or unknown");
 	const cwd = dispositionText(input.cwd, "cwd", 4096);
-	if (!cwd.startsWith("/") || (cwd !== "/" && (cwd.endsWith("/") || cwd.split("/").slice(1).some(
-		(part) => part === "" || part === "." || part === ".."))))
+	if (
+		!cwd.startsWith("/") ||
+		(cwd !== "/" &&
+			(cwd.endsWith("/") ||
+				cwd
+					.split("/")
+					.slice(1)
+					.some((part) => part === "" || part === "." || part === "..")))
+	)
 		throw new ProtocolError("invalid_params", "cwd must be canonical absolute path");
-	if (typeof input.requestHash !== "string" || !/^[0-9a-f]{64}$/.test(input.requestHash) ||
-		!Array.isArray(input.controls) || input.controls.length > 20 ||
-		(input.controlsCompleteness !== "complete" && input.controlsCompleteness !== "partial"))
+	if (
+		typeof input.requestHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(input.requestHash) ||
+		!Array.isArray(input.controls) ||
+		input.controls.length > 20 ||
+		(input.controlsCompleteness !== "complete" && input.controlsCompleteness !== "partial")
+	)
 		throw new ProtocolError("invalid_params", "invalid disposition basis");
 	const controls = input.controls.map((value: unknown) => {
 		const target = taskRecord(value, ["kind", "controlId", "eventId", "clientRef"]);
 		if (target.kind !== "control") throw new ProtocolError("invalid_params", "invalid control target");
-		return { kind: "control" as const, controlId: dispositionText(target.controlId, "controlId"),
+		return {
+			kind: "control" as const,
+			controlId: dispositionText(target.controlId, "controlId"),
 			eventId: dispositionText(target.eventId, "original eventId"),
-			clientRef: target.clientRef === null ? null : dispositionText(target.clientRef, "clientRef") };
+			clientRef: target.clientRef === null ? null : dispositionText(target.clientRef, "clientRef"),
+		};
 	});
 	if (new Set(controls.map((control) => control.controlId)).size !== controls.length)
 		throw new ProtocolError("invalid_params", "duplicate control target");
@@ -883,12 +938,24 @@ export function validateWorkTaskDispositionBasis(value: unknown): WorkTaskDispos
 	if (input.report !== null) {
 		const target = taskRecord(input.report, ["kind", "reportId"]);
 		if (target.kind !== "report") throw new ProtocolError("invalid_params", "invalid report target");
-		report = { kind: "report", reportId: target.reportId === null ? null : dispositionText(target.reportId, "reportId") };
+		report = {
+			kind: "report",
+			reportId: target.reportId === null ? null : dispositionText(target.reportId, "reportId"),
+		};
 	}
-	return { taskId: taskUuid(input.taskId, "taskId"), jobId: dispositionText(input.jobId, "jobId"),
-		expectedOpRef: taskOpRef(input.expectedOpRef), sessionId, epoch, cwd, requestHash: input.requestHash,
-		expectedTaskVersion: dispositionInteger(input.expectedTaskVersion), controls,
-		controlsCompleteness: input.controlsCompleteness, report };
+	return {
+		taskId: taskUuid(input.taskId, "taskId"),
+		jobId: dispositionText(input.jobId, "jobId"),
+		expectedOpRef: taskOpRef(input.expectedOpRef),
+		sessionId,
+		epoch,
+		cwd,
+		requestHash: input.requestHash,
+		expectedTaskVersion: dispositionInteger(input.expectedTaskVersion),
+		controls,
+		controlsCompleteness: input.controlsCompleteness,
+		report,
+	};
 }
 
 export interface WorkTaskDispositionRecord {
@@ -932,6 +999,91 @@ export interface WorkTaskContextParams {
 	readonly topic?: string;
 	/** Opaque prior snapshot continuation; never a transport/execution cursor. */
 	readonly continuation?: string;
+}
+
+export interface WorkTaskSourceReadParams {
+	readonly mode: "source";
+	readonly taskId: string;
+	readonly sourceId: string;
+	readonly contentHash: string;
+	readonly cursor?: string;
+}
+
+export interface WorkTaskSourceReadResult {
+	readonly mode: "source";
+	readonly taskId: string;
+	readonly sourceId: string;
+	readonly contentHash: string;
+	readonly body: string;
+	readonly totalBytes: number;
+	readonly startByte: number;
+	readonly endByte: number;
+	readonly nextCursor?: string;
+	readonly eof: boolean;
+	readonly completeness: "complete" | "incomplete";
+	readonly evidence: {
+		readonly principalId: string;
+		readonly origin: OriginRef;
+		readonly eventId: string;
+		readonly editId: string | null;
+		readonly evidenceAt: string;
+		readonly observedAt: string;
+	};
+}
+
+/** An agent judgment about an exact retained original; never owner authorization. */
+export interface WorkTaskReviewParams {
+	readonly taskId: string;
+	readonly expectedOpRef: string;
+	readonly reportId: string;
+	readonly sourceId: string;
+	readonly contentHash: string;
+	readonly reviewId: string;
+	readonly expectedReviewId: string | null;
+	readonly callerSessionId: string;
+	readonly callerEpoch: number;
+	readonly fullRead: true;
+	readonly disposition: "no_exception" | "owner_question";
+	readonly rationale: string;
+	readonly question?: string;
+}
+
+export interface WorkTaskReviewResult {
+	readonly execution: "none";
+	readonly disposition: "recorded" | "duplicate";
+	readonly sourceId: string;
+	readonly reviewId: string;
+	readonly deliveryId: string | null;
+}
+
+export interface WorkTaskReviewPendingParams {
+	readonly mode: "pending_reviews";
+	readonly callerSessionId: string;
+	readonly afterTaskId?: string;
+}
+
+export interface WorkTaskReviewLocator {
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly reportId: string;
+	readonly sourceId: string;
+	readonly contentHash: string;
+	readonly totalBytes: number;
+	readonly completeness: "complete" | "incomplete";
+	readonly reviewId: string | null;
+	readonly pending: boolean;
+	readonly ownerQuestions: readonly {
+		readonly reviewId: string;
+		readonly question: string;
+		readonly deliveryId: string;
+	}[];
+}
+
+export interface WorkTaskReviewPendingResult {
+	readonly mode: "pending_reviews";
+	readonly items: readonly WorkTaskReviewLocator[];
+	readonly nextTaskId: string | null;
+	readonly unavailableTaskIds: readonly string[];
 }
 
 export interface WorkTaskContextSource {
@@ -1049,19 +1201,39 @@ function dispositionTime(value: unknown): string {
 }
 
 export function validateWorkTaskDispositionParams(value: unknown): WorkTaskDispositionParams {
-	const input = taskRecord(value, ["taskId", "jobId", "expectedOpRef", "sessionId", "epoch", "cwd",
-		"requestHash", "target", "eventId", "expectedTaskVersion", "outcome", "reason", "evidence", "callerSessionId",
-		"validationUnavailable"]);
+	const input = taskRecord(value, [
+		"taskId",
+		"jobId",
+		"expectedOpRef",
+		"sessionId",
+		"epoch",
+		"cwd",
+		"requestHash",
+		"target",
+		"eventId",
+		"expectedTaskVersion",
+		"outcome",
+		"reason",
+		"evidence",
+		"callerSessionId",
+		"validationUnavailable",
+	]);
 	const target = taskRecord(input.target, ["kind", "controlId", "eventId", "clientRef", "reportId"]);
 	let parsedTarget: WorkTaskDispositionParams["target"];
 	if (target.kind === "control") {
 		taskRecord(target, ["kind", "controlId", "eventId", "clientRef"]);
-		parsedTarget = { kind: "control", controlId: dispositionText(target.controlId, "controlId"),
+		parsedTarget = {
+			kind: "control",
+			controlId: dispositionText(target.controlId, "controlId"),
 			eventId: dispositionText(target.eventId, "original eventId"),
-			clientRef: target.clientRef === null ? null : dispositionText(target.clientRef, "clientRef") };
+			clientRef: target.clientRef === null ? null : dispositionText(target.clientRef, "clientRef"),
+		};
 	} else if (target.kind === "report") {
 		taskRecord(target, ["kind", "reportId"]);
-		parsedTarget = { kind: "report", reportId: target.reportId === null ? null : dispositionText(target.reportId, "reportId") };
+		parsedTarget = {
+			kind: "report",
+			reportId: target.reportId === null ? null : dispositionText(target.reportId, "reportId"),
+		};
 	} else throw new ProtocolError("invalid_params", "invalid disposition target");
 	const evidence = taskRecord(input.evidence, ["availability", "detail", "evidenceAt"]);
 	if (evidence.availability !== "partial" && evidence.availability !== "unavailable")
@@ -1073,22 +1245,42 @@ export function validateWorkTaskDispositionParams(value: unknown): WorkTaskDispo
 	if ((sessionId === null) !== (epoch === null))
 		throw new ProtocolError("invalid_params", "session/epoch must be jointly known or unknown");
 	const cwd = dispositionText(input.cwd, "cwd", 4096);
-	if (!cwd.startsWith("/") || (cwd !== "/" && (cwd.endsWith("/") || cwd.split("/").slice(1).some(
-		(part) => part === "" || part === "." || part === ".."))))
+	if (
+		!cwd.startsWith("/") ||
+		(cwd !== "/" &&
+			(cwd.endsWith("/") ||
+				cwd
+					.split("/")
+					.slice(1)
+					.some((part) => part === "" || part === "." || part === "..")))
+	)
 		throw new ProtocolError("invalid_params", "cwd must be canonical absolute path");
 	if (typeof input.requestHash !== "string" || !/^[0-9a-f]{64}$/.test(input.requestHash))
 		throw new ProtocolError("invalid_params", "invalid requestHash");
 	const result: WorkTaskDispositionParams = {
-		taskId: taskUuid(input.taskId, "taskId"), jobId: dispositionText(input.jobId, "jobId"),
-		expectedOpRef: taskOpRef(input.expectedOpRef), sessionId, epoch, cwd, requestHash: input.requestHash,
-		target: parsedTarget, eventId: dispositionText(input.eventId, "eventId"),
-		expectedTaskVersion: dispositionInteger(input.expectedTaskVersion), outcome: input.outcome,
+		taskId: taskUuid(input.taskId, "taskId"),
+		jobId: dispositionText(input.jobId, "jobId"),
+		expectedOpRef: taskOpRef(input.expectedOpRef),
+		sessionId,
+		epoch,
+		cwd,
+		requestHash: input.requestHash,
+		target: parsedTarget,
+		eventId: dispositionText(input.eventId, "eventId"),
+		expectedTaskVersion: dispositionInteger(input.expectedTaskVersion),
+		outcome: input.outcome,
 		reason: dispositionText(input.reason, "reason", 2048),
-		evidence: { availability: evidence.availability, detail: dispositionText(evidence.detail, "detail", 4096),
-			evidenceAt: evidence.evidenceAt === null ? null : dispositionTime(evidence.evidenceAt) },
-		...("callerSessionId" in input ? { callerSessionId: dispositionText(input.callerSessionId, "callerSessionId") } : {}),
+		evidence: {
+			availability: evidence.availability,
+			detail: dispositionText(evidence.detail, "detail", 4096),
+			evidenceAt: evidence.evidenceAt === null ? null : dispositionTime(evidence.evidenceAt),
+		},
+		...("callerSessionId" in input
+			? { callerSessionId: dispositionText(input.callerSessionId, "callerSessionId") }
+			: {}),
 		...("validationUnavailable" in input
-			? { validationUnavailable: validateWorkTaskDispositionNegative(input.validationUnavailable) } : {}),
+			? { validationUnavailable: validateWorkTaskDispositionNegative(input.validationUnavailable) }
+			: {}),
 	};
 	if (new TextEncoder().encode(JSON.stringify(result)).byteLength > WORK_TASK_TEXT_MAX_BYTES)
 		throw new ProtocolError("invalid_params", "disposition exceeds byte bound");
@@ -1101,37 +1293,55 @@ export function validateWorkTaskDispositionRecord(value: unknown): WorkTaskDispo
 		throw new ProtocolError("invalid_params", "administrative record exceeds byte bound");
 	const request = validateWorkTaskDispositionParams(input.request);
 	const retained = taskRecord(input.retained, ["obligationState", "reportId", "holdReason", "controlPhase"]);
-	if (!["awaiting_final", "held", "final_admitted"].includes(retained.obligationState as string) ||
+	if (
+		!["awaiting_final", "held", "final_admitted"].includes(retained.obligationState as string) ||
 		(retained.controlPhase !== null && retained.controlPhase !== "held") ||
 		(request.target.kind === "control") !== (retained.controlPhase === "held") ||
-		(request.target.kind === "report" && ((retained.obligationState !== "held" &&
-			!(request.validationUnavailable && retained.obligationState === "awaiting_final")) ||
-			retained.reportId !== request.target.reportId)) ||
-		(retained.obligationState === "held") !== (retained.holdReason !== null))
+		(request.target.kind === "report" &&
+			((retained.obligationState !== "held" &&
+				!(request.validationUnavailable && retained.obligationState === "awaiting_final")) ||
+				retained.reportId !== request.target.reportId)) ||
+		(retained.obligationState === "held") !== (retained.holdReason !== null)
+	)
 		throw new ProtocolError("invalid_params", "invalid retained disposition state");
 	const origin = taskRecord(input.origin, ["platform", "kind", "conversationId", "parentId", "boundaryId", "peerId"]);
 	validateOriginRef(origin as unknown as OriginRef);
 	const taskVersion = dispositionInteger(input.taskVersion);
 	if (taskVersion !== request.expectedTaskVersion + 1)
 		throw new ProtocolError("invalid_params", "invalid recorded task version");
-	return { request, principalId: dispositionText(input.principalId, "principalId"), origin: origin as unknown as OriginRef,
-		recordedAt: dispositionTime(input.recordedAt), taskVersion,
-		retained: { obligationState: retained.obligationState as WorkTaskDispositionRetained["obligationState"],
+	return {
+		request,
+		principalId: dispositionText(input.principalId, "principalId"),
+		origin: origin as unknown as OriginRef,
+		recordedAt: dispositionTime(input.recordedAt),
+		taskVersion,
+		retained: {
+			obligationState: retained.obligationState as WorkTaskDispositionRetained["obligationState"],
 			reportId: retained.reportId === null ? null : dispositionText(retained.reportId, "reportId"),
 			holdReason: retained.holdReason === null ? null : dispositionText(retained.holdReason, "holdReason", 2048),
-			controlPhase: retained.controlPhase as "held" | null } };
+			controlPhase: retained.controlPhase as "held" | null,
+		},
+	};
 }
 
 export function validateWorkTaskDispositionResult(value: unknown): WorkTaskDispositionResult {
 	const input = taskRecord(value, ["execution", "disposition", "dispositionId", "sourceId", "deliveryId", "record"]);
-	if (input.execution !== "none" || (input.disposition !== "recorded" && input.disposition !== "duplicate") ||
-		typeof input.dispositionId !== "string" || !/^disposition-[0-9a-f]{64}$/.test(input.dispositionId) ||
-		input.sourceId !== input.dispositionId)
+	if (
+		input.execution !== "none" ||
+		(input.disposition !== "recorded" && input.disposition !== "duplicate") ||
+		typeof input.dispositionId !== "string" ||
+		!/^disposition-[0-9a-f]{64}$/.test(input.dispositionId) ||
+		input.sourceId !== input.dispositionId
+	)
 		throw new ProtocolError("invalid_params", "invalid administrative result");
-	return { execution: "none", disposition: input.disposition, dispositionId: input.dispositionId,
+	return {
+		execution: "none",
+		disposition: input.disposition,
+		dispositionId: input.dispositionId,
 		sourceId: input.dispositionId,
 		deliveryId: input.deliveryId === null ? null : dispositionText(input.deliveryId, "deliveryId"),
-		record: validateWorkTaskDispositionRecord(input.record) };
+		record: validateWorkTaskDispositionRecord(input.record),
+	};
 }
 
 function taskSnowflake(value: unknown, field: string): string {
@@ -1176,8 +1386,12 @@ export function validateWorkJobsParams(value: unknown): WorkJobsParams | undefin
 export function validateWorkTaskOriginSource(value: unknown, origin: OriginRef): WorkTaskOriginSource {
 	taskOrigin(origin, "thread");
 	const input = taskRecord(value, ["platformCreatedAt", "recovered"]);
-	if (typeof input.platformCreatedAt !== "number" || !Number.isSafeInteger(input.platformCreatedAt) ||
-		input.platformCreatedAt < 0 || input.platformCreatedAt > 8640000000000000) {
+	if (
+		typeof input.platformCreatedAt !== "number" ||
+		!Number.isSafeInteger(input.platformCreatedAt) ||
+		input.platformCreatedAt < 0 ||
+		input.platformCreatedAt > 8640000000000000
+	) {
 		throw new ProtocolError("invalid_params", "platformCreatedAt must be a valid Unix millisecond timestamp");
 	}
 	if ("recovered" in input && typeof input.recovered !== "boolean") {
@@ -1191,7 +1405,12 @@ export function validateWorkTaskOriginSource(value: unknown, origin: OriginRef):
 
 export function validateWorkTaskMessageMetadata(
 	value: unknown,
-	context: { readonly origin: OriginRef; readonly taskId?: string; readonly opRef?: string; readonly sourceId?: string },
+	context: {
+		readonly origin: OriginRef;
+		readonly taskId?: string;
+		readonly opRef?: string;
+		readonly sourceId?: string;
+	},
 ): WorkTaskMessageMetadata {
 	taskOrigin(context.origin, "thread");
 	const input = taskRecord(value, ["taskId", "opRef", "sourceId", "mappedOnly", "bindingRevision"]);
@@ -1201,12 +1420,17 @@ export function validateWorkTaskMessageMetadata(
 	if (hasAsciiControlCharacter(sourceId) || input.mappedOnly !== true) {
 		throw new ProtocolError("invalid_params", "invalid mapped task metadata");
 	}
-	for (const [key, actual] of [["taskId", taskId], ["opRef", opRef], ["sourceId", sourceId]] as const) {
+	for (const [key, actual] of [
+		["taskId", taskId],
+		["opRef", opRef],
+		["sourceId", sourceId],
+	] as const) {
 		if (context[key] !== undefined && context[key] !== actual) {
 			throw new ProtocolError("invalid_params", `task metadata ${key} mismatch`);
 		}
 	}
-	const bindingRevision = "bindingRevision" in input ? taskText(input.bindingRevision, "bindingRevision", 64) : undefined;
+	const bindingRevision =
+		"bindingRevision" in input ? taskText(input.bindingRevision, "bindingRevision", 64) : undefined;
 	if (bindingRevision !== undefined && !/^[0-9a-f]{64}$/.test(bindingRevision)) {
 		throw new ProtocolError("invalid_params", "bindingRevision must be a canonical SHA-256 hash");
 	}
@@ -1229,8 +1453,11 @@ export function validateDeliveryConfirmParams(value: unknown): DeliveryConfirmPa
 	if (!("platformReceipt" in input)) return { deliveryId };
 	const receipt = taskRecord(input.platformReceipt, ["origin", "messageIds"]);
 	const origin = taskOrigin(receipt.origin, "thread");
-	if (!Array.isArray(receipt.messageIds) || receipt.messageIds.length === 0 ||
-		receipt.messageIds.length > DELIVERY_RECEIPT_MAX_MESSAGE_IDS) {
+	if (
+		!Array.isArray(receipt.messageIds) ||
+		receipt.messageIds.length === 0 ||
+		receipt.messageIds.length > DELIVERY_RECEIPT_MAX_MESSAGE_IDS
+	) {
 		throw new ProtocolError("invalid_params", "receipt requires 1..1024 messageIds");
 	}
 	const messageIds = Array.from(receipt.messageIds, (id) => taskSnowflake(id, "messageId"));
@@ -1275,7 +1502,8 @@ export function validateWorkStartParams(value: unknown): WorkStartParams {
 	}
 	if (task && input.resume === true) throw new ProtocolError("invalid_params", "task admission cannot resume");
 	const cwd = "cwd" in input ? taskText(input.cwd, "cwd", 4096) : undefined;
-	const callerSessionId = "callerSessionId" in input ? taskText(input.callerSessionId, "callerSessionId", 256) : undefined;
+	const callerSessionId =
+		"callerSessionId" in input ? taskText(input.callerSessionId, "callerSessionId", 256) : undefined;
 	let model: WorkRunParams["model"];
 	if ("model" in input) {
 		if (typeof input.model === "string") model = taskText(input.model, "model", 256);
@@ -1285,7 +1513,8 @@ export function validateWorkStartParams(value: unknown): WorkStartParams {
 		}
 	}
 	return {
-		name, text,
+		name,
+		text,
 		...(task === undefined ? {} : { task }),
 		...(cwd === undefined ? {} : { cwd }),
 		...(typeof input.resume === "boolean" ? { resume: input.resume } : {}),
@@ -1356,6 +1585,75 @@ export function validateWorkTaskContextParams(value: unknown): WorkTaskContextPa
 		...(taskId === undefined ? {} : { taskId }),
 		...(topic === undefined ? {} : { topic }),
 		...(continuation === undefined ? {} : { continuation }),
+	};
+}
+
+export function validateWorkTaskSourceReadParams(value: unknown): WorkTaskSourceReadParams {
+	const input = taskRecord(value, ["mode", "taskId", "sourceId", "contentHash", "cursor"]);
+	if (input.mode !== "source") throw new ProtocolError("invalid_params", "source mode required");
+	const contentHash = taskText(input.contentHash, "contentHash", 64);
+	if (!/^[0-9a-f]{64}$/.test(contentHash)) throw new ProtocolError("invalid_params", "invalid source hash");
+	return {
+		mode: "source",
+		taskId: taskUuid(input.taskId, "taskId"),
+		sourceId: taskText(input.sourceId, "sourceId", 1024),
+		contentHash,
+		...("cursor" in input ? { cursor: taskText(input.cursor, "cursor", 4096) } : {}),
+	};
+}
+
+export function validateWorkTaskReviewParams(value: unknown): WorkTaskReviewParams {
+	const input = taskRecord(value, [
+		"taskId",
+		"expectedOpRef",
+		"reportId",
+		"sourceId",
+		"contentHash",
+		"reviewId",
+		"expectedReviewId",
+		"callerSessionId",
+		"callerEpoch",
+		"fullRead",
+		"disposition",
+		"rationale",
+		"question",
+	]);
+	const source = validateWorkTaskSourceReadParams({
+		mode: "source",
+		taskId: input.taskId,
+		sourceId: input.sourceId,
+		contentHash: input.contentHash,
+	});
+	if (!Number.isSafeInteger(input.callerEpoch) || (input.callerEpoch as number) < 0 || input.fullRead !== true)
+		throw new ProtocolError("invalid_params", "current epoch and explicit complete read required");
+	if (input.disposition !== "no_exception" && input.disposition !== "owner_question")
+		throw new ProtocolError("invalid_params", "invalid review disposition");
+	if ((input.disposition === "owner_question") !== "question" in input)
+		throw new ProtocolError("invalid_params", "only owner_question requires a question");
+	return {
+		taskId: source.taskId,
+		sourceId: source.sourceId,
+		contentHash: source.contentHash,
+		expectedOpRef: taskOpRef(input.expectedOpRef),
+		reportId: taskText(input.reportId, "reportId", 1024),
+		reviewId: taskUuid(input.reviewId, "reviewId"),
+		expectedReviewId: input.expectedReviewId === null ? null : taskUuid(input.expectedReviewId, "expectedReviewId"),
+		callerSessionId: taskText(input.callerSessionId, "callerSessionId", 1024),
+		callerEpoch: input.callerEpoch as number,
+		fullRead: true,
+		disposition: input.disposition,
+		rationale: taskText(input.rationale, "rationale", 2048),
+		...("question" in input ? { question: taskText(input.question, "question", 2048) } : {}),
+	};
+}
+
+export function validateWorkTaskReviewPendingParams(value: unknown): WorkTaskReviewPendingParams {
+	const input = taskRecord(value, ["mode", "callerSessionId", "afterTaskId"]);
+	if (input.mode !== "pending_reviews") throw new ProtocolError("invalid_params", "pending review mode required");
+	return {
+		mode: "pending_reviews",
+		callerSessionId: taskText(input.callerSessionId, "callerSessionId", 1024),
+		...("afterTaskId" in input ? { afterTaskId: taskUuid(input.afterTaskId, "afterTaskId") } : {}),
 	};
 }
 
@@ -1828,7 +2126,11 @@ export interface VerbCatalogV01 {
 	"work.task.recover": { params: WorkTaskRecoverParams; result: WorkTaskRecoverResult };
 	"work.task.disposition": { params: WorkTaskDispositionParams; result: WorkTaskDispositionResult };
 	"work.task.disposition.basis": { params: WorkTaskDispositionBasisParams; result: WorkTaskDispositionBasisResult };
-	"work.task.context": { params: WorkTaskContextParams; result: WorkTaskContextResult };
+	"work.task.context": {
+		params: WorkTaskContextParams | WorkTaskSourceReadParams | WorkTaskReviewPendingParams;
+		result: WorkTaskContextResult | WorkTaskSourceReadResult | WorkTaskReviewPendingResult;
+	};
+	"work.task.review": { params: WorkTaskReviewParams; result: WorkTaskReviewResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
 	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
@@ -1877,6 +2179,7 @@ export const VERBS_V01 = [
 	"work.task.disposition",
 	"work.task.disposition.basis",
 	"work.task.context",
+	"work.task.review",
 	"work.jobs",
 	"work.retire",
 	"chat.react",

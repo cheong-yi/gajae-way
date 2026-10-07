@@ -77,9 +77,16 @@ type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceReti
 export type TaskReleaseAssessment =
 	| { readonly kind: "unmapped" }
 	| { readonly kind: "hold"; readonly reason: string }
-	| { readonly kind: "eligible"; readonly taskId: string; readonly taskVersion: number;
-		readonly jobId: string; readonly opRef: string; readonly sessionId: string;
-		readonly epoch: number; readonly cwd: string };
+	| {
+			readonly kind: "eligible";
+			readonly taskId: string;
+			readonly taskVersion: number;
+			readonly jobId: string;
+			readonly opRef: string;
+			readonly sessionId: string;
+			readonly epoch: number;
+			readonly cwd: string;
+	  };
 
 export interface LaneGovernorOptions {
 	readonly database: GatewayDatabase;
@@ -501,10 +508,16 @@ export class LaneGovernor {
 			const assessment = this.#taskReleaseAssessment?.(name);
 			if (!assessment || assessment.kind === "unmapped")
 				return { kind: "hold", reason: "task_release_assessment_unavailable" };
-			if (assessment.kind === "eligible" && (assessment.taskId !== task.taskId ||
-				assessment.taskVersion !== task.version || assessment.jobId !== task.jobId ||
-				assessment.opRef !== task.opRef || assessment.sessionId !== task.sessionId ||
-				assessment.epoch !== task.epoch || assessment.cwd !== task.request.cwd))
+			if (
+				assessment.kind === "eligible" &&
+				(assessment.taskId !== task.taskId ||
+					assessment.taskVersion !== task.version ||
+					assessment.jobId !== task.jobId ||
+					assessment.opRef !== task.opRef ||
+					assessment.sessionId !== task.sessionId ||
+					assessment.epoch !== task.epoch ||
+					assessment.cwd !== task.request.cwd)
+			)
 				return { kind: "hold", reason: "task_release_identity_changed" };
 			return assessment;
 		} catch {
@@ -525,7 +538,8 @@ export class LaneGovernor {
 			return hold(assessment.kind === "hold" ? assessment.reason : "task_release_identity_changed");
 		const identity = JSON.stringify(assessment);
 		const authority = JSON.stringify(this.#database.inspectBrokerAuthority().authority);
-		const current = () => !this.#stopped &&
+		const current = () =>
+			!this.#stopped &&
 			authority === JSON.stringify(this.#database.inspectBrokerAuthority().authority) &&
 			identity === JSON.stringify(this.#assessTask(name));
 		let hostClosed = false;
@@ -546,12 +560,19 @@ export class LaneGovernor {
 				if (!current()) throw new Error("task_release_changed_after_close");
 				this.#database.rebindEpoch(sessionKey);
 			});
-			return { retired: true, sessionKey, sessionId: assessment.sessionId, closed: true,
-				...(forced ? { forced: true } : {}) };
+			return {
+				retired: true,
+				sessionKey,
+				sessionId: assessment.sessionId,
+				closed: true,
+				...(forced ? { forced: true } : {}),
+			};
 		} catch (error) {
 			// A close may already have taken effect. Neither failure nor host absence
 			// authorizes fallback release, replay, or a claim of safe nonexecution.
-			return hold(`${hostClosed ? "task_capacity_release_failed_after_close" : "task_release_unconfirmed"}: ${sanitizeDiagnostic(diagnostic(error))}`);
+			return hold(
+				`${hostClosed ? "task_capacity_release_failed_after_close" : "task_release_unconfirmed"}: ${sanitizeDiagnostic(diagnostic(error))}`,
+			);
 		}
 	}
 

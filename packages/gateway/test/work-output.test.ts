@@ -155,17 +155,22 @@ for (const transport of ["cli", "relay"] as const) {
 				if (transport === "relay") throw new Error("relay evidence must not fall back to CLI");
 				return response(envelope, exitCode);
 			},
-			transport === "relay" ? (request) => {
-				relayCalls++;
-				expect(request).toEqual({
-					type: "query_request", operation: "turn.result", input: { kind: "prompt", clientRef: input.opRef },
-				});
-				return envelope as ScriptedRelayReply;
-			} : undefined,
+			transport === "relay"
+				? (request) => {
+						relayCalls++;
+						expect(request).toEqual({
+							type: "query_request",
+							operation: "turn.result",
+							input: { kind: "prompt", clientRef: input.opRef },
+						});
+						return envelope as ScriptedRelayReply;
+					}
+				: undefined,
 		);
-		const handle = transport === "relay"
-			? await port.attachTail({ sessionId: input.sessionId, repo: input.repo, brokerGeneration: 0 })
-			: undefined;
+		const handle =
+			transport === "relay"
+				? await port.attachTail({ sessionId: input.sessionId, repo: input.repo, brokerGeneration: 0 })
+				: undefined;
 		const fetch = () => port.fetchWorkerOutput({ ...input, relay: handle });
 		try {
 			expect(await fetch()).toMatchObject({ status: "proven", text: "original answer" });
@@ -239,9 +244,13 @@ test("summary-only, incomplete and malformed original content cannot become outp
 	}
 	expect(parse(terminal("original", { textSummary: "." }))).toMatchObject({ status: "proven", text: "original" });
 	expect(parse(terminal(" . \n"))).toMatchObject({ status: "proven", text: " . \n" });
-	expect(parse(terminal("x".repeat(16_384), {
-		outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
-	}))).toMatchObject({ status: "proven", provenance: { byteLength: 16_384 } });
+	expect(
+		parse(
+			terminal("x".repeat(16_384), {
+				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+			}),
+		),
+	).toMatchObject({ status: "proven", provenance: { byteLength: 16_384 } });
 });
 
 test("exact current clientRef is supported without fabricating optional command or turn ids", () => {
@@ -397,11 +406,16 @@ test("production steer accepts the selected SDK receipt through the real relay d
 	const uncertain = await port.steer(steer).catch((error: unknown) => error);
 	expect(uncertain).toBeInstanceOf(GjcCliError);
 	expect((uncertain as GjcCliError).details).toEqual({
-		code: "receipt_identity_mismatch", outcomeCertainty: "unknown",
+		code: "receipt_identity_mismatch",
+		outcomeCertainty: "unknown",
 	});
-	expect(requests).toEqual(Array.from({ length: 2 }, () => ({
-		type: "control_request", operation: "turn.steer", input: { text: "steer", clientRef },
-	})));
+	expect(requests).toEqual(
+		Array.from({ length: 2 }, () => ({
+			type: "control_request",
+			operation: "turn.steer",
+			input: { text: "steer", clientRef },
+		})),
+	);
 	expect(cliCalls).toBe(0);
 });
 
@@ -492,11 +506,18 @@ test("steer authoritative refusal or matching rejection is marked while malforme
 	const steer = { sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-ref" };
 	const refusal = { code: "busy", message: "occupied", outcomeCertainty: "not-applied" };
 	for (const rejected of [
-		{ ok: true, result: {
-			accepted: false, status: "rejected", clientRef: "caller-ref",
-			commandId: "command-1", turnId: "turn-1", acceptedAt: 1_700_000_000_000,
-			error: refusal,
-		} },
+		{
+			ok: true,
+			result: {
+				accepted: false,
+				status: "rejected",
+				clientRef: "caller-ref",
+				commandId: "command-1",
+				turnId: "turn-1",
+				acceptedAt: 1_700_000_000_000,
+				error: refusal,
+			},
+		},
 		{ ok: false, error: refusal },
 	]) {
 		envelope = rejected;
@@ -535,7 +556,8 @@ test("steer authoritative refusal or matching rejection is marked while malforme
 		);
 		expect(error).toBeInstanceOf(GjcCliError);
 		expect((error as GjcCliError).details).toEqual({
-			code: "receipt_identity_mismatch", outcomeCertainty: "unknown",
+			code: "receipt_identity_mismatch",
+			outcomeCertainty: "unknown",
 		});
 	}
 	envelope = { ok: false, error: { code: "terminal_uncertain", message: "Original steering outcome is uncertain" } };
@@ -543,10 +565,17 @@ test("steer authoritative refusal or matching rejection is marked while malforme
 		() => undefined,
 		(error: unknown) => error,
 	);
-	expect((uncertain as GjcCliError).details).toEqual({ code: "terminal_uncertain", message: "Original steering outcome is uncertain" });
-	expect(requests).toEqual(Array.from({ length: malformedResults.length + 3 }, () => ({
-		type: "control_request", operation: "turn.steer", input: { text: "steer", clientRef: "caller-ref" },
-	})));
+	expect((uncertain as GjcCliError).details).toEqual({
+		code: "terminal_uncertain",
+		message: "Original steering outcome is uncertain",
+	});
+	expect(requests).toEqual(
+		Array.from({ length: malformedResults.length + 3 }, () => ({
+			type: "control_request",
+			operation: "turn.steer",
+			input: { text: "steer", clientRef: "caller-ref" },
+		})),
+	);
 	expect(cliCalls).toBe(0);
 });
 
@@ -563,15 +592,25 @@ test("bare busy without no-effect evidence remains uncertain through the real re
 			return { ok: false, error: { code: "busy" } };
 		},
 	);
-	const failure = await port.steer({
-		sessionId: input.sessionId, repo: input.repo, text: "steer", clientRef: "caller-ref",
-	}).catch((error: unknown) => error);
-	expect(requests).toEqual([{
-		type: "control_request", operation: "turn.steer", input: { text: "steer", clientRef: "caller-ref" },
-	}]);
+	const failure = await port
+		.steer({
+			sessionId: input.sessionId,
+			repo: input.repo,
+			text: "steer",
+			clientRef: "caller-ref",
+		})
+		.catch((error: unknown) => error);
+	expect(requests).toEqual([
+		{
+			type: "control_request",
+			operation: "turn.steer",
+			input: { text: "steer", clientRef: "caller-ref" },
+		},
+	]);
 	expect(cliCalls).toBe(0);
 	expect(failure).toBeInstanceOf(GjcCliError);
 	expect((failure as GjcCliError).details).toEqual({
-		code: "receipt_identity_mismatch", outcomeCertainty: "unknown",
+		code: "receipt_identity_mismatch",
+		outcomeCertainty: "unknown",
 	});
 });

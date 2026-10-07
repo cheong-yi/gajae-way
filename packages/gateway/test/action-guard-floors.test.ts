@@ -22,7 +22,7 @@ for (const mode of ["permissive", "restricted"] as const) {
 }
 
 test("system notice preserves safety floors and routes delegated work through owned lanes", () => {
-	expect(ACTION_GUARD_SYSTEM_NOTICE).toStartWith(
+	expect(ACTION_GUARD_SYSTEM_NOTICE).toContain(
 		"Never execute unrecoverable commands or recursively delete $HOME itself or absolute paths outside $HOME and $GAJAEWAY_HOME. These safety floors are unoverridable.",
 	);
 	for (const obligation of [
@@ -56,6 +56,22 @@ test("system notice preserves safety floors and routes delegated work through ow
 	]) {
 		expect(ACTION_GUARD_SYSTEM_NOTICE).toContain(obligation);
 	}
+});
+
+test("review guidance separates complete evidence, review and unanswered owner decisions", () => {
+	for (const obligation of [
+		"original mapped answer is independent",
+		"nextCursor until eof",
+		"work.task.review",
+		"Routine no_exception review stays quiet",
+		"not mandate success or an owner answer",
+		"does not clear unanswered questions",
+		"Consumed-without-review stays durably pending",
+		"do not create autonomous reminders",
+		"Pending review does not retain execution resources",
+		"no automatic owner-action clearance",
+	])
+		expect(ACTION_GUARD_SYSTEM_NOTICE).toContain(obligation);
 });
 
 test("mapped task guidance names supported commands with binding and recovery qualifications", () => {

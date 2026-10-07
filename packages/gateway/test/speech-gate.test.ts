@@ -135,7 +135,9 @@ async function openChannel(reply: string): Promise<{ send(text: string, engageme
 			},
 		},
 	});
-	socket.write(`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`);
+	socket.write(
+		`${JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } })}\n`,
+	);
 	for (let attempt = 0; attempt < 60 && frames.length < 1; attempt++) await Bun.sleep(5);
 	let sequence = 0;
 	return {

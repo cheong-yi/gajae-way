@@ -80,11 +80,15 @@ export function describePanelResponse(
 	const action = event.actions[0];
 	if (!action.action_id) return null;
 
-	// Parse action_id format: ask_user_<panelId>_<optionId> or approval_<panelId>_allow/deny
-	// Use greedy matching for panelId to handle IDs with underscores, stop at last underscore
-	const askUserMatch = action.action_id.match(/^ask_user_(.+)_([^_]+)$/);
-	if (askUserMatch) {
-		const [, panelId, optionId] = askUserMatch;
+	// The renderer supplies the complete option ID as value. Neither ID has an
+	// underscore-free grammar, so only that exact suffix establishes the boundary.
+	if (action.action_id.startsWith("ask_user_")) {
+		const optionId = action.value;
+		if (typeof optionId !== "string" || optionId.length === 0) return null;
+		const suffix = `_${optionId}`;
+		if (!action.action_id.endsWith(suffix)) return null;
+		const panelId = action.action_id.slice("ask_user_".length, -suffix.length);
+		if (!panelId) return null;
 		return {
 			origin,
 			panelId,

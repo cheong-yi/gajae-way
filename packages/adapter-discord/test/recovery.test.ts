@@ -1,9 +1,9 @@
-import { afterAll, beforeAll, expect, spyOn, test as bunTest } from "bun:test";
-import type { WorkJobsResult } from "@gajae-gateway/protocol";
+import { afterAll, beforeAll, test as bunTest, expect, spyOn } from "bun:test";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { WorkJobsResult } from "@gajae-gateway/protocol";
 import type { DiscordInboundMessage } from "../src/main";
 import { decideInbound, LruSet, monitorFailureDecision, ReconnectingGateway, WorkingStatus } from "../src/main";
 import {
@@ -103,7 +103,10 @@ function recoveryGateway(...args: ConstructorParameters<typeof ReconnectingGatew
 	gateway.recoverMissedMessages = () => {
 		const pass = recover();
 		scope.passes.add(pass);
-		void pass.then(() => scope.passes.delete(pass), () => scope.passes.delete(pass));
+		void pass.then(
+			() => scope.passes.delete(pass),
+			() => scope.passes.delete(pass),
+		);
 		return pass;
 	};
 	return gateway;

@@ -34,13 +34,19 @@ test("scripted steering lookup retains exact receipts and rejects mismatched ori
 	const receipt = await port.lookupSteerStatus(input);
 	expect(receipt).toEqual({ status: "accepted", clientRef: input.clientRef, acceptedAt: expect.any(Number) });
 	expect(await port.lookupSteerStatus(input)).toEqual(receipt);
-	for (const mismatch of [{ ...input, sessionId: "other-session" }, { ...input, repo: "/other-repo" }]) {
+	for (const mismatch of [
+		{ ...input, sessionId: "other-session" },
+		{ ...input, repo: "/other-repo" },
+	]) {
 		expect(await port.lookupSteerStatus(mismatch)).toEqual({
-			status: "unavailable", clientRef: input.clientRef, code: "identity_mismatch",
+			status: "unavailable",
+			clientRef: input.clientRef,
+			code: "identity_mismatch",
 		});
 	}
 	expect(await port.lookupSteerStatus({ ...input, clientRef: "unrecorded" })).toEqual({
-		status: "unknown", clientRef: "unrecorded",
+		status: "unknown",
+		clientRef: "unrecorded",
 	});
 	await expect(port.lookupSteerStatus({ ...input, clientRef: " original-steer" })).rejects.toThrow("canonical");
 	expect(port.steers).toEqual([input]);
@@ -49,14 +55,25 @@ test("scripted steering lookup retains exact receipts and rejects mismatched ori
 
 test("scripted steering refusal is not acceptance and transport failure stays unknown", async () => {
 	const refusal = steerRefused();
-	const port = new ScriptedSessionPort({ onSteer: () => { throw refusal; } });
+	const port = new ScriptedSessionPort({
+		onSteer: () => {
+			throw refusal;
+		},
+	});
 	const input = { sessionId: "original-session", repo: REPO, clientRef: "refused-steer", text: "Inspect" };
 	await expect(port.steer(input)).rejects.toBe(refusal);
 	expect(await port.lookupSteerStatus(input)).toEqual({
-		status: "rejected", clientRef: input.clientRef, acceptedAt: expect.any(Number),
-		terminalAt: expect.any(Number), errorCode: "busy",
+		status: "rejected",
+		clientRef: input.clientRef,
+		acceptedAt: expect.any(Number),
+		terminalAt: expect.any(Number),
+		errorCode: "busy",
 	});
-	const uncertain = new ScriptedSessionPort({ onSteer: () => { throw new Error("transport lost"); } });
+	const uncertain = new ScriptedSessionPort({
+		onSteer: () => {
+			throw new Error("transport lost");
+		},
+	});
 	await expect(uncertain.steer(input)).rejects.toThrow("transport lost");
 	expect(await uncertain.lookupSteerStatus(input)).toEqual({ status: "unknown", clientRef: input.clientRef });
 });

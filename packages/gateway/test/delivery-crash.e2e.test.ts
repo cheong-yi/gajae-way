@@ -1,8 +1,8 @@
 import { afterEach, expect, test } from "bun:test";
-import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { GatewayDatabase } from "../src/store/db";
 import { DeliveryLedger } from "../src/store/ledger";
 

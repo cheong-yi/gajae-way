@@ -838,17 +838,6 @@ class ManagedTailHandle implements TailHandle {
 				definitions: { methods: ["request"] },
 			}),
 		);
-		// Register for 'ui' capability with select and confirm methods
-		const uiId = `gw-ui-${this.brokerGeneration}-${this.sessionId}`;
-		stream.write(
-			JSON.stringify({
-				type: "register_provider",
-				id: uiId,
-				connectionId: this.#connectionId,
-				capability: "ui",
-				definitions: { methods: ["select", "confirm"] },
-			}),
-		);
 		// Start heartbeat timer to keep leases alive
 		this.#startHeartbeat();
 	}
@@ -878,18 +867,17 @@ class ManagedTailHandle implements TailHandle {
 					}
 					continue;
 				}
-				// Send heartbeat if lease will expire in less than 2 seconds
-				if (expiresAt - now < 2000) {
-					try {
-						this.#stream?.write(
-							JSON.stringify({
-								type: "provider_heartbeat",
-								leaseId,
-							}),
-						);
-					} catch (_error) {
-						// Stream write failed; will be handled by stream error handlers
-					}
+				// The host renews an unexpired lease on heartbeat. Renew every
+				// tick rather than waiting for a window shorter than this interval.
+				try {
+					this.#stream.write(
+						JSON.stringify({
+							type: "provider_heartbeat",
+							leaseId,
+						}),
+					);
+				} catch (_error) {
+					// Stream write failed; will be handled by stream error handlers
 				}
 			}
 		}, HEARTBEAT_INTERVAL_MS);
@@ -899,10 +887,10 @@ class ManagedTailHandle implements TailHandle {
 	#handleLeaseState(frame: Record<string, unknown>): void {
 		const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : undefined;
 		if (!leaseId) return;
-		const expiresAt = typeof frame.leaseExpiresAt === "string" ? new Date(frame.leaseExpiresAt).getTime() : undefined;
-		if (!expiresAt || Number.isNaN(expiresAt)) return;
 		const active = frame.active === true;
 		if (active) {
+			const expiresAt = typeof frame.leaseExpiresAt === "string" ? new Date(frame.leaseExpiresAt).getTime() : undefined;
+			if (!expiresAt || Number.isNaN(expiresAt)) return;
 			// Store the expiry time for this lease
 			this.#leaseExpiryTimes.set(leaseId, expiresAt);
 		} else {
@@ -927,12 +915,11 @@ class ManagedTailHandle implements TailHandle {
 		this.#leaseExpiryTimes.set(leaseId, expiresAt);
 	}
 
-	async #releaseAllLeases(): Promise<void> {
-		if (!this.#stream || this.#closed) return;
+	#releaseAllLeases(): void {
 		try {
 			for (const [, leaseId] of this.#providerLeases.entries()) {
 				try {
-					this.#stream.write(
+					this.#stream?.write(
 						JSON.stringify({
 							type: "lease_release",
 							leaseId,
@@ -957,7 +944,7 @@ class ManagedTailHandle implements TailHandle {
 			this.#heartbeatTimer = undefined;
 		}
 		// Release all active leases
-		await this.#releaseAllLeases();
+		this.#releaseAllLeases();
 		this.#stream?.close();
 		this.#stream = undefined;
 		this.#failPending("handle closed");

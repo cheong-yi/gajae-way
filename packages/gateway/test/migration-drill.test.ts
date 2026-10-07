@@ -98,12 +98,14 @@ test("upgrades constructed historical schema 32 to 33 and preserves rows and rec
 		});
 		current.memoryIntentBeginAttempt("memory-v32");
 		current.memoryIntentQuarantine("memory-v32", "preserve diagnostic");
-		expect(current.deliveryCreate({
-			id: "delivery-v32",
-			turnId: "op-v32",
-			originKey: "discord/channel/v32",
-			payloadJson: '{"text":"original result","sessionId":"session-v32"}',
-		})).toBe(true);
+		expect(
+			current.deliveryCreate({
+				id: "delivery-v32",
+				turnId: "op-v32",
+				originKey: "discord/channel/v32",
+				payloadJson: '{"text":"original result","sessionId":"session-v32"}',
+			}),
+		).toBe(true);
 		current.deliveryUpdate("delivery-v32", "pending", 2, "unconfirmed acknowledgement");
 		current.close();
 
@@ -128,9 +130,7 @@ test("upgrades constructed historical schema 32 to 33 and preserves rows and rec
 			const originalRows = rows(raw);
 			for (const seeded of originalRows) expect(seeded.rows.length).toBeGreaterThan(0);
 			const historicalReceipts = receipts(raw).filter((row) => row.version <= 32);
-			expect(historicalReceipts.map((row) => row.version)).toEqual(
-				Array.from({ length: 32 }, (_, index) => index + 1),
-			);
+			expect(historicalReceipts.map((row) => row.version)).toEqual(Array.from({ length: 32 }, (_, index) => index + 1));
 			for (const table of firstmateTables)
 				expect(raw.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n).toBe(0);
 			raw.transaction(() => {
@@ -139,9 +139,9 @@ test("upgrades constructed historical schema 32 to 33 and preserves rows and rec
 			})();
 
 			expect(receipts(raw)).toEqual(historicalReceipts);
-			expect(raw.query<{ version: number }, []>(
-				"SELECT MAX(version) AS version FROM schema_migrations",
-			).get()?.version).toBe(32);
+			expect(
+				raw.query<{ version: number }, []>("SELECT MAX(version) AS version FROM schema_migrations").get()?.version,
+			).toBe(32);
 			expect(schema(raw)).toEqual(historicalSchema);
 			expect(rows(raw)).toEqual(originalRows);
 			const boundaryNames = schema(raw).map((row) => row.name);
@@ -155,9 +155,7 @@ test("upgrades constructed historical schema 32 to 33 and preserves rows and rec
 				upgraded.close();
 				const observedReceipts = receipts(raw);
 				expect(observedReceipts.filter((row) => row.version <= 32)).toEqual(historicalReceipts);
-				expect(observedReceipts.map((row) => row.version)).toEqual(
-					Array.from({ length: 33 }, (_, index) => index + 1),
-				);
+				expect(observedReceipts.map((row) => row.version)).toEqual(Array.from({ length: 33 }, (_, index) => index + 1));
 				expect(observedReceipts.filter((row) => row.version === 33)).toHaveLength(1);
 				expect(observedReceipts[32]?.applied_at).toBeString();
 				if (phase === "upgrade") upgradedReceipts = observedReceipts;
@@ -169,10 +167,8 @@ test("upgrades constructed historical schema 32 to 33 and preserves rows and rec
 				expect(schema(raw).filter((row) => firstmateTables.includes(row.tbl_name))).toEqual(firstmateSchema);
 				expect(rows(raw)).toEqual(originalRows);
 				const objects = schema(raw);
-				for (const name of firstmateTables)
-					expect(objects.find((row) => row.name === name)?.type).toBe("table");
-				for (const name of firstmateIndexes)
-					expect(objects.find((row) => row.name === name)?.type).toBe("index");
+				for (const name of firstmateTables) expect(objects.find((row) => row.name === name)?.type).toBe("table");
+				for (const name of firstmateIndexes) expect(objects.find((row) => row.name === name)?.type).toBe("index");
 				const tableSql = (name: string) => objects.find((row) => row.name === name)?.sql;
 				for (const table of firstmateTables) {
 					expect(raw.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ${table}`).get()?.n).toBe(0);

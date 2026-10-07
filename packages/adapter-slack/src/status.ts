@@ -148,9 +148,8 @@ export class WorkingStatus {
 		const key = progress.origin.conversationId;
 		const entry = this.#entries.get(key);
 		if (!entry?.wanted) return;
-		// Reset both stale and refresh timers on each signal: the turn is still alive.
+		// Extend liveness without postponing the independent periodic refresh.
 		this.#armStale(key);
-		this.#armRefresh(key, entry);
 		const swap = presenceTransition(entry.state, progress, this.now());
 		if (!swap) return;
 		entry.state = swap.state;
@@ -206,15 +205,16 @@ export class WorkingStatus {
 		const timer = this.setTimer(async () => {
 			// Periodically refresh the status line to keep it alive (Slack expires after ~2min).
 			// The entry may have been cleared by an explicit clear() call in the meantime.
-			if (!this.#entries.has(key)) return;
-			if (!entry.wanted) return;
+			if (this.#entries.get(key) !== entry || !entry.wanted || this.#refreshTimers.get(key) !== timer) return;
 			// Force refresh of the status line by clearing the confirmed state, even if
 			// the desired text hasn't changed. Slack's expiry timer resets on every setStatus call.
 			if (entry.shownStatus) entry.shownStatus = "";
 			// Re-reconcile to refresh the status line without changing the desired state.
 			await this.#reconcile(key, entry);
 			// Re-arm the refresh timer for the next cycle.
-			if (this.#entries.has(key)) this.#armRefresh(key, entry);
+			if (this.#entries.get(key) === entry && entry.wanted && this.#refreshTimers.get(key) === timer) {
+				this.#armRefresh(key, entry);
+			}
 		}, WORKING_STATUS_REFRESH_MS);
 		timer.unref?.();
 		this.#refreshTimers.set(key, timer);

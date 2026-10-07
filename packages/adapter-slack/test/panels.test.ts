@@ -2,6 +2,52 @@ import { describe, expect, it } from "bun:test";
 import type { ChatMessagePayload } from "@gajae-gateway/protocol";
 import { approvalPanelBlocks, approvalPanelFallback, askUserPanelBlocks, askUserPanelFallback } from "../src/panels";
 
+describe("panel duplicate-warning presentation", () => {
+	for (const duplicateWarning of [false, true]) {
+		for (const expired of [false, true]) {
+			it(`qualifies both panel kinds only when duplicateWarning=${duplicateWarning}, expired=${expired}`, () => {
+				const expiresAt = expired ? "2000-01-01T00:00:00Z" : "2999-01-01T00:00:00Z";
+				const prefix = duplicateWarning ? "[recovered - may be a duplicate] " : "";
+				const message: ChatMessagePayload = {
+					turnId: "turn123",
+					origin: { platform: "slack", kind: "channel", conversationId: "C123" },
+					role: "assistant",
+					text: "Delivery text is not the panel title",
+					final: true,
+					redelivered: true,
+					duplicateWarning,
+					askUserPanel: {
+						panelId: "question_001",
+						question: "Choose a tool",
+						expiresAt,
+						options: [{ id: "option_a", label: "Tool A" }],
+					},
+					approvalPanel: { panelId: "approval_001", message: "Approve deployment?", expiresAt },
+				};
+				const questionBlocks = askUserPanelBlocks(message);
+				const approvalBlocks = approvalPanelBlocks(message);
+				expect(questionBlocks[0]).toEqual({
+					type: "section",
+					text: { type: "mrkdwn", text: `${prefix}Choose a tool` },
+				});
+				expect(approvalBlocks[0]).toEqual({
+					type: "section",
+					text: { type: "mrkdwn", text: `${prefix}Approve deployment?` },
+				});
+				expect(askUserPanelFallback(message)).toBe(
+					`${prefix}Choose a tool\n• Tool A${expired ? "\n_(This question has expired.)_" : ""}`,
+				);
+				expect(approvalPanelFallback(message)).toBe(
+					`${prefix}Approve deployment?\n${expired ? "_(This approval request has expired.)_" : "React with :white_check_mark: to allow or :x: to deny."}`,
+				);
+				for (const blocks of [questionBlocks, approvalBlocks]) {
+					expect(blocks.filter((block) => block.type === "actions")).toHaveLength(expired ? 0 : 1);
+				}
+			});
+		}
+	}
+});
+
 describe("askUserPanelBlocks", () => {
 	it("renders ask-user panel with interactive buttons", () => {
 		const futureTime = new Date(Date.now() + 60 * 1000).toISOString();

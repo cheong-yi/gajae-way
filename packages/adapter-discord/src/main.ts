@@ -2,10 +2,11 @@ import { join } from "node:path";
 import { installStructuredLogging } from "@gajae-gateway/log";
 import {
 	type ChannelEngagementPolicy,
-	type ChatMessagePayload,
 	type ChatEditResult,
-	type ChatSendResult,
+	type ChatMessagePayload,
 	type ChatProgressPayload,
+	type ChatSendResult,
+	DELIVERY_RECEIPT_MAX_MESSAGE_IDS,
 	type EngagementContext,
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
@@ -15,21 +16,28 @@ import {
 	presenceTransition,
 	type ReactionAction,
 	type SessionModelChoicesResult,
-	type WorkJobsResult,
-	type WorkTaskThreadOrigin,
-	type WorkTaskOriginSource,
-	type WorkThreadClaimResult,
-	type WorkThreadBindParams,
-	type WorkThreadBindResult,
-	DELIVERY_RECEIPT_MAX_MESSAGE_IDS,
 	validateDeliveryConfirmParams,
 	validateWorkJobsParams,
 	validateWorkTaskMessageMetadata,
 	validateWorkTaskSpec,
 	validateWorkThreadBindParams,
+	type WorkJobsResult,
+	type WorkTaskOriginSource,
+	type WorkTaskThreadOrigin,
+	type WorkThreadBindParams,
+	type WorkThreadBindResult,
+	type WorkThreadClaimResult,
 } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "@gajae-gateway/sdk";
-import { AttachmentBuilder, ChannelType, Client, GatewayIntentBits, MessageFlags, Partials, PermissionFlagsBits } from "discord.js";
+import {
+	AttachmentBuilder,
+	ChannelType,
+	Client,
+	GatewayIntentBits,
+	MessageFlags,
+	Partials,
+	PermissionFlagsBits,
+} from "discord.js";
 import pkg from "../package.json";
 import { type AttachmentCarrier, describeInboundBody, firstVoiceMessage } from "./attachments";
 import { type AuthorLike, resolveDisplayName, resolveServerTag } from "./author";
@@ -351,9 +359,11 @@ export function describeMessageEdit(
 		text,
 		engagement,
 		receivedAt: new Date(editedAt).toISOString(),
-		...(message.createdTimestamp === undefined ? {} : {
-			originSource: { platformCreatedAt: message.createdTimestamp },
-		}),
+		...(message.createdTimestamp === undefined
+			? {}
+			: {
+					originSource: { platformCreatedAt: message.createdTimestamp },
+				}),
 	};
 }
 
@@ -853,8 +863,13 @@ interface TaskChannelLike extends DiscordTextChannelLike {
 }
 
 function taskChannel(value: unknown): TaskChannelLike {
-	if (!isDiscordTextChannel(value) || !("isThread" in value) || typeof value.isThread !== "function" ||
-		!("permissionsFor" in value) || typeof value.permissionsFor !== "function")
+	if (
+		!isDiscordTextChannel(value) ||
+		!("isThread" in value) ||
+		typeof value.isThread !== "function" ||
+		!("permissionsFor" in value) ||
+		typeof value.permissionsFor !== "function"
+	)
 		throw new Error("Discord task surface is unavailable or unsupported");
 	return value as TaskChannelLike;
 }
@@ -868,12 +883,19 @@ function requireTaskPermissions(channel: TaskChannelLike, flags: readonly bigint
 
 function verifyMappedThread(value: unknown, origin: WorkTaskThreadOrigin): TaskChannelLike {
 	const channel = taskChannel(value);
-	if (!channel.isThread() || channel.id !== origin.conversationId ||
-		channel.parentId !== origin.parentId || channel.guildId !== origin.boundaryId ||
-		channel.archived !== false || channel.locked !== false)
+	if (
+		!channel.isThread() ||
+		channel.id !== origin.conversationId ||
+		channel.parentId !== origin.parentId ||
+		channel.guildId !== origin.boundaryId ||
+		channel.archived !== false ||
+		channel.locked !== false
+	)
 		throw new Error("Discord mapped thread identity or active state is invalid");
 	requireTaskPermissions(channel, [
-		PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.SendMessagesInThreads,
+		PermissionFlagsBits.ViewChannel,
+		PermissionFlagsBits.ReadMessageHistory,
+		PermissionFlagsBits.SendMessagesInThreads,
 	]);
 	return channel;
 }
@@ -910,8 +932,10 @@ export async function reconcileDiscordWorkTasks(
 		if (projectionDiagnostics++ < 20) log.error(`Discord task discovery incomplete: ${message}`);
 	};
 	for (let page = 0; page < 100; page++) {
-		const result = await gateway.request<WorkJobsResult>("work.jobs",
-			validateWorkJobsParams(afterTaskId === undefined ? undefined : { afterTaskId }));
+		const result = await gateway.request<WorkJobsResult>(
+			"work.jobs",
+			validateWorkJobsParams(afterTaskId === undefined ? undefined : { afterTaskId }),
+		);
 		if (!Array.isArray(result.tasks) || result.tasks.length > 20) throw new Error("Invalid work.jobs task page");
 		// Projection errors contain identities, not recoverable surface facts. Never
 		// turn a tombstone into a claim, an origin, or permission to create a thread.
@@ -919,22 +943,33 @@ export async function reconcileDiscordWorkTasks(
 			projectionFailure("Invalid work.jobs taskErrors page");
 		}
 		const errorIds = new Set<string>();
-		if (Array.isArray(result.taskErrors)) for (const error of result.taskErrors.slice(0, 20)) {
-			try {
-				if (!error || typeof error !== "object" || Array.isArray(error) ||
-					Object.keys(error).length !== 2 || !Object.hasOwn(error, "taskId") || !Object.hasOwn(error, "reason") ||
-					typeof error.taskId !== "string" || typeof error.reason !== "string" || !error.reason.trim())
-					throw new Error("Invalid projection error");
-				validateWorkJobsParams({ afterTaskId: error.taskId });
-				const duplicate = errorIds.has(error.taskId);
-				errorIds.add(error.taskId);
-				if (duplicate || result.tasks.some((task) => task.taskId === error.taskId))
-					throw new Error("Conflicting projection error identity");
-				projectionFailure(`task ${error.taskId} projection unavailable: ${JSON.stringify(error.reason.slice(0, 256))}`);
-			} catch {
-				projectionFailure("Invalid work.jobs taskErrors entry");
+		if (Array.isArray(result.taskErrors))
+			for (const error of result.taskErrors.slice(0, 20)) {
+				try {
+					if (
+						!error ||
+						typeof error !== "object" ||
+						Array.isArray(error) ||
+						Object.keys(error).length !== 2 ||
+						!Object.hasOwn(error, "taskId") ||
+						!Object.hasOwn(error, "reason") ||
+						typeof error.taskId !== "string" ||
+						typeof error.reason !== "string" ||
+						!error.reason.trim()
+					)
+						throw new Error("Invalid projection error");
+					validateWorkJobsParams({ afterTaskId: error.taskId });
+					const duplicate = errorIds.has(error.taskId);
+					errorIds.add(error.taskId);
+					if (duplicate || result.tasks.some((task) => task.taskId === error.taskId))
+						throw new Error("Conflicting projection error identity");
+					projectionFailure(
+						`task ${error.taskId} projection unavailable: ${JSON.stringify(error.reason.slice(0, 256))}`,
+					);
+				} catch {
+					projectionFailure("Invalid work.jobs taskErrors entry");
+				}
 			}
-		}
 		for (const task of result.tasks) {
 			if (errorIds.has(task.taskId)) continue;
 			const surface = task.surface;
@@ -948,31 +983,57 @@ export async function reconcileDiscordWorkTasks(
 					continue;
 				}
 				validateWorkTaskSpec({ taskId: task.taskId, kind: task.kind, surface: surface.request });
-				const claim = await gateway.request<WorkThreadClaimResult>("work.thread.claim", { taskId: task.taskId, claimId });
+				const claim = await gateway.request<WorkThreadClaimResult>("work.thread.claim", {
+					taskId: task.taskId,
+					claimId,
+				});
 				if (claim.taskId !== task.taskId || claim.claimId !== claimId) throw new Error("Task claim identity mismatch");
 				let origin: WorkTaskThreadOrigin;
 				if (claim.create === true) {
 					mayHold = true;
-					if (surface.phase !== "pending" || surface.request.parentOrigin === undefined ||
+					if (
+						surface.phase !== "pending" ||
+						surface.request.parentOrigin === undefined ||
 						claim.parentOrigin.conversationId !== surface.request.parentOrigin.conversationId ||
-						claim.parentOrigin.boundaryId !== surface.request.parentOrigin.boundaryId)
+						claim.parentOrigin.boundaryId !== surface.request.parentOrigin.boundaryId
+					)
 						throw new Error("Task create claim does not match the original pending parent");
 					// Only this fresh server authorization permits a single create attempt.
-					validateWorkTaskSpec({ taskId: task.taskId, kind: task.kind, surface: {
-						parentOrigin: claim.parentOrigin, ...(claim.title === undefined ? {} : { title: claim.title }),
-					} });
+					validateWorkTaskSpec({
+						taskId: task.taskId,
+						kind: task.kind,
+						surface: {
+							parentOrigin: claim.parentOrigin,
+							...(claim.title === undefined ? {} : { title: claim.title }),
+						},
+					});
 					const parent = taskChannel(await discord.channels.fetch(claim.parentOrigin.conversationId, { force: true }));
-					if (parent.id !== claim.parentOrigin.conversationId || parent.guildId !== claim.parentOrigin.boundaryId ||
-						parent.type !== ChannelType.GuildText || parent.isThread() || !parent.threads?.create)
+					if (
+						parent.id !== claim.parentOrigin.conversationId ||
+						parent.guildId !== claim.parentOrigin.boundaryId ||
+						parent.type !== ChannelType.GuildText ||
+						parent.isThread() ||
+						!parent.threads?.create
+					)
 						throw new Error("Unsupported Discord task parent; only guild text public threads are supported");
 					requireTaskPermissions(parent, [
-						PermissionFlagsBits.ViewChannel, PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.SendMessagesInThreads,
+						PermissionFlagsBits.ViewChannel,
+						PermissionFlagsBits.CreatePublicThreads,
+						PermissionFlagsBits.SendMessagesInThreads,
 					]);
-					const created = taskChannel(await parent.threads.create({
-						name: claim.title ?? task.name.slice(0, 100), type: ChannelType.PublicThread,
-					}));
-					origin = { platform: "discord", kind: "thread", conversationId: created.id,
-						parentId: parent.id, boundaryId: parent.guildId };
+					const created = taskChannel(
+						await parent.threads.create({
+							name: claim.title ?? task.name.slice(0, 100),
+							type: ChannelType.PublicThread,
+						}),
+					);
+					origin = {
+						platform: "discord",
+						kind: "thread",
+						conversationId: created.id,
+						parentId: parent.id,
+						boundaryId: parent.guildId,
+					};
 					await fetchMappedThread(discord, origin, task.taskId);
 				} else {
 					if (claim.surface.phase === "bound") {
@@ -994,11 +1055,17 @@ export async function reconcileDiscordWorkTasks(
 					await fetchMappedThread(discord, origin, task.taskId);
 				}
 				const params: WorkThreadBindParams = { taskId: task.taskId, claimId, outcome: { kind: "bound", origin } };
-				const bound = await gateway.request<WorkThreadBindResult>("work.thread.bind", validateWorkThreadBindParams(params));
+				const bound = await gateway.request<WorkThreadBindResult>(
+					"work.thread.bind",
+					validateWorkThreadBindParams(params),
+				);
 				if (bound.taskId !== task.taskId || bound.claimId !== claimId) throw new Error("Task bind identity mismatch");
 				if (bound.surface.phase === "bound") {
-					if (bound.surface.origin.conversationId !== origin.conversationId ||
-						bound.surface.origin.parentId !== origin.parentId || bound.surface.origin.boundaryId !== origin.boundaryId)
+					if (
+						bound.surface.origin.conversationId !== origin.conversationId ||
+						bound.surface.origin.parentId !== origin.parentId ||
+						bound.surface.origin.boundaryId !== origin.boundaryId
+					)
 						throw new Error("Task bind origin mismatch");
 					origins.set(origin.conversationId, origin);
 				}
@@ -1007,8 +1074,11 @@ export async function reconcileDiscordWorkTasks(
 				log.error(`Discord task ${task.taskId} surface reconciliation failed: ${errorMessage(error)}`);
 				if (mayHold) {
 					try {
-						const params: WorkThreadBindParams = { taskId: task.taskId, claimId,
-							outcome: { kind: "held", reason: "Discord surface creation/verification/binding failed or is uncertain" } };
+						const params: WorkThreadBindParams = {
+							taskId: task.taskId,
+							claimId,
+							outcome: { kind: "held", reason: "Discord surface creation/verification/binding failed or is uncertain" },
+						};
 						await gateway.request<WorkThreadBindResult>("work.thread.bind", params);
 					} catch (holdError) {
 						log.error(`Discord task ${task.taskId} hold not acknowledged: ${errorMessage(holdError)}`);
@@ -1016,12 +1086,13 @@ export async function reconcileDiscordWorkTasks(
 				}
 			}
 		}
-		if (result.nextTaskId === undefined) return {
-			// An incomplete scan cannot establish that previously known addressing
-			// disappeared. Retention is not proof the target is currently usable.
-			origins: incomplete ? new Map([...knownOrigins, ...origins]) : origins,
-			incomplete,
-		};
+		if (result.nextTaskId === undefined)
+			return {
+				// An incomplete scan cannot establish that previously known addressing
+				// disappeared. Retention is not proof the target is currently usable.
+				origins: incomplete ? new Map([...knownOrigins, ...origins]) : origins,
+				incomplete,
+			};
 		validateWorkJobsParams({ afterTaskId: result.nextTaskId });
 		if (cursors.has(result.nextTaskId)) throw new Error("work.jobs cursor loop");
 		cursors.add(result.nextTaskId);
@@ -1073,21 +1144,27 @@ export async function settleDiscordDelivery(
 			// deleted target from failing the whole delivery.
 			const chunk = chunks[index] as string;
 			// Recheck between chunks as well; Discord may have archived/locked the thread.
-			const target = mapped && index > 0
-				? await fetchMappedThread(discord, message.origin as WorkTaskThreadOrigin, message.workTask!.taskId)
-				: channel;
+			const target =
+				mapped && index > 0
+					? await fetchMappedThread(discord, message.origin as WorkTaskThreadOrigin, message.workTask!.taskId)
+					: channel;
 			sendAttempted = true;
 			// A reply reference points into the thread, so it is dropped on parent fallback.
-			const sent = index === 0 && message.replyToMessageId && !notice
-				? await target.send({
-					content: chunk,
-					reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
-				})
-				: await target.send(chunk);
+			const sent =
+				index === 0 && message.replyToMessageId && !notice
+					? await target.send({
+							content: chunk,
+							reply: { messageReference: message.replyToMessageId, failIfNotExists: false },
+						})
+					: await target.send(chunk);
 			posted++;
 			if (mapped) {
-				if (typeof sent === "object" && sent !== null && "channelId" in sent &&
-					sent.channelId !== message.origin.conversationId)
+				if (
+					typeof sent === "object" &&
+					sent !== null &&
+					"channelId" in sent &&
+					sent.channelId !== message.origin.conversationId
+				)
 					throw new Error("Mapped delivery receipt belongs to another Discord channel");
 				const id = typeof sent === "object" && sent !== null && "id" in sent ? sent.id : undefined;
 				// The validator rejects absent, noncanonical, duplicate and over-bound IDs.
@@ -1103,9 +1180,12 @@ export async function settleDiscordDelivery(
 		// the one that is guaranteed. A synthesis failure is logged and the
 		// delivery still confirms — the words arrived, which is the deliverable.
 		if (message.voiceText && speech) await sendVoiceMessage(channel, message.voiceText, speech);
-		await gateway.request("delivery.confirm", mapped
-			? validateDeliveryConfirmParams({ deliveryId, platformReceipt: { origin: message.origin, messageIds } })
-			: { deliveryId });
+		await gateway.request(
+			"delivery.confirm",
+			mapped
+				? validateDeliveryConfirmParams({ deliveryId, platformReceipt: { origin: message.origin, messageIds } })
+				: { deliveryId },
+		);
 	} catch (error) {
 		await gateway.request("delivery.fail", {
 			deliveryId,
@@ -1798,7 +1878,10 @@ export class ReconnectingGateway {
 	): Promise<{ readonly incomplete: boolean; readonly threadIds: readonly string[] }> {
 		let fetched: unknown;
 		try {
-			fetched = await this.discord.channels.fetch(channelId, this.#mappedOrigins.has(channelId) ? { force: true } : undefined);
+			fetched = await this.discord.channels.fetch(
+				channelId,
+				this.#mappedOrigins.has(channelId) ? { force: true } : undefined,
+			);
 		} catch (error) {
 			if (!isPermanentDiscordUnreadable(error)) {
 				console.error(
@@ -1841,7 +1924,13 @@ export class ReconnectingGateway {
 				let failure: RecoveryFailureClass = "write-path-unknown";
 				let summary = "unclassified chat.send failure";
 				for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt++) {
-					const result = await this.requestRecovered(message.id, origin, message.content, engagement, message.createdTimestamp);
+					const result = await this.requestRecovered(
+						message.id,
+						origin,
+						message.content,
+						engagement,
+						message.createdTimestamp,
+					);
 					if (result.verdict !== "unavailable") {
 						this.forgetAttempts(message.id);
 						return result.verdict;
@@ -2093,8 +2182,14 @@ export class ReconnectingGateway {
 		receivedAt?: string,
 		originSource?: WorkTaskOriginSource,
 	): void {
-		this.#editOutbox.set(messageId, { messageId, origin, text, engagement,
-			...(receivedAt ? { receivedAt } : {}), ...(originSource ? { originSource } : {}) });
+		this.#editOutbox.set(messageId, {
+			messageId,
+			origin,
+			text,
+			engagement,
+			...(receivedAt ? { receivedAt } : {}),
+			...(originSource ? { originSource } : {}),
+		});
 		if (this.#editOutbox.size > EDIT_OUTBOX_LIMIT) {
 			const oldest = this.#editOutbox.keys().next().value as string;
 			this.#editOutbox.delete(oldest);
@@ -2278,7 +2373,11 @@ export class ReconnectingGateway {
 				return "unavailable";
 			}
 			try {
-				await client.request("chat.send", { origin, text, engagement, messageId,
+				await client.request("chat.send", {
+					origin,
+					text,
+					engagement,
+					messageId,
 					...(platformCreatedAt === undefined ? {} : { originSource: { platformCreatedAt, recovered: true } }),
 				});
 				return "acked";

@@ -159,7 +159,9 @@ test("maxPerTurn 2, minGapMs 0: 5 interim texts + final → assert 2 interim + 1
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } }) + "\n");
+	socket.write(
+		JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } }) + "\n",
+	);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
@@ -259,7 +261,9 @@ test("maxPerTurn 0: 5 interim + final → assert 0 interim + 1 terminal delivery
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } }) + "\n");
+	socket.write(
+		JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } }) + "\n",
+	);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn
@@ -364,7 +368,9 @@ test("boot path: config.json with interimSpeech {maxPerTurn:0} starts via boot.t
 	});
 
 	// Send hello
-	socket.write(JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } }) + "\n");
+	socket.write(
+		JSON.stringify({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } }) + "\n",
+	);
 	await Bun.sleep(100);
 
 	// Send a channel message to trigger a turn

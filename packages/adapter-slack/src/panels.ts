@@ -20,7 +20,7 @@ export function askUserPanelBlocks(message: ChatMessagePayload): Block[] {
 			type: "section",
 			text: {
 				type: "mrkdwn",
-				text: panel.question,
+				text: message.duplicateWarning ? `[recovered - may be a duplicate] ${panel.question}` : panel.question,
 			},
 		},
 	];
@@ -87,7 +87,7 @@ export function approvalPanelBlocks(message: ChatMessagePayload): Block[] {
 			type: "section",
 			text: {
 				type: "mrkdwn",
-				text: panel.message,
+				text: message.duplicateWarning ? `[recovered - may be a duplicate] ${panel.message}` : panel.message,
 			},
 		},
 	];
@@ -181,7 +181,7 @@ export function askUserPanelFallback(message: ChatMessagePayload): string | null
 	const expiresAt = new Date(panel.expiresAt).getTime();
 	const isExpired = now >= expiresAt;
 
-	let text = `${panel.question}\n`;
+	let text = `${message.duplicateWarning ? "[recovered - may be a duplicate] " : ""}${panel.question}\n`;
 	text += panel.options.map((opt) => `• ${opt.label}`).join("\n");
 
 	if (isExpired) {
@@ -202,7 +202,7 @@ export function approvalPanelFallback(message: ChatMessagePayload): string | nul
 	const expiresAt = new Date(panel.expiresAt).getTime();
 	const isExpired = now >= expiresAt;
 
-	let text = `${panel.message}\n`;
+	let text = `${message.duplicateWarning ? "[recovered - may be a duplicate] " : ""}${panel.message}\n`;
 	if (isExpired) {
 		text += "_(This approval request has expired.)_";
 	} else if (panel.options && panel.options.length > 0) {

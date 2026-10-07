@@ -170,21 +170,43 @@ test("actual runningJobs requires successful complete singleton public query evi
 	const sessionId = "jobs-owned";
 	database.recordOwnedBinding({ authority, sessionId, originKey: "jobs/proof", epoch: 0, repo });
 	const snapshot = { running: [], recent: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } };
-	const clean = { type: "query_response", query: "runtime.jobs.list", ok: true, page: { items: [snapshot], complete: true } };
+	const clean = {
+		type: "query_response",
+		query: "runtime.jobs.list",
+		ok: true,
+		page: { items: [snapshot], complete: true },
+	};
 	let reply: CliResult = { exitCode: 0, stderr: "", stdout: JSON.stringify(clean) };
 	const calls: string[][] = [];
 	const port = new BrokerSessionPort({
-		database, authority, instanceId: "jobs-proof",
-		cli: async (args) => { calls.push([...args]); return reply; },
+		database,
+		authority,
+		instanceId: "jobs-proof",
+		cli: async (args) => {
+			calls.push([...args]);
+			return reply;
+		},
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
 	const query = () => port.runningJobs({ sessionId, repo });
 	try {
 		expect(await query()).toEqual([]);
 		for (const key of ["type", "kind"]) {
-			reply = { ...reply, stdout: JSON.stringify({ ...clean, page: { ...clean.page, items: [{
-				...snapshot, running: [{ id: "active", [key]: "task", label: "still running", status: "running" }],
-			}] } }) };
+			reply = {
+				...reply,
+				stdout: JSON.stringify({
+					...clean,
+					page: {
+						...clean.page,
+						items: [
+							{
+								...snapshot,
+								running: [{ id: "active", [key]: "task", label: "still running", status: "running" }],
+							},
+						],
+					},
+				}),
+			};
 			expect(await query()).toEqual([{ id: "active", type: "task", label: "still running" }]);
 		}
 		const invalid = [
@@ -201,11 +223,17 @@ test("actual runningJobs requires successful complete singleton public query evi
 			{ ...clean, page: { ...clean.page, preview: true } },
 			{ ...clean, page: { ...clean.page, truncated: true } },
 			{ ...clean, page: { ...clean.page, items: [] } },
-			{ ...clean, page: { ...clean.page, items: [snapshot, { running: [{ id: "live", type: "task", label: "live" }] }] } },
+			{
+				...clean,
+				page: { ...clean.page, items: [snapshot, { running: [{ id: "live", type: "task", label: "live" }] }] },
+			},
 			{ ...clean, page: { ...clean.page, items: [{ ...snapshot, complete: false }] } },
-			...[null, {}, { id: "live", type: "task", label: 1 }, { id: "live", type: "task", label: "live", truncated: true }].map(
-				(job) => ({ ...clean, page: { ...clean.page, items: [{ ...snapshot, running: [job] }] } }),
-			),
+			...[
+				null,
+				{},
+				{ id: "live", type: "task", label: 1 },
+				{ id: "live", type: "task", label: "live", truncated: true },
+			].map((job) => ({ ...clean, page: { ...clean.page, items: [{ ...snapshot, running: [job] }] } })),
 		];
 		for (const envelope of invalid) {
 			reply = { exitCode: 0, stderr: "", stdout: JSON.stringify(envelope) };
@@ -214,7 +242,11 @@ test("actual runningJobs requires successful complete singleton public query evi
 		reply = { exitCode: 1, stderr: "", stdout: JSON.stringify(clean) };
 		await expect(query()).rejects.toThrow();
 		expect(calls).toHaveLength(4 + invalid.length);
-		expect(calls.every((args) => args.join(" ") === `sdk session raw query ${sessionId} --query runtime.jobs.list --json-input {}`)).toBe(true);
+		expect(
+			calls.every(
+				(args) => args.join(" ") === `sdk session raw query ${sessionId} --query runtime.jobs.list --json-input {}`,
+			),
+		).toBe(true);
 		database.assertOwnedSession(sessionId, repo, authority);
 	} finally {
 		database.close();

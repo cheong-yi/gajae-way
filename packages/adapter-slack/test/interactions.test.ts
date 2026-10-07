@@ -235,6 +235,7 @@ describe("describePanelResponse", () => {
 				{
 					type: "button",
 					action_id: "ask_user_panelDM_optionA",
+					value: "optionA",
 				},
 			],
 			trigger_id: "trigger123",

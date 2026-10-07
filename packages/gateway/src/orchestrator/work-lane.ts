@@ -8,24 +8,24 @@ import {
 	ProtocolError,
 	parseOriginKey,
 	validateOriginRef,
-	validateWorkTaskSpec,
-	validateWorkThreadClaimParams,
-	validateWorkThreadBindParams,
-	type WorkTaskProjection,
-	type WorkThreadClaimResult,
-	type WorkThreadBindResult,
-	type WorkTaskRecoverResult,
-	type WorkTaskControlProjection,
-	validateWorkSteerParams,
 	validateWorkStatusParams,
-	validateWorkTaskDispositionParams,
+	validateWorkSteerParams,
 	validateWorkTaskDispositionBasis,
 	validateWorkTaskDispositionBasisParams,
-	type WorkTaskDispositionBasisResult,
-	type WorkTaskDispositionResult,
+	validateWorkTaskDispositionParams,
+	validateWorkTaskSpec,
+	validateWorkThreadBindParams,
+	validateWorkThreadClaimParams,
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
+	type WorkTaskControlProjection,
+	type WorkTaskDispositionBasisResult,
+	type WorkTaskDispositionResult,
+	type WorkTaskProjection,
+	type WorkTaskRecoverResult,
+	type WorkThreadBindResult,
+	type WorkThreadClaimResult,
 } from "@gajae-gateway/protocol";
 import {
 	acknowledgeHold,
@@ -47,25 +47,31 @@ import {
 	type GatewayDatabase,
 	type LaneReportRow,
 	type WorkAttemptAdmission,
-	WorkAttemptStateError,
 	type WorkAttemptRuntime,
 	type WorkAttemptSettleResult,
+	WorkAttemptStateError,
 	type WorkAttemptTerminalEvidence,
+	type WorkControl,
 	type WorkParent,
 	type WorkReportRoot,
 	type WorkTask,
-	type WorkTaskQualifiedAdmissionScope,
 	type WorkTaskEvidence,
-	type WorkControl,
+	type WorkTaskQualifiedAdmissionScope,
 	type WorkTaskSourceInput,
-	workTaskSourceDeliveryId,
 	workAttemptDeliveryId,
 	workAttemptReportId,
 	workTaskDispositionId,
 	workTaskDispositionText,
+	workTaskSourceDeliveryId,
 } from "../store/db";
 import { readFailedTransportCause } from "./failed-turn-evidence";
-import { type LaneForceRetireReason, type LaneGovernor, type TaskReleaseAssessment, laneJobIdentity, workSessionKey } from "./lane-governor";
+import {
+	type LaneForceRetireReason,
+	type LaneGovernor,
+	laneJobIdentity,
+	type TaskReleaseAssessment,
+	workSessionKey,
+} from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import { isSessionUnavailable, type SessionPort } from "./session-port";
 import type { TailHandle } from "./tail-runner";
@@ -376,8 +382,14 @@ export class WorkLaneManager {
 				};
 			}
 		}
-		const settled = this.#settleWithTaskResult(undefined, opRef, runtime.version, closed,
-			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) }, admission);
+		const settled = this.#settleWithTaskResult(
+			undefined,
+			opRef,
+			runtime.version,
+			closed,
+			{ decision, settledAt: endedAt, terminal, ...(output !== runtime.output ? { output } : {}) },
+			admission,
+		);
 		if (!settled) return false;
 		this.#finishWaiters(opRef);
 		for (const payload of [settled.fallbackPayload, settled.childFallback]) {
@@ -553,48 +565,93 @@ export class WorkLaneManager {
 	}
 	#taskProjection(task: WorkTask, dispositionBasis = false): WorkTaskProjection {
 		const taskId = task.taskId;
-		const request = "thread" in task.request.surface
-			? { threadOrigin: task.request.surface.thread as Extract<WorkTaskProjection["surface"], { phase: "bound" }>["origin"] }
-			: { parentOrigin: task.request.surface.parent as Extract<WorkThreadClaimResult, { create: true }>["parentOrigin"],
-				...(task.request.surface.title ? { title: task.request.surface.title } : {}) };
+		const request =
+			"thread" in task.request.surface
+				? {
+						threadOrigin: task.request.surface.thread as Extract<
+							WorkTaskProjection["surface"],
+							{ phase: "bound" }
+						>["origin"],
+					}
+				: {
+						parentOrigin: task.request.surface.parent as Extract<
+							WorkThreadClaimResult,
+							{ create: true }
+						>["parentOrigin"],
+						...(task.request.surface.title ? { title: task.request.surface.title } : {}),
+					};
 		const surface: WorkTaskProjection["surface"] = task.thread
-			? { phase: "bound", origin: task.thread as Extract<WorkTaskProjection["surface"], { phase: "bound" }>["origin"],
-				...(task.surfaceClaimId ? { claimId: task.surfaceClaimId } : {}) }
+			? {
+					phase: "bound",
+					origin: task.thread as Extract<WorkTaskProjection["surface"], { phase: "bound" }>["origin"],
+					...(task.surfaceClaimId ? { claimId: task.surfaceClaimId } : {}),
+				}
 			: task.surfacePhase === "held"
-				? { phase: "held", reason: task.surfaceHoldReason!, ...(task.surfaceClaimId ? { claimId: task.surfaceClaimId } : {}) }
+				? {
+						phase: "held",
+						reason: task.surfaceHoldReason!,
+						...(task.surfaceClaimId ? { claimId: task.surfaceClaimId } : {}),
+					}
 				: task.surfacePhase === "claimed"
 					? { phase: "claimed", request, claimId: task.surfaceClaimId! }
 					: { phase: "pending", request };
 		return {
-			taskId, name: task.laneName, kind: task.request.kind, jobId: task.jobId, opRef: task.opRef,
+			taskId,
+			name: task.laneName,
+			kind: task.request.kind,
+			jobId: task.jobId,
+			opRef: task.opRef,
 			...(dispositionBasis ? { dispositionBasis: this.#dispositionBasis(task) } : {}),
-			sessionId: task.sessionId, epoch: task.epoch, surface, obligation: task.obligationState,
+			sessionId: task.sessionId,
+			epoch: task.epoch,
+			surface,
+			obligation: task.obligationState,
 			...(task.holdReason ? { holdReason: task.holdReason } : {}),
-			finalReport: { reportId: task.terminalReportId,
+			finalReport: {
+				reportId: task.terminalReportId,
 				completeness: task.obligationState === "final_admitted" ? "complete" : "unavailable",
-				disposition: task.obligationState === "final_admitted" ? "admitted" : task.obligationState === "held" ? "held" : "pending",
-				...(task.holdReason ? { reason: task.holdReason } : {}) },
+				disposition:
+					task.obligationState === "final_admitted" ? "admitted" : task.obligationState === "held" ? "held" : "pending",
+				...(task.holdReason ? { reason: task.holdReason } : {}),
+			},
 		};
 	}
 	#dispositionBasis(task: WorkTask) {
 		const page = this.#db.workControlList(task.taskId, 0, 21);
 		const held = page.slice(0, 20).filter((control) => control.phase === "held");
-		if (held.some((control) => control.receipt !== null || control.request.expectedOpRef !== task.opRef ||
-			control.sessionId !== task.sessionId || control.epoch !== task.epoch))
+		if (
+			held.some(
+				(control) =>
+					control.receipt !== null ||
+					control.request.expectedOpRef !== task.opRef ||
+					control.sessionId !== task.sessionId ||
+					control.epoch !== task.epoch,
+			)
+		)
 			throw new ProtocolError("verb_failed", "original held control identity unavailable");
 		return validateWorkTaskDispositionBasis({
-			taskId: task.taskId, jobId: task.jobId, expectedOpRef: task.opRef,
-			sessionId: task.sessionId, epoch: task.epoch, cwd: task.request.cwd,
-			requestHash: task.requestHash, expectedTaskVersion: task.version,
+			taskId: task.taskId,
+			jobId: task.jobId,
+			expectedOpRef: task.opRef,
+			sessionId: task.sessionId,
+			epoch: task.epoch,
+			cwd: task.request.cwd,
+			requestHash: task.requestHash,
+			expectedTaskVersion: task.version,
 			controls: held.map((control) => ({
-					kind: "control", controlId: control.controlId,
-					eventId: control.request.evidence.eventId, clientRef: control.clientRef,
-				})),
+				kind: "control",
+				controlId: control.controlId,
+				eventId: control.request.evidence.eventId,
+				clientRef: control.clientRef,
+			})),
 			controlsCompleteness: page.length > 20 ? "partial" : "complete",
 			report: task.obligationState === "held" ? { kind: "report", reportId: task.terminalReportId } : null,
 		});
 	}
-	async #admitTask(params: object & Record<"task", unknown>, context?: WorkTaskAdmissionContext): Promise<WorkStartResult> {
+	async #admitTask(
+		params: object & Record<"task", unknown>,
+		context?: WorkTaskAdmissionContext,
+	): Promise<WorkStartResult> {
 		this.#live();
 		const { task: rawTask, ...ordinary } = params;
 		const spec = validateWorkTaskSpec(rawTask);
@@ -604,66 +661,129 @@ export class WorkLaneManager {
 		if (!origin || !context || !["discord", "slack", "telegram", "loopback"].includes(origin.platform))
 			throw new ProtocolError("unauthorized", "task admission requires an authenticated persona origin");
 		validateOriginRef(origin);
-		if (originKey(context.evidence.origin) !== originKey(origin) ||
+		if (
+			originKey(context.evidence.origin) !== originKey(origin) ||
 			(input.callerSessionId && this.#db.originForSessionId(input.callerSessionId) !== originKey(origin)) ||
-			this.#db.workTaskByThread(originKey(origin)))
+			this.#db.workTaskByThread(originKey(origin))
+		)
 			throw new ProtocolError("unauthorized", "task caller identity mismatch or nested task");
 		return this.#port.runExclusive(workSessionKey(input.name), async () => {
 			const existing = this.#db.workTaskGet(spec.taskId);
 			if (!existing && this.#job(input.name)) throw new ProtocolError("invalid_params", "task name has lane history");
 			const admitted = this.#db.withTransaction(() => {
 				const result = this.#db.workTaskCreateInTransaction({
-					taskId: spec.taskId, opRef: existing?.opRef ?? newOpRef("firstmate"),
-					request: { text: input.text, ...(spec.context ? { context: spec.context } : {}),
-						kind: spec.kind, cwd: input.cwd, ...(input.model ? { model: input.model } : {}),
-						coordinator: origin, evidence: context.evidence,
-						surface: spec.surface.threadOrigin ? { thread: spec.surface.threadOrigin }
-							: { parent: spec.surface.parentOrigin, ...(spec.surface.title ? { title: spec.surface.title } : {}) } },
+					taskId: spec.taskId,
+					opRef: existing?.opRef ?? newOpRef("firstmate"),
+					request: {
+						text: input.text,
+						...(spec.context ? { context: spec.context } : {}),
+						kind: spec.kind,
+						cwd: input.cwd,
+						...(input.model ? { model: input.model } : {}),
+						coordinator: origin,
+						evidence: context.evidence,
+						surface: spec.surface.threadOrigin
+							? { thread: spec.surface.threadOrigin }
+							: { parent: spec.surface.parentOrigin, ...(spec.surface.title ? { title: spec.surface.title } : {}) },
+					},
 				});
 				if (result.disposition === "conflict") throw new ProtocolError("invalid_params", "task assignment conflict");
 				if (result.disposition === "created") {
 					let proof: ReturnType<typeof admitDedicatedWorktree> | undefined;
-					try { proof = this.#worktreeProof(result.record); }
-					catch (error) { if (spec.kind === "code_mutating") throw error; }
-					if (proof) this.#db.workTaskSourceAppendInTransaction({
-						sourceId: `worktree-admission-${spec.taskId}`, taskId: spec.taskId, kind: "decision",
-						body: JSON.stringify(proof), evidence: context.evidence, supersedes: null,
-						completeness: "complete", controlId: null, reportId: null,
-					});
+					try {
+						proof = this.#worktreeProof(result.record);
+					} catch (error) {
+						if (spec.kind === "code_mutating") throw error;
+					}
+					if (proof)
+						this.#db.workTaskSourceAppendInTransaction({
+							sourceId: `worktree-admission-${spec.taskId}`,
+							taskId: spec.taskId,
+							kind: "decision",
+							body: JSON.stringify(proof),
+							evidence: context.evidence,
+							supersedes: null,
+							completeness: "complete",
+							controlId: null,
+							reportId: null,
+						});
 				}
 				return result.record;
 			});
 			if (admitted.surfacePhase === "held")
-				return { started: false, held: true, taskId: admitted.taskId, jobId: admitted.jobId,
-					opRef: admitted.opRef, state: "held", reason: admitted.surfaceHoldReason! };
+				return {
+					started: false,
+					held: true,
+					taskId: admitted.taskId,
+					jobId: admitted.jobId,
+					opRef: admitted.opRef,
+					state: "held",
+					reason: admitted.surfaceHoldReason!,
+				};
 			if (admitted.dispatchPhase === "prepared") {
 				const runtime = this.#db.workAttemptGet(admitted.opRef);
-				if (runtime?.sendPhase === "accepted") return { started: true, taskId: admitted.taskId,
-					jobId: admitted.jobId, opRef: admitted.opRef, sessionKey: workSessionKey(admitted.laneName), sessionId: admitted.sessionId! };
-				return { started: false, held: true, taskId: admitted.taskId, jobId: admitted.jobId,
-					opRef: admitted.opRef, state: "held", reason: "original_dispatch_uncertain" };
+				if (runtime?.sendPhase === "accepted")
+					return {
+						started: true,
+						taskId: admitted.taskId,
+						jobId: admitted.jobId,
+						opRef: admitted.opRef,
+						sessionKey: workSessionKey(admitted.laneName),
+						sessionId: admitted.sessionId!,
+					};
+				return {
+					started: false,
+					held: true,
+					taskId: admitted.taskId,
+					jobId: admitted.jobId,
+					opRef: admitted.opRef,
+					state: "held",
+					reason: "original_dispatch_uncertain",
+				};
 			}
 			if (admitted.request.kind === "code_mutating") this.#originalWorktreeProof(admitted);
-			return { started: false, accepted: "durable", execution: "pending_surface",
-				taskId: admitted.taskId, jobId: admitted.jobId, opRef: admitted.opRef };
+			return {
+				started: false,
+				accepted: "durable",
+				execution: "pending_surface",
+				taskId: admitted.taskId,
+				jobId: admitted.jobId,
+				opRef: admitted.opRef,
+			};
 		});
 	}
 	async threadClaim(params: unknown): Promise<WorkThreadClaimResult> {
 		const input = validateWorkThreadClaimParams(params);
 		this.#live();
 		const task = this.#task(input.taskId);
-		return this.#port.runExclusive(workSessionKey(task.laneName), async () => this.#db.withTransaction(() => {
-			const current = this.#task(input.taskId);
-			if (current.surfacePhase !== "pending" || "thread" in current.request.surface)
-				return { ...input, create: false, disposition: current.surfacePhase === "held" ? "held" : "duplicate",
-					surface: this.taskProjection(input.taskId).surface };
-			if (current.request.kind === "code_mutating") this.#originalWorktreeProof(current);
-			const claimed = this.#db.workTaskSurfaceInTransaction(input.taskId, current.version,
-				{ phase: "claimed", claimId: input.claimId, at: this.#at() });
-			if (!claimed) throw new Error("task_claim_raced");
-			return { ...input, create: true, parentOrigin: current.request.surface.parent as Extract<WorkThreadClaimResult, { create: true }>["parentOrigin"],
-				...(current.request.surface.title ? { title: current.request.surface.title } : {}) };
-		}));
+		return this.#port.runExclusive(workSessionKey(task.laneName), async () =>
+			this.#db.withTransaction(() => {
+				const current = this.#task(input.taskId);
+				if (current.surfacePhase !== "pending" || "thread" in current.request.surface)
+					return {
+						...input,
+						create: false,
+						disposition: current.surfacePhase === "held" ? "held" : "duplicate",
+						surface: this.taskProjection(input.taskId).surface,
+					};
+				if (current.request.kind === "code_mutating") this.#originalWorktreeProof(current);
+				const claimed = this.#db.workTaskSurfaceInTransaction(input.taskId, current.version, {
+					phase: "claimed",
+					claimId: input.claimId,
+					at: this.#at(),
+				});
+				if (!claimed) throw new Error("task_claim_raced");
+				return {
+					...input,
+					create: true,
+					parentOrigin: current.request.surface.parent as Extract<
+						WorkThreadClaimResult,
+						{ create: true }
+					>["parentOrigin"],
+					...(current.request.surface.title ? { title: current.request.surface.title } : {}),
+				};
+			}),
+		);
 	}
 	/** Binding publishes an assignment marker, but does not establish a platform ingress floor. */
 	async threadBind(params: unknown): Promise<WorkThreadBindResult> {
@@ -674,74 +794,159 @@ export class WorkLaneManager {
 		return this.#port.runExclusive(workSessionKey(task.laneName), async () => {
 			const current = this.#task(input.taskId);
 			if (current.surfacePhase === "bound" || current.surfacePhase === "held") {
-				if (input.outcome.kind === "bound" && (!current.thread || originKey(current.thread) !== originKey(input.outcome.origin)) ||
-					current.surfaceClaimId !== null && current.surfaceClaimId !== input.claimId)
+				if (
+					(input.outcome.kind === "bound" &&
+						(!current.thread || originKey(current.thread) !== originKey(input.outcome.origin))) ||
+					(current.surfaceClaimId !== null && current.surfaceClaimId !== input.claimId)
+				)
 					throw new ProtocolError("invalid_params", "task binding conflict");
-				return { taskId: task.taskId, claimId: input.claimId, disposition: "duplicate",
-					surface: this.taskProjection(task.taskId).surface as WorkThreadBindResult["surface"] };
+				return {
+					taskId: task.taskId,
+					claimId: input.claimId,
+					disposition: "duplicate",
+					surface: this.taskProjection(task.taskId).surface as WorkThreadBindResult["surface"],
+				};
 			}
 			if (input.outcome.kind === "bound" && this.#options.taskSurfaceAvailable?.(input.outcome.origin) !== true)
 				throw new ProtocolError("invalid_params", "verified inactive surface required");
 			this.#db.withTransaction(() => {
-				const bound = this.#db.workTaskSurfaceInTransaction(task.taskId, current.version,
+				const bound = this.#db.workTaskSurfaceInTransaction(
+					task.taskId,
+					current.version,
 					input.outcome.kind === "bound"
-						? { phase: "bound", thread: input.outcome.origin, claimId: current.surfaceClaimId === null ? null : input.claimId, at: this.#at() }
-						: { phase: "held", reason: input.outcome.reason, at: this.#at() });
+						? {
+								phase: "bound",
+								thread: input.outcome.origin,
+								claimId: current.surfaceClaimId === null ? null : input.claimId,
+								at: this.#at(),
+							}
+						: { phase: "held", reason: input.outcome.reason, at: this.#at() },
+				);
 				if (!bound) throw new Error("task_bind_raced");
-				if (bound.thread) this.#source(bound, {
-					sourceId: `activation-${task.taskId}`, taskId: task.taskId, kind: "observation",
-					body: `Assignment ${task.taskId}\n${task.request.text}\nScope: ${task.request.kind}; repository admission is not an OS sandbox.`,
-					evidence: { principalId: "gateway", origin: bound.thread,
-						eventId: input.claimId, editId: null, evidenceAt: this.#at(), observedAt: this.#at() },
-					supersedes: null, completeness: "complete", controlId: null, reportId: null,
-				});
+				if (bound.thread)
+					this.#source(bound, {
+						sourceId: `activation-${task.taskId}`,
+						taskId: task.taskId,
+						kind: "observation",
+						body: `Assignment ${task.taskId}\n${task.request.text}\nScope: ${task.request.kind}; repository admission is not an OS sandbox.`,
+						evidence: {
+							principalId: "gateway",
+							origin: bound.thread,
+							eventId: input.claimId,
+							editId: null,
+							evidenceAt: this.#at(),
+							observedAt: this.#at(),
+						},
+						supersedes: null,
+						completeness: "complete",
+						controlId: null,
+						reportId: null,
+					});
 			});
 			const bound = this.#task(task.taskId);
 			if (bound.surfacePhase === "bound") await this.#dispatchTask(bound);
-			return { taskId: task.taskId, claimId: input.claimId, disposition: bound.surfacePhase === "held" ? "held" : "recorded",
-				surface: this.taskProjection(task.taskId).surface as WorkThreadBindResult["surface"] };
+			return {
+				taskId: task.taskId,
+				claimId: input.claimId,
+				disposition: bound.surfacePhase === "held" ? "held" : "recorded",
+				surface: this.taskProjection(task.taskId).surface as WorkThreadBindResult["surface"],
+			};
 		});
 	}
 	async #dispatchTask(task: WorkTask): Promise<void> {
 		if (task.dispatchPhase !== "pending" || task.surfacePhase !== "bound") return;
 		// A pending row is never sent: preparation atomically consumes this sole dispatch permission.
-		await this.#startLocked({ name: task.laneName, text: [
-			`Declared scope: ${task.request.kind}. ${task.request.kind === "read_only" ? "Do not edit files or perform mutations." : "Use only the admitted workspace."}`,
-			task.request.text, task.request.context,
-		].filter(Boolean).join("\n\n"), cwd: task.request.cwd, resume: false, model: task.request.model }, "start",
-		{ opRef: task.opRef, parent: { kind: "persona", origin: task.request.coordinator, originKey: originKey(task.request.coordinator) } });
+		await this.#startLocked(
+			{
+				name: task.laneName,
+				text: [
+					`Declared scope: ${task.request.kind}. ${task.request.kind === "read_only" ? "Do not edit files or perform mutations." : "Use only the admitted workspace."}`,
+					task.request.text,
+					task.request.context,
+				]
+					.filter(Boolean)
+					.join("\n\n"),
+				cwd: task.request.cwd,
+				resume: false,
+				model: task.request.model,
+			},
+			"start",
+			{
+				opRef: task.opRef,
+				parent: { kind: "persona", origin: task.request.coordinator, originKey: originKey(task.request.coordinator) },
+			},
+		);
 	}
 	#source(task: WorkTask, input: WorkTaskSourceInput): void {
 		this.#assertTaskSurface(task);
 		const deliveryId = workTaskSourceDeliveryId(task.taskId, input.sourceId, task.thread!);
-		const payload = buildDeliveryPayload(task.opRef, task.thread!, input.body, deliveryId, undefined, input.reportId !== null);
+		const payload = buildDeliveryPayload(
+			task.opRef,
+			task.thread!,
+			input.body,
+			deliveryId,
+			undefined,
+			input.reportId !== null,
+		);
 		if (!payload) throw new Error("task_payload_unavailable");
-		this.#db.workTaskSourceAppendInTransaction(input, { ...payload,
-			workTask: { taskId: task.taskId, opRef: task.opRef, sourceId: input.sourceId, mappedOnly: true } });
+		this.#db.workTaskSourceAppendInTransaction(input, {
+			...payload,
+			workTask: { taskId: task.taskId, opRef: task.opRef, sourceId: input.sourceId, mappedOnly: true },
+		});
 	}
 	/** Existing observation boundaries only. A retained fact is never refreshed or redelivered. */
-	#taskObservation(task: WorkTask, fact: "checkpoint" | "reconciliation_unavailable" | "output_unavailable",
-		at: string, headSha?: string): void {
+	#taskObservation(
+		task: WorkTask,
+		fact: "checkpoint" | "reconciliation_unavailable" | "output_unavailable",
+		at: string,
+		headSha?: string,
+	): void {
 		this.#db.withTransaction(() => {
 			const current = this.#db.workTaskGet(task.taskId);
-			if (!current || current.version !== task.version || current.dispatchPhase !== "prepared" ||
-				current.sessionId === null || current.epoch === null) return;
+			if (
+				!current ||
+				current.version !== task.version ||
+				current.dispatchPhase !== "prepared" ||
+				current.sessionId === null ||
+				current.epoch === null
+			)
+				return;
 			const binding = this.#db.getSessionRecord(workSessionKey(current.laneName));
 			if (binding?.sessionId !== current.sessionId || binding.epoch !== current.epoch) return;
-			const identity = { taskId: current.taskId, jobId: current.jobId, opRef: current.opRef,
-				sessionId: current.sessionId, epoch: current.epoch };
+			const identity = {
+				taskId: current.taskId,
+				jobId: current.jobId,
+				opRef: current.opRef,
+				sessionId: current.sessionId,
+				epoch: current.epoch,
+			};
 			const sourceId = `execution-${createHash("sha256").update(JSON.stringify({ identity, fact, headSha })).digest("hex")}`;
 			if (this.#db.workTaskSourceGet(sourceId)) return;
-			const mapped = current.thread !== null && current.surfacePhase === "bound" &&
+			const mapped =
+				current.thread !== null &&
+				current.surfacePhase === "bound" &&
 				this.#options.taskSurfaceAvailable?.(current.thread) === true;
 			const input: WorkTaskSourceInput = {
-				sourceId, taskId: current.taskId, kind: "observation",
-				body: `${JSON.stringify(identity)}\n${fact === "checkpoint"
-					? `Repository checkpoint observed: ${headSha}. This commit observation is not semantic progress, task success, or proof of authorship.`
-					: "Original attempt reconciliation unavailable. Status/output evidence is incomplete; no failure of the task itself is inferred."}\nObservation category: ${fact}.\nSource ${sourceId}; first evidence observed ${at}.\nExecution coverage remains incomplete; no replay or control authority.${mapped ? "" : "\nMapped surface unavailable: audit only, no delivery intent or retroactive delivery promise."}`,
-				evidence: { principalId: "gateway", origin: current.thread ?? current.request.coordinator,
-					eventId: sourceId, editId: null, evidenceAt: at, observedAt: at },
-				supersedes: null, completeness: "incomplete", controlId: null, reportId: null,
+				sourceId,
+				taskId: current.taskId,
+				kind: "observation",
+				body: `${JSON.stringify(identity)}\n${
+					fact === "checkpoint"
+						? `Repository checkpoint observed: ${headSha}. This commit observation is not semantic progress, task success, or proof of authorship.`
+						: "Original attempt reconciliation unavailable. Status/output evidence is incomplete; no failure of the task itself is inferred."
+				}\nObservation category: ${fact}.\nSource ${sourceId}; first evidence observed ${at}.\nExecution coverage remains incomplete; no replay or control authority.${mapped ? "" : "\nMapped surface unavailable: audit only, no delivery intent or retroactive delivery promise."}`,
+				evidence: {
+					principalId: "gateway",
+					origin: current.thread ?? current.request.coordinator,
+					eventId: sourceId,
+					editId: null,
+					evidenceAt: at,
+					observedAt: at,
+				},
+				supersedes: null,
+				completeness: "incomplete",
+				controlId: null,
+				reportId: null,
 			};
 			// Never truncate an identity into apparent validity or retain unbounded diagnostics.
 			if (Buffer.byteLength(input.body, "utf8") > 8 * 1024) return;
@@ -749,42 +954,78 @@ export class WorkLaneManager {
 			else this.#db.workTaskSourceAppendInTransaction(input);
 		});
 	}
-	#observeAttempt(observer: Observer, fact: "checkpoint" | "reconciliation_unavailable" | "output_unavailable",
-		at: string, headSha?: string): void {
+	#observeAttempt(
+		observer: Observer,
+		fact: "checkpoint" | "reconciliation_unavailable" | "output_unavailable",
+		at: string,
+		headSha?: string,
+	): void {
 		if (!this.#writeCurrent(observer) || !this.#binding(observer.runtime)) return;
 		const original = observer.runtime;
 		const task = this.#db.workTaskByLane(original.sessionKey.slice("work/task/".length));
-		if (!task || task.opRef !== original.opRef || task.jobId !== original.jobId ||
-			task.sessionId !== original.sessionId || task.epoch !== original.epoch ||
-			task.request.cwd !== original.cwd) return;
+		if (
+			!task ||
+			task.opRef !== original.opRef ||
+			task.jobId !== original.jobId ||
+			task.sessionId !== original.sessionId ||
+			task.epoch !== original.epoch ||
+			task.request.cwd !== original.cwd
+		)
+			return;
 		const admission = this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`);
 		if (admission) {
 			try {
 				if (admission.body !== JSON.stringify(this.#worktreeProof(task))) return;
-			} catch { return; }
+			} catch {
+				return;
+			}
 		} else if (task.request.kind === "code_mutating") return;
 		const current = this.#db.workAttemptGet(original.opRef);
-		if (!current || current.settledAt || current.sessionId !== original.sessionId ||
-			current.epoch !== original.epoch || current.cwd !== original.cwd || current.jobId !== original.jobId) return;
+		if (
+			!current ||
+			current.settledAt ||
+			current.sessionId !== original.sessionId ||
+			current.epoch !== original.epoch ||
+			current.cwd !== original.cwd ||
+			current.jobId !== original.jobId
+		)
+			return;
 		const job = this.#job(task.laneName);
-		if (!job || job.jobId !== original.jobId || job.lane.worktreePath !== original.cwd ||
-			!job.attempts.some((attempt) => attempt.opRef === original.opRef &&
-				attempt.sessionId === original.sessionId && attempt.endedAt === undefined)) return;
+		if (
+			!job ||
+			job.jobId !== original.jobId ||
+			job.lane.worktreePath !== original.cwd ||
+			!job.attempts.some(
+				(attempt) =>
+					attempt.opRef === original.opRef && attempt.sessionId === original.sessionId && attempt.endedAt === undefined,
+			)
+		)
+			return;
 		if (fact === "checkpoint" && (!headSha || !/^[0-9a-f]{40}$/.test(headSha))) return;
 		this.#taskObservation(task, fact, at, headSha);
 	}
-	#observeFailure(observer: Observer, fact: "reconciliation_unavailable" | "output_unavailable" = "reconciliation_unavailable"): void {
-		try { this.#observeAttempt(observer, fact, this.#at()); }
-		catch { /* Unattributable/corrupt task or unavailable transaction: never fabricate a source. */ }
+	#observeFailure(
+		observer: Observer,
+		fact: "reconciliation_unavailable" | "output_unavailable" = "reconciliation_unavailable",
+	): void {
+		try {
+			this.#observeAttempt(observer, fact, this.#at());
+		} catch {
+			/* Unattributable/corrupt task or unavailable transaction: never fabricate a source. */
+		}
 		const prefix = "work/task/fm-";
 		if (observer.runtime.sessionKey.startsWith(prefix))
 			this.#observeLinkedUnavailable(observer.runtime.sessionKey.slice(prefix.length));
 	}
 	#observeLinkedUnavailable(taskId: string): void {
 		try {
-			this.#db.withTransaction(() => this.#db.workTaskRecordLinkedUnavailableInTransaction(
-				taskId, this.#at(), (origin) => this.#options.taskSurfaceAvailable?.(origin, taskId) === true,
-			));
+			this.#db.withTransaction(() =>
+				this.#db.workTaskRecordLinkedUnavailableInTransaction(
+					taskId,
+					this.#at(),
+					(origin) => this.#options.taskSurfaceAvailable?.(origin, taskId) === true,
+				),
+			);
 		} catch {
 			// No independently valid admission anchor: no invented identity/source.
 			// Existing recovery quarantine is retained; this path grants no authority.
@@ -797,33 +1038,60 @@ export class WorkLaneManager {
 	 * No SDK send and no inference from local times or thread-creation snowflakes.
 	 */
 	recordTaskActivationInTransaction(input: {
-		readonly taskId: string; readonly deliveryId: string; readonly origin: OriginRef;
-		readonly messageId: string; readonly evidenceAt: string; readonly observedAt: string; readonly principalId: string;
+		readonly taskId: string;
+		readonly deliveryId: string;
+		readonly origin: OriginRef;
+		readonly messageId: string;
+		readonly evidenceAt: string;
+		readonly observedAt: string;
+		readonly principalId: string;
 	}): void {
 		this.#db.requireTransaction();
 		const task = this.#task(input.taskId);
 		this.#assertTaskSurface(task);
 		const marker = this.#db.workTaskSourceGet(`activation-${task.taskId}`);
 		const delivery = this.#db.deliveryGet(input.deliveryId);
-		if (!marker || marker.deliveryId !== input.deliveryId || !delivery || delivery.state !== "confirmed" ||
-			delivery.turn_id !== task.opRef || delivery.origin_key !== originKey(task.thread!) ||
-			originKey(input.origin) !== originKey(task.thread!) || !input.messageId ||
-			!Number.isFinite(Date.parse(input.evidenceAt)))
+		if (
+			!marker ||
+			marker.deliveryId !== input.deliveryId ||
+			!delivery ||
+			delivery.state !== "confirmed" ||
+			delivery.turn_id !== task.opRef ||
+			delivery.origin_key !== originKey(task.thread!) ||
+			originKey(input.origin) !== originKey(task.thread!) ||
+			!input.messageId ||
+			!Number.isFinite(Date.parse(input.evidenceAt))
+		)
 			throw new ProtocolError("invalid_params", "original confirmed marker evidence required");
 		const sourceId = `activation-floor-${task.taskId}`;
 		const body = JSON.stringify({ deliveryId: input.deliveryId, messageId: input.messageId });
 		const existing = this.#db.workTaskSourceGet(sourceId);
 		if (existing) {
-			if (existing.body !== body || existing.evidence.evidenceAt !== input.evidenceAt ||
-				existing.evidence.principalId !== input.principalId)
+			if (
+				existing.body !== body ||
+				existing.evidence.evidenceAt !== input.evidenceAt ||
+				existing.evidence.principalId !== input.principalId
+			)
 				throw new ProtocolError("invalid_params", "activation floor evidence conflict");
 			return;
 		}
 		this.#db.workTaskSourceAppendInTransaction({
-			sourceId, taskId: task.taskId, kind: "observation", body,
-			evidence: { principalId: input.principalId, origin: task.thread!, eventId: input.messageId,
-				editId: null, evidenceAt: input.evidenceAt, observedAt: input.observedAt },
-			supersedes: null, completeness: "complete", controlId: null, reportId: null,
+			sourceId,
+			taskId: task.taskId,
+			kind: "observation",
+			body,
+			evidence: {
+				principalId: input.principalId,
+				origin: task.thread!,
+				eventId: input.messageId,
+				editId: null,
+				evidenceAt: input.evidenceAt,
+				observedAt: input.observedAt,
+			},
+			supersedes: null,
+			completeness: "complete",
+			controlId: null,
+			reportId: null,
 		});
 	}
 	/** Post-commit notification drains only existing controls, never creates execution. */
@@ -847,46 +1115,94 @@ export class WorkLaneManager {
 			const scope = event.scope ?? task.request.kind;
 			let mutationProof: ReturnType<typeof admitDedicatedWorktree> | undefined;
 			if (event.kind === "steer" && scope === "code_mutating") {
-				try { mutationProof = this.#originalWorktreeProof(current); }
-				catch { /* Refuse new mutation controls below, including already-granted scope. */ }
+				try {
+					mutationProof = this.#originalWorktreeProof(current);
+				} catch {
+					/* Refuse new mutation controls below, including already-granted scope. */
+				}
 			}
 			const admitted = this.#db.withTransaction(() => {
-				const evidence = { origin: event.origin, principalId: event.authorId, eventId: event.eventId,
-					editId: event.editId ?? null, evidenceAt: event.platformTimestamp!, observedAt: this.#at() };
-				const sourceId = `mapped-${createHash("sha256").update(JSON.stringify([
-					task.taskId, event.origin, event.eventId, event.editId ?? null,
-				])).digest("hex")}`;
+				const evidence = {
+					origin: event.origin,
+					principalId: event.authorId,
+					eventId: event.eventId,
+					editId: event.editId ?? null,
+					evidenceAt: event.platformTimestamp!,
+					observedAt: this.#at(),
+				};
+				const sourceId = `mapped-${createHash("sha256")
+					.update(JSON.stringify([task.taskId, event.origin, event.eventId, event.editId ?? null]))
+					.digest("hex")}`;
 				const priorSource = this.#db.workTaskSourceGet(sourceId);
 				if (priorSource) evidence.observedAt = priorSource.evidence.observedAt;
-				if (mutationProof) this.#db.workTaskSourceAppendInTransaction({
-					sourceId, taskId: task.taskId, kind: "instruction", body: event.body, evidence,
-					supersedes: null, completeness: "complete", controlId: null, reportId: null,
-				});
-				const result = this.#db.workControlAdmitInTransaction({
-					taskId: task.taskId, expectedOpRef: task.opRef, kind: event.kind,
-					scope, body: event.body, evidence,
-				}, mutationProof ? { taskId: task.taskId, opRef: task.opRef, cwd: task.request.cwd,
-					kind: "code_mutating", eventId: event.eventId, sourceId, validatedAt: this.#at() } : undefined);
-				if (result.disposition === "conflict") throw new ProtocolError("invalid_params", "mapped event payload conflict");
+				if (mutationProof)
+					this.#db.workTaskSourceAppendInTransaction({
+						sourceId,
+						taskId: task.taskId,
+						kind: "instruction",
+						body: event.body,
+						evidence,
+						supersedes: null,
+						completeness: "complete",
+						controlId: null,
+						reportId: null,
+					});
+				const result = this.#db.workControlAdmitInTransaction(
+					{
+						taskId: task.taskId,
+						expectedOpRef: task.opRef,
+						kind: event.kind,
+						scope,
+						body: event.body,
+						evidence,
+					},
+					mutationProof
+						? {
+								taskId: task.taskId,
+								opRef: task.opRef,
+								cwd: task.request.cwd,
+								kind: "code_mutating",
+								eventId: event.eventId,
+								sourceId,
+								validatedAt: this.#at(),
+							}
+						: undefined,
+				);
+				if (result.disposition === "conflict")
+					throw new ProtocolError("invalid_params", "mapped event payload conflict");
 				if (result.disposition === "created") {
 					let control = result.record;
-					if (mutationProof) this.#db.workTaskSourceAppendInTransaction({
-						sourceId: `worktree-${control.controlId}`, taskId: task.taskId, kind: "decision",
-						body: JSON.stringify(mutationProof), evidence, supersedes: null, completeness: "complete",
-						controlId: control.controlId, reportId: null,
-					});
+					if (mutationProof)
+						this.#db.workTaskSourceAppendInTransaction({
+							sourceId: `worktree-${control.controlId}`,
+							taskId: task.taskId,
+							kind: "decision",
+							body: JSON.stringify(mutationProof),
+							evidence,
+							supersedes: null,
+							completeness: "complete",
+							controlId: control.controlId,
+							reportId: null,
+						});
 					this.#db.workTaskSourceAppendInTransaction({
-						sourceId: `instruction-${control.controlId}`, taskId: task.taskId, kind: "instruction",
-						body: control.request.body, evidence: control.request.evidence, supersedes: null,
-						completeness: "complete", controlId: control.controlId, reportId: null,
+						sourceId: `instruction-${control.controlId}`,
+						taskId: task.taskId,
+						kind: "instruction",
+						body: control.request.body,
+						evidence: control.request.evidence,
+						supersedes: null,
+						completeness: "complete",
+						controlId: control.controlId,
+						reportId: null,
 					});
 					// Admission must not depend on draining past an earlier uncertain send.
 					// Existing controls retain their original outcome and uncertainty.
-					if (event.kind === "steer" && scope === "code_mutating" &&
-						!mutationProof && control.phase === "pending") {
+					if (event.kind === "steer" && scope === "code_mutating" && !mutationProof && control.phase === "pending") {
 						const refused = this.#db.workControlTransitionInTransaction(control.controlId, control.version, {
-							phase: "refused", identity: { opRef: current.opRef, sessionId: current.sessionId!, epoch: current.epoch! },
-							at: this.#at(), reason: "dedicated_worktree_required",
+							phase: "refused",
+							identity: { opRef: current.opRef, sessionId: current.sessionId!, epoch: current.epoch! },
+							at: this.#at(),
+							reason: "dedicated_worktree_required",
 						});
 						if (!refused) throw new Error("control_transition_raced");
 						control = refused;
@@ -897,48 +1213,63 @@ export class WorkLaneManager {
 			});
 			await this.#drainTaskControlsLocked(current);
 			const control = this.#db.workControlGet(admitted.controlId)!;
-			return { route: "work_task", taskId: task.taskId, controlId: control.controlId,
-				opRef: task.opRef, acceptance: "durable", delivery: control.phase === "sending" ? "held" : control.phase,
-				...(control.reason ? { reason: control.reason } : {}) };
+			return {
+				route: "work_task",
+				taskId: task.taskId,
+				controlId: control.controlId,
+				opRef: task.opRef,
+				acceptance: "durable",
+				delivery: control.phase === "sending" ? "held" : control.phase,
+				...(control.reason ? { reason: control.reason } : {}),
+			};
 		});
 	}
 	#controlObservation(task: WorkTask, control: WorkControl): void {
 		const body = `Task ${task.taskId}\nOperation ${task.opRef}\nBinding ${task.sessionId ?? "not_prepared"}/${task.epoch ?? "unknown"}\nControl ${control.controlId} #${control.sequence}: ${control.phase}${control.reason ? ` (${control.reason})` : ""}\nActor ${control.request.evidence.principalId}; source ${control.request.evidence.eventId}${control.request.evidence.editId ? ` edit ${control.request.evidence.editId}` : ""}\nSteering acceptance is not task completion.`;
 		this.#source(task, {
-			sourceId: `disposition-${control.controlId}-${control.phase}`, taskId: task.taskId,
-			kind: "observation", body, evidence: { ...control.request.evidence, principalId: "gateway", observedAt: control.updatedAt },
-			supersedes: null, completeness: control.phase === "held" ? "incomplete" : "complete",
-			controlId: control.controlId, reportId: null,
+			sourceId: `disposition-${control.controlId}-${control.phase}`,
+			taskId: task.taskId,
+			kind: "observation",
+			body,
+			evidence: { ...control.request.evidence, principalId: "gateway", observedAt: control.updatedAt },
+			supersedes: null,
+			completeness: control.phase === "held" ? "incomplete" : "complete",
+			controlId: control.controlId,
+			reportId: null,
 		});
-		if (control.phase === "pending" || control.phase === "sending" || control.notificationDisposition) return;
-		const key = originKey(task.request.coordinator);
-		const held = this.#options.personaHold?.(key);
-		let disposition: "inbound" | "delivery";
-		if (!held && this.#db.getSessionRecord(key) &&
-			this.#db.inboundEnqueueInTransaction({ messageId: control.notificationId, originKey: key,
-				originRefJson: JSON.stringify(task.request.coordinator), body: utf8Prefix(body),
-				source: "lane_report", receivedAt: control.updatedAt })) {
-			disposition = "inbound";
-		} else {
-			const payload = buildDeliveryPayload(task.opRef, task.request.coordinator, utf8Prefix(body), control.notificationId)!;
-			this.#db.deliveryCreateInTransaction({ id: control.notificationId, turnId: task.opRef, originKey: key, payloadJson: JSON.stringify(payload) });
-			disposition = "delivery";
-		}
-		if (!this.#db.workControlNotificationInTransaction(control.controlId, control.version,
-			{ kind: disposition, id: control.notificationId })) throw new Error("control_notification_raced");
+		// Policy D: a control disposition is not evidence that a previously
+		// requested owner action became unnecessary. Keep detail without a cockpit notice.
+		// Automatic clearance notices remain unsupported; do not infer them from steering.
 	}
-	#controlTransition(task: WorkTask, control: WorkControl, phase: "sending" | "accepted" | "refused" | "held",
-		reason?: string, source?: "turn.steer" | "turn.steer_status"): WorkControl {
+	#controlTransition(
+		task: WorkTask,
+		control: WorkControl,
+		phase: "sending" | "accepted" | "refused" | "held",
+		reason?: string,
+		source?: "turn.steer" | "turn.steer_status",
+	): WorkControl {
 		return this.#db.withTransaction(() => {
 			this.#assertTaskSurface(this.#task(task.taskId));
 			const at = this.#at();
 			const identity = { opRef: task.opRef, sessionId: task.sessionId!, epoch: task.epoch! };
 			const next = this.#db.workControlTransitionInTransaction(control.controlId, control.version, {
-				phase, identity, at, ...(reason ? { reason } : {}),
-				...(source && (phase === "accepted" || phase === "refused") ? {
-					receipt: { ...identity, source, clientRef: control.clientRef!, eventId: control.request.evidence.eventId,
-						outcome: phase, observedAt: at, evidence: reason ?? "original_steer_accepted" },
-				} : {}),
+				phase,
+				identity,
+				at,
+				...(reason ? { reason } : {}),
+				...(source && (phase === "accepted" || phase === "refused")
+					? {
+							receipt: {
+								...identity,
+								source,
+								clientRef: control.clientRef!,
+								eventId: control.request.evidence.eventId,
+								outcome: phase,
+								observedAt: at,
+								evidence: reason ?? "original_steer_accepted",
+							},
+						}
+					: {}),
 			});
 			if (!next) throw new Error("control_transition_raced");
 			this.#controlObservation(task, next);
@@ -947,15 +1278,21 @@ export class WorkLaneManager {
 	}
 	#controlRuntime(task: WorkTask): WorkAttemptRuntime | undefined {
 		const runtime = this.#originalTaskRuntime(task);
-		return runtime && this.#binding(runtime) &&
-			this.#job(task.laneName)?.attempts.at(-1)?.opRef === task.opRef ? runtime : undefined;
+		return runtime && this.#binding(runtime) && this.#job(task.laneName)?.attempts.at(-1)?.opRef === task.opRef
+			? runtime
+			: undefined;
 	}
 	#originalTaskRuntime(task: WorkTask): WorkAttemptRuntime | undefined {
 		if (this.#stopped || this.#db.isBrokerQuarantined("work", task.jobId)) return;
 		const runtime = this.#db.workAttemptGet(task.opRef);
-		return runtime && runtime.sessionId === task.sessionId && runtime.epoch === task.epoch &&
-			runtime.jobId === task.jobId && runtime.cwd === task.request.cwd &&
-			runtime.sessionKey === workSessionKey(task.laneName) ? runtime : undefined;
+		return runtime &&
+			runtime.sessionId === task.sessionId &&
+			runtime.epoch === task.epoch &&
+			runtime.jobId === task.jobId &&
+			runtime.cwd === task.request.cwd &&
+			runtime.sessionKey === workSessionKey(task.laneName)
+			? runtime
+			: undefined;
 	}
 	async #drainTaskControlsLocked(original: WorkTask): Promise<void> {
 		let after = 0;
@@ -974,23 +1311,40 @@ export class WorkLaneManager {
 				if (!runtime) return;
 				if (control.phase === "sending" || (control.phase === "held" && control.sendingAt !== null)) {
 					// Only the same steering reference can settle a torn send, never prompt status.
-					const receipt = await this.#port.lookupSteerStatus({
-						sessionId: runtime.sessionId, repo: runtime.cwd, clientRef: control.clientRef!,
-					}).catch(() => undefined);
+					const receipt = await this.#port
+						.lookupSteerStatus({
+							sessionId: runtime.sessionId,
+							repo: runtime.cwd,
+							clientRef: control.clientRef!,
+						})
+						.catch(() => undefined);
 					if (generation !== (this.#options.brokerGeneration?.() ?? 0)) return;
 					runtime = this.#controlRuntime(this.#task(task.taskId));
 					if (!runtime) return;
-					if (receipt?.clientRef === control.clientRef && (receipt.status === "accepted" || receipt.status === "rejected")) {
-						this.#controlTransition(task, control, receipt.status === "accepted" ? "accepted" : "refused",
-							receipt.status === "rejected" ? "original_steer_rejected" : undefined, "turn.steer_status");
+					if (
+						receipt?.clientRef === control.clientRef &&
+						(receipt.status === "accepted" || receipt.status === "rejected")
+					) {
+						this.#controlTransition(
+							task,
+							control,
+							receipt.status === "accepted" ? "accepted" : "refused",
+							receipt.status === "rejected" ? "original_steer_rejected" : undefined,
+							"turn.steer_status",
+						);
 						continue;
 					}
 					if (control.phase === "sending") this.#controlTransition(task, control, "held", "steer_receipt_unresolved");
 					return;
 				}
-				if (control.phase === "held" && control.request.kind === "cancel_request" &&
-					control.sendingAt === null && control.receipt === null &&
-					control.reason === "local_operator_action_required") continue;
+				if (
+					control.phase === "held" &&
+					control.request.kind === "cancel_request" &&
+					control.sendingAt === null &&
+					control.receipt === null &&
+					control.reason === "local_operator_action_required"
+				)
+					continue;
 				if (control.phase === "held") return;
 				const explicit = this.#db.workTaskSourceGet(`route-${control.controlId}`);
 				if (!activation && !explicit) return;
@@ -998,8 +1352,12 @@ export class WorkLaneManager {
 				const floor = activation ? Date.parse(activation.evidence.evidenceAt) : NaN;
 				const eventId = control.request.evidence.eventId;
 				const markerId = activation?.evidence.eventId ?? "";
-				if (!explicit && (time < floor || (time === floor &&
-					(!isDiscordSnowflake(eventId) || !isDiscordSnowflake(markerId) || BigInt(eventId) <= BigInt(markerId))))) {
+				if (
+					!explicit &&
+					(time < floor ||
+						(time === floor &&
+							(!isDiscordSnowflake(eventId) || !isDiscordSnowflake(markerId) || BigInt(eventId) <= BigInt(markerId))))
+				) {
 					this.#controlTransition(task, control, "refused", "message_precedes_activation_marker");
 					continue;
 				}
@@ -1025,8 +1383,12 @@ export class WorkLaneManager {
 					return;
 				}
 				try {
-					await this.#port.steer({ sessionId: runtime.sessionId, repo: runtime.cwd,
-						text: control.request.body, clientRef: control.clientRef! });
+					await this.#port.steer({
+						sessionId: runtime.sessionId,
+						repo: runtime.cwd,
+						text: control.request.body,
+						clientRef: control.clientRef!,
+					});
 				} catch (error) {
 					if (generation !== (this.#options.brokerGeneration?.() ?? 0)) return;
 					if (!this.#controlRuntime(this.#task(task.taskId))) return;
@@ -1043,18 +1405,31 @@ export class WorkLaneManager {
 			}
 		}
 	}
-	#revalidateControlWorktree(task: Pick<WorkTaskQualifiedAdmissionScope, "taskId" | "request">, control: WorkControl): void {
+	#revalidateControlWorktree(
+		task: Pick<WorkTaskQualifiedAdmissionScope, "taskId" | "request">,
+		control: WorkControl,
+	): void {
 		const source = this.#db.workTaskSourceGet(`worktree-${control.controlId}`);
-		if (!source || source.taskId !== task.taskId || source.controlId !== control.controlId ||
-			source.kind !== "decision" || source.completeness !== "complete")
+		if (
+			!source ||
+			source.taskId !== task.taskId ||
+			source.controlId !== control.controlId ||
+			source.kind !== "decision" ||
+			source.completeness !== "complete"
+		)
 			throw new Error("dedicated_worktree_proof_unavailable");
 		const proof = JSON.parse(source.body) as ReturnType<typeof admitDedicatedWorktree>;
-		if (proof.requestedCwd !== task.request.cwd ||
-			proof.requestedCoordinator !== this.#options.coordinatorCwd?.(task.request.coordinator))
+		if (
+			proof.requestedCwd !== task.request.cwd ||
+			proof.requestedCoordinator !== this.#options.coordinatorCwd?.(task.request.coordinator)
+		)
 			throw new Error("dedicated_worktree_changed");
 		revalidateDedicatedWorktree(proof);
 	}
-	#settleWithTaskResult(text: string | undefined, ...args: Parameters<GatewayDatabase["workAttemptSettle"]>): WorkAttemptSettleResult | undefined {
+	#settleWithTaskResult(
+		text: string | undefined,
+		...args: Parameters<GatewayDatabase["workAttemptSettle"]>
+	): WorkAttemptSettleResult | undefined {
 		const runtime = this.#db.workAttemptGet(args[0]);
 		if (!runtime || !this.#db.workTaskByLane(runtime.sessionKey.slice("work/task/".length)))
 			return this.#db.workAttemptSettle(...args);
@@ -1071,84 +1446,159 @@ export class WorkLaneManager {
 		if (task.opRef !== runtime.opRef || task.sessionId !== runtime.sessionId || task.epoch !== runtime.epoch)
 			throw new Error("task_terminal_identity_mismatch");
 		const mapped = !!task.thread && this.#options.taskSurfaceAvailable?.(task.thread) === true;
-		const complete = mapped && runtime.terminal?.kind === "broker" && runtime.output.proof !== null &&
-			runtime.output.disposition === "available" && runtime.decision === "reported" &&
-			text !== undefined && text.trim().length > 0 && !isSilentOutput(text) && Buffer.byteLength(text, "utf8") <= 16 * 1024;
-		const reason = !mapped ? "mapped_surface_unavailable"
-			: runtime.decision !== "reported" ? "coordinator_report_not_admitted" : "original_output_incomplete";
+		const complete =
+			mapped &&
+			runtime.terminal?.kind === "broker" &&
+			runtime.output.proof !== null &&
+			runtime.output.disposition === "available" &&
+			text !== undefined &&
+			text.trim().length > 0 &&
+			!isSilentOutput(text) &&
+			Buffer.byteLength(text, "utf8") <= 16 * 1024;
+		const reason = !mapped ? "mapped_surface_unavailable" : "original_output_incomplete";
 		const at = this.#at();
 		const next = this.#db.workTaskObligationInTransaction(task.taskId, task.version, {
 			identity: { opRef: runtime.opRef, sessionId: runtime.sessionId, epoch: runtime.epoch },
-			state: complete ? "final_admitted" : "held", reason: complete ? null : reason, at,
+			state: complete ? "final_admitted" : "held",
+			reason: complete ? null : reason,
+			at,
 		});
 		if (!next) throw new Error("task_obligation_raced");
 		const sourceId = `${complete ? "final" : "hold"}-${task.taskId}-${complete ? "original" : reason}`;
 		if (this.#db.workTaskSourceGet(sourceId)) return;
 		const input: WorkTaskSourceInput = {
-			sourceId, taskId: task.taskId, kind: "observation",
-			body: complete ? text! : `Task ${task.taskId}; original operation ${task.opRef}: ${reason}. Execution evidence: ${runtime.terminal?.kind ?? "unknown"}/${runtime.terminal?.reasonCode ?? "unknown"}. Final answer remains incomplete; no execution replay.`,
-			evidence: { principalId: "gateway", origin: task.thread ?? task.request.coordinator,
-				eventId: runtime.opRef, editId: null,
-				evidenceAt: runtime.terminal?.status?.terminalAt === undefined
-					? runtime.terminal?.observedAt ?? at : new Date(runtime.terminal.status.terminalAt).toISOString(), observedAt: at },
-			supersedes: null, completeness: complete ? "complete" : "incomplete", controlId: null, reportId: runtime.reportId,
+			sourceId,
+			taskId: task.taskId,
+			kind: "observation",
+			body: complete
+				? text!
+				: `Task ${task.taskId}; original operation ${task.opRef}: ${reason}. Execution evidence: ${runtime.terminal?.kind ?? "unknown"}/${runtime.terminal?.reasonCode ?? "unknown"}. Final answer remains incomplete; no execution replay.`,
+			evidence: {
+				principalId: "gateway",
+				origin: task.thread ?? task.request.coordinator,
+				eventId: runtime.opRef,
+				editId: null,
+				evidenceAt:
+					runtime.terminal?.status?.terminalAt === undefined
+						? (runtime.terminal?.observedAt ?? at)
+						: new Date(runtime.terminal.status.terminalAt).toISOString(),
+				observedAt: at,
+			},
+			supersedes: null,
+			completeness: complete ? "complete" : "incomplete",
+			controlId: null,
+			reportId: runtime.reportId,
 		};
 		if (mapped) this.#source(next, input);
 		else this.#db.workTaskSourceAppendInTransaction(input);
 		return mapped ? workTaskSourceDeliveryId(task.taskId, sourceId, task.thread!) : undefined;
 	}
+	#recoverCoordinatorReport(taskId: string): void {
+		const task = this.#db.workTaskGet(taskId);
+		if (!task) return;
+		const key = originKey(task.request.coordinator);
+		const admitted = this.#db.workTaskRecoverCoordinatorReport(taskId, this.#options.personaHold?.(key));
+		if (admitted) this.#options.notifyPersona?.(admitted.originKey);
+	}
 	/** Observes only the original result. No bind, resume, send, or observer creation. */
 	async recoverTaskReport(taskId: string): Promise<WorkTaskRecoverResult> {
 		this.#live();
 		const task = this.#task(taskId);
+		this.#recoverCoordinatorReport(taskId);
 		return this.#port.runExclusive(workSessionKey(task.laneName), async () => {
 			const current = this.#task(taskId);
-			const base = { taskId, jobId: current.jobId, opRef: current.opRef, sessionId: current.sessionId,
-				epoch: current.epoch, reportId: current.terminalReportId, execution: "none" as const };
+			const base = {
+				taskId,
+				jobId: current.jobId,
+				opRef: current.opRef,
+				sessionId: current.sessionId,
+				epoch: current.epoch,
+				reportId: current.terminalReportId,
+				execution: "none" as const,
+			};
 			if (current.obligationState === "final_admitted")
 				return { ...base, disposition: "unchanged", completeness: "complete" };
 			const runtime = this.#originalTaskRuntime(current);
 			if (!runtime || runtime.terminal?.kind !== "broker" || runtime.settledAt === null)
-				return { ...base, disposition: "held", completeness: "unavailable", reason: "original_terminal_evidence_unavailable" };
-			const output = await this.#port.fetchWorkerOutput({
-				sessionId: runtime.sessionId, repo: runtime.cwd, opRef: runtime.opRef,
-				notBeforeMs: Math.max(Date.parse(runtime.startedAt), runtime.terminal.status?.startedAt ?? 0),
-				terminalIdentity: runtime.terminal.status,
-				isCurrent: () => this.#db.workTaskGet(taskId)?.version === current.version &&
-					this.#originalTaskRuntime(current)?.version === runtime.version,
-			}).catch(() => undefined);
-			if (this.#db.workTaskGet(taskId)?.version !== current.version || this.#originalTaskRuntime(current)?.version !== runtime.version)
+				return {
+					...base,
+					disposition: "held",
+					completeness: "unavailable",
+					reason: "original_terminal_evidence_unavailable",
+				};
+			const output = await this.#port
+				.fetchWorkerOutput({
+					sessionId: runtime.sessionId,
+					repo: runtime.cwd,
+					opRef: runtime.opRef,
+					notBeforeMs: Math.max(Date.parse(runtime.startedAt), runtime.terminal.status?.startedAt ?? 0),
+					terminalIdentity: runtime.terminal.status,
+					isCurrent: () =>
+						this.#db.workTaskGet(taskId)?.version === current.version &&
+						this.#originalTaskRuntime(current)?.version === runtime.version,
+				})
+				.catch(() => undefined);
+			if (
+				this.#db.workTaskGet(taskId)?.version !== current.version ||
+				this.#originalTaskRuntime(current)?.version !== runtime.version
+			)
 				return { ...base, disposition: "held", completeness: "unavailable", reason: "original_identity_changed" };
-			if (output?.status !== "proven" ||
-				output.provenance.source !== "turn.result" || output.provenance.fullness !== "original" ||
+			if (
+				output?.status !== "proven" ||
+				output.provenance.source !== "turn.result" ||
+				output.provenance.fullness !== "original" ||
 				output.provenance.contentVersion !== 1 ||
-				output.provenance.sessionId !== current.sessionId || output.provenance.opRef !== current.opRef ||
-				output.provenance.clientRef !== current.opRef || output.provenance.repo !== current.request.cwd ||
+				output.provenance.sessionId !== current.sessionId ||
+				output.provenance.opRef !== current.opRef ||
+				output.provenance.clientRef !== current.opRef ||
+				output.provenance.repo !== current.request.cwd ||
 				!Number.isFinite(output.provenance.terminalAt) ||
 				output.provenance.terminalAt !== runtime.terminal.status?.terminalAt ||
 				output.provenance.commandId !== runtime.terminal.status?.commandId ||
 				output.provenance.turnId !== runtime.terminal.status?.turnId ||
 				output.provenance.byteLength !== Buffer.byteLength(output.text, "utf8") ||
-				output.provenance.byteLength > 16 * 1024 || !output.text.trim() || isSilentOutput(output.text))
-				return { ...base, disposition: "held", completeness: "unavailable",
-					reason: output?.status === "proven" ? "late_report_reconciliation_required" : "original_output_incomplete" };
+				output.provenance.byteLength > 16 * 1024 ||
+				!output.text.trim() ||
+				isSilentOutput(output.text)
+			)
+				return {
+					...base,
+					disposition: "held",
+					completeness: "unavailable",
+					reason: output?.status === "proven" ? "late_report_reconciliation_required" : "original_output_incomplete",
+				};
 			this.#assertTaskSurface(current);
 			const deliveryId = workTaskSourceDeliveryId(taskId, `supplement-${taskId}-original`, current.thread!);
 			const payload = buildDeliveryPayload(current.opRef, current.thread!, output.text, deliveryId, undefined, true);
 			if (!payload) throw new Error("task_payload_unavailable");
 			this.#db.withTransaction(() => {
-				if (!this.#db.workTaskSupplementInTransaction(taskId, current.version, {
-					identity: { opRef: runtime.opRef, sessionId: runtime.sessionId, epoch: runtime.epoch },
-					text: output.text, proof: output.provenance, at: this.#at(),
-				}, { ...payload, workTask: { taskId, opRef: current.opRef,
-					sourceId: `supplement-${taskId}-original`, mappedOnly: true } })) throw new Error("task_supplement_raced");
+				if (
+					!this.#db.workTaskSupplementInTransaction(
+						taskId,
+						current.version,
+						{
+							identity: { opRef: runtime.opRef, sessionId: runtime.sessionId, epoch: runtime.epoch },
+							text: output.text,
+							proof: output.provenance,
+							at: this.#at(),
+						},
+						{
+							...payload,
+							workTask: { taskId, opRef: current.opRef, sourceId: `supplement-${taskId}-original`, mappedOnly: true },
+						},
+					)
+				)
+					throw new Error("task_supplement_raced");
 			});
 			const after = this.#task(taskId);
-			return { ...base, reportId: after.terminalReportId,
+			return {
+				...base,
+				reportId: after.terminalReportId,
 				disposition: after.obligationState === "final_admitted" ? "reconciled" : "held",
 				completeness: after.obligationState === "final_admitted" ? "complete" : "unavailable",
 				...(deliveryId ? { supplementalDeliveryId: deliveryId } : {}),
-				...(after.holdReason ? { reason: after.holdReason } : {}) };
+				...(after.holdReason ? { reason: after.holdReason } : {}),
+			};
 		});
 	}
 	/** Synchronous original-proof eligibility. The governor alone verifies closure and releases capacity. */
@@ -1160,11 +1610,21 @@ export class WorkLaneManager {
 			const runtime = this.#controlRuntime(task);
 			const job = this.#job(name);
 			const last = job?.attempts.at(-1);
-			if (task.dispatchPhase !== "prepared" || !runtime || runtime.settledAt === null ||
-				runtime.terminal?.kind !== "broker" || runtime.terminal.status?.receiptState !== "present" ||
+			if (
+				task.dispatchPhase !== "prepared" ||
+				!runtime ||
+				runtime.settledAt === null ||
+				runtime.terminal?.kind !== "broker" ||
+				runtime.terminal.status?.receiptState !== "present" ||
 				!["terminal_ok", "failed"].includes(runtime.terminal.status.status) ||
-				!job || !last || last.opRef !== task.opRef || last.sessionId !== task.sessionId || last.endedAt === undefined ||
-				job.lane.worktreePath !== task.request.cwd || job.attempts.some((attempt) => attempt.endedAt === undefined))
+				!job ||
+				!last ||
+				last.opRef !== task.opRef ||
+				last.sessionId !== task.sessionId ||
+				last.endedAt === undefined ||
+				job.lane.worktreePath !== task.request.cwd ||
+				job.attempts.some((attempt) => attempt.endedAt === undefined)
+			)
 				return hold("task_original_terminal_proof_unavailable");
 			const authority = this.#db.inspectBrokerAuthority().authority;
 			if (!authority) return hold("task_owned_binding_unavailable");
@@ -1174,29 +1634,49 @@ export class WorkLaneManager {
 			// The immutable admission request, not the latest steering scope, decides
 			// whether dedicated isolation must still be proven. Read-only admission
 			// without that proof owns host capacity only, never filesystem cleanup.
-			if (task.request.kind === "code_mutating" ||
-				this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`)) {
-				try { this.#originalWorktreeProof(task); }
-				catch { return hold("task_original_worktree_proof_unavailable"); }
+			if (task.request.kind === "code_mutating" || this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`)) {
+				try {
+					this.#originalWorktreeProof(task);
+				} catch {
+					return hold("task_original_worktree_proof_unavailable");
+				}
 			}
 			let after = 0;
 			for (;;) {
 				const controls = this.#db.workControlList(task.taskId, after);
 				for (const control of controls) {
-					if (control.request.expectedOpRef !== task.opRef || control.sessionId !== task.sessionId || control.epoch !== task.epoch)
+					if (
+						control.request.expectedOpRef !== task.opRef ||
+						control.sessionId !== task.sessionId ||
+						control.epoch !== task.epoch
+					)
 						return hold("task_control_identity_unavailable");
 					if (control.request.kind === "steer" && !["accepted", "refused"].includes(control.phase))
 						return hold("task_remote_control_unresolved");
-					if (control.request.kind !== "steer" && !["accepted", "refused"].includes(control.phase) &&
-						(control.request.kind !== "cancel_request" || control.phase !== "held" ||
-							control.reason !== "local_operator_action_required" || control.sendingAt !== null || control.receipt !== null))
+					if (
+						control.request.kind !== "steer" &&
+						!["accepted", "refused"].includes(control.phase) &&
+						(control.request.kind !== "cancel_request" ||
+							control.phase !== "held" ||
+							control.reason !== "local_operator_action_required" ||
+							control.sendingAt !== null ||
+							control.receipt !== null)
+					)
 						return hold("task_control_execution_uncertain");
 				}
 				if (controls.length < 50) break;
 				after = controls.at(-1)!.sequence;
 			}
-			return { kind: "eligible", taskId: task.taskId, taskVersion: task.version, jobId: task.jobId,
-				opRef: task.opRef, sessionId: runtime.sessionId, epoch: runtime.epoch, cwd: runtime.cwd };
+			return {
+				kind: "eligible",
+				taskId: task.taskId,
+				taskVersion: task.version,
+				jobId: task.jobId,
+				opRef: task.opRef,
+				sessionId: runtime.sessionId,
+				epoch: runtime.epoch,
+				cwd: runtime.cwd,
+			};
 		} catch {
 			return { kind: "hold", reason: "task_release_evidence_unavailable" };
 		}
@@ -1222,14 +1702,21 @@ export class WorkLaneManager {
 		}
 		const exactTerminal = runtime?.terminal?.kind === "broker" && this.#controlRuntime(task) !== undefined;
 		const safeToReleaseExecution = this.assessTaskRelease(name).kind === "eligible";
-		return { taskId: task.taskId, opRef: task.opRef, sessionId: task.sessionId, epoch: task.epoch,
-			obligation: task.obligationState, unresolvedControls: controls,
-			unresolvedSteers: remoteControls, exactTerminal,
-			safeToReleaseExecution, safeToCleanupWorktree: false };
+		return {
+			taskId: task.taskId,
+			opRef: task.opRef,
+			sessionId: task.sessionId,
+			epoch: task.epoch,
+			obligation: task.obligationState,
+			unresolvedControls: controls,
+			unresolvedSteers: remoteControls,
+			exactTerminal,
+			safeToReleaseExecution,
+			safeToCleanupWorktree: false,
+		};
 	}
 	async start(params: unknown, context?: WorkTaskAdmissionContext): Promise<WorkStartResult> {
-		if (params && typeof params === "object" && "task" in params)
-			return this.#admitTask(params, context);
+		if (params && typeof params === "object" && "task" in params) return this.#admitTask(params, context);
 		return this.#start(parseInput(params), "start");
 	}
 	async run(params: unknown, owner: object, signal?: AbortSignal) {
@@ -1343,7 +1830,10 @@ export class WorkLaneManager {
 		if (proof) revalidateDedicatedWorktree(proof);
 		if (task) {
 			this.#assertTaskSurface(this.#task(task.taskId));
-			if (!this.#writeCurrent(observer) || (proof && JSON.stringify(this.#worktreeProof(task)) !== JSON.stringify(proof)))
+			if (
+				!this.#writeCurrent(observer) ||
+				(proof && JSON.stringify(this.#worktreeProof(task)) !== JSON.stringify(proof))
+			)
 				throw workError("task dispatch identity changed before transport", "task_dispatch_fenced", runtime);
 		}
 		let accepted = false;
@@ -1433,32 +1923,40 @@ export class WorkLaneManager {
 				} catch {
 					// Missing original evidence is uncertainty, not a replacement-session lookup.
 				}
-				if (!this.#controlRuntime(task) || generation !== (this.#options.brokerGeneration?.() ?? 0))
-					op = null;
+				if (!this.#controlRuntime(task) || generation !== (this.#options.brokerGeneration?.() ?? 0)) op = null;
 			}
 			return this.#db.withTransaction(() => {
 				const current = this.#task(task.taskId);
 				if (current.version !== task.version) op = null;
 				const job = this.#job(name);
-				const attempt = job?.attempts.find((value) =>
-					value.opRef === current.opRef && value.sessionId === current.sessionId);
+				const attempt = job?.attempts.find(
+					(value) => value.opRef === current.opRef && value.sessionId === current.sessionId,
+				);
 				return {
-				jobId: current.jobId,
-				state: attempt && job ? job.state
-					: current.surfacePhase === "held" || current.obligationState === "held" ? "held" : current.dispatchPhase,
-				sessionId: current.sessionId ?? "",
-				lastActivityAt: runtime && this.#binding(runtime)
-					? this.#db.workLaneRows().find((row) =>
-						row.origin_key === workSessionKey(name))?.last_activity_at ?? null
-					: null,
-				attempt: attempt ? {
-					opRef: attempt.opRef, startedAt: attempt.startedAt,
-					...(attempt.endedAt ? { endedAt: attempt.endedAt } : {}),
-					...(attempt.endState ? { endState: attempt.endState } : {}),
-				} : null,
-				op,
-				task: this.#taskProjection(current, true),
-			};
+					jobId: current.jobId,
+					state:
+						attempt && job
+							? job.state
+							: current.surfacePhase === "held" || current.obligationState === "held"
+								? "held"
+								: current.dispatchPhase,
+					sessionId: current.sessionId ?? "",
+					lastActivityAt:
+						runtime && this.#binding(runtime)
+							? (this.#db.workLaneRows().find((row) => row.origin_key === workSessionKey(name))?.last_activity_at ??
+								null)
+							: null,
+					attempt: attempt
+						? {
+								opRef: attempt.opRef,
+								startedAt: attempt.startedAt,
+								...(attempt.endedAt ? { endedAt: attempt.endedAt } : {}),
+								...(attempt.endState ? { endState: attempt.endState } : {}),
+							}
+						: null,
+					op,
+					task: this.#taskProjection(current, true),
+				};
 			});
 		}
 		const job = this.#job(name, true)!;
@@ -1499,29 +1997,39 @@ export class WorkLaneManager {
 		};
 	}
 	#dispositionOwner(callerSessionId: string | undefined, context?: WorkTaskAdmissionContext): OriginRef {
-		if (!context?.stableOrigin || originKey(context.stableOrigin) !== originKey(context.evidence.origin) ||
+		if (
+			!context?.stableOrigin ||
+			originKey(context.stableOrigin) !== originKey(context.evidence.origin) ||
 			context.evidence.editId !== null ||
-			!["discord", "slack", "telegram", "loopback"].includes(context.stableOrigin.platform))
+			!["discord", "slack", "telegram", "loopback"].includes(context.stableOrigin.platform)
+		)
 			throw new ProtocolError("unauthorized", "disposition requires authenticated owner evidence");
 		const origin = context.stableOrigin;
 		if (callerSessionId) {
 			const key = this.#db.originForSessionId(callerSessionId);
-			const row = this.#db.sessionIdentityRows().find((entry) =>
-				entry.origin_key === key && entry.gjc_session_id === callerSessionId);
-			if (!key || key.startsWith("work/") || key !== originKey(origin) || !row?.origin_ref_json ||
+			const row = this.#db
+				.sessionIdentityRows()
+				.find((entry) => entry.origin_key === key && entry.gjc_session_id === callerSessionId);
+			if (
+				!key ||
+				key.startsWith("work/") ||
+				key !== originKey(origin) ||
+				!row?.origin_ref_json ||
 				originKey(validateOriginRef(JSON.parse(row.origin_ref_json))) !== key ||
-				this.#db.inboundHasQuarantinedNonterminalTurn(key))
+				this.#db.inboundHasQuarantinedNonterminalTurn(key)
+			)
 				throw new ProtocolError("unauthorized", "disposition caller identity changed");
 		}
-		if ((origin.platform === "discord" && this.#db.workTaskDiscordLocator(origin.conversationId)) ||
-			this.#db.workTaskByThread(originKey(origin)))
+		if (
+			(origin.platform === "discord" && this.#db.workTaskDiscordLocator(origin.conversationId)) ||
+			this.#db.workTaskByThread(originKey(origin))
+		)
 			throw new ProtocolError("unauthorized", "mapped caller cannot dispose tasks");
 		return origin;
 	}
 	#negativeDispositionScope(taskId: string) {
 		const scope = this.#db.workTaskQualifiedAdmissionScopeInTransaction(taskId);
-		if (scope.request.kind === "code_mutating" ||
-			this.#db.workTaskSourceGet(`worktree-admission-${taskId}`))
+		if (scope.request.kind === "code_mutating" || this.#db.workTaskSourceGet(`worktree-admission-${taskId}`))
 			this.#originalWorktreeProof(scope);
 		return scope;
 	}
@@ -1529,100 +2037,141 @@ export class WorkLaneManager {
 		const input = validateWorkTaskDispositionBasisParams(params);
 		this.#live();
 		this.#dispositionOwner(input.callerSessionId, context);
-		return this.#port.runExclusive(workSessionKey(`fm-${input.taskId}`), async () => this.#db.withTransaction(() => {
-			this.#live();
-			this.#dispositionOwner(input.callerSessionId, context);
-			const selected = this.#db.workTaskDispositionBasis(input.taskId);
-			if (selected.kind === "unavailable") return selected;
-			if (selected.kind === "validation_unavailable") {
-				this.#negativeDispositionScope(input.taskId);
-			} else {
-				const task = this.#task(input.taskId);
-				if (task.request.kind === "code_mutating" ||
-					this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`))
-					this.#originalWorktreeProof(task);
-			}
-			// Qualification time belongs to the retained fact, never this read's ingress context.
-			return selected;
-		}));
+		return this.#port.runExclusive(workSessionKey(`fm-${input.taskId}`), async () =>
+			this.#db.withTransaction(() => {
+				this.#live();
+				this.#dispositionOwner(input.callerSessionId, context);
+				const selected = this.#db.workTaskDispositionBasis(input.taskId);
+				if (selected.kind === "unavailable") return selected;
+				if (selected.kind === "validation_unavailable") {
+					this.#negativeDispositionScope(input.taskId);
+				} else {
+					const task = this.#task(input.taskId);
+					if (task.request.kind === "code_mutating" || this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`))
+						this.#originalWorktreeProof(task);
+				}
+				// Qualification time belongs to the retained fact, never this read's ingress context.
+				return selected;
+			}),
+		);
 	}
 	async disposition(params: unknown, context?: WorkTaskAdmissionContext): Promise<WorkTaskDispositionResult> {
 		const input = validateWorkTaskDispositionParams(params);
 		this.#live();
-		if (!context?.stableOrigin || originKey(context.stableOrigin) !== originKey(context.evidence.origin) ||
-			context.evidence.eventId !== input.eventId || context.evidence.editId !== null ||
-			!["discord", "slack", "telegram", "loopback"].includes(context.stableOrigin.platform))
+		if (
+			!context?.stableOrigin ||
+			originKey(context.stableOrigin) !== originKey(context.evidence.origin) ||
+			context.evidence.eventId !== input.eventId ||
+			context.evidence.editId !== null ||
+			!["discord", "slack", "telegram", "loopback"].includes(context.stableOrigin.platform)
+		)
 			throw new ProtocolError("unauthorized", "disposition requires authenticated owner evidence");
 		const origin = context.stableOrigin;
 		const qualification = input.validationUnavailable;
 		if (qualification) {
 			this.#dispositionOwner(input.callerSessionId, context);
-			return this.#port.runExclusive(workSessionKey(`fm-${input.taskId}`), async () => this.#db.withTransaction(() => {
-				this.#live();
-				this.#dispositionOwner(input.callerSessionId, context);
-				const scope = this.#negativeDispositionScope(input.taskId);
-				if (qualification.scope !== scope.request.kind)
-					throw new ProtocolError("invalid_params", "original disposition scope mismatch");
-				if (input.target.kind === "control") {
-					const control = this.#db.workControlGet(input.target.controlId);
-					if (control?.request.taskId === scope.taskId && control.request.scope === "code_mutating") {
-						this.#originalWorktreeProof(scope);
-						this.#revalidateControlWorktree(scope, control);
+			return this.#port.runExclusive(workSessionKey(`fm-${input.taskId}`), async () =>
+				this.#db.withTransaction(() => {
+					this.#live();
+					this.#dispositionOwner(input.callerSessionId, context);
+					const scope = this.#negativeDispositionScope(input.taskId);
+					if (qualification.scope !== scope.request.kind)
+						throw new ProtocolError("invalid_params", "original disposition scope mismatch");
+					if (input.target.kind === "control") {
+						const control = this.#db.workControlGet(input.target.controlId);
+						if (control?.request.taskId === scope.taskId && control.request.scope === "code_mutating") {
+							this.#originalWorktreeProof(scope);
+							this.#revalidateControlWorktree(scope, control);
+						}
 					}
-				}
-				return this.#db.workTaskNegativeDispositionInTransaction(input, context.evidence,
-					(destination) => this.#options.taskSurfaceAvailable?.(destination, input.taskId) === true);
-			}));
+					return this.#db.workTaskNegativeDispositionInTransaction(
+						input,
+						context.evidence,
+						(destination) => this.#options.taskSurfaceAvailable?.(destination, input.taskId) === true,
+					);
+				}),
+			);
 		}
 		const task = this.#task(input.taskId);
-		return this.#port.runExclusive(workSessionKey(task.laneName), async () => this.#db.withTransaction(() => {
-			this.#live();
-			const current = this.#task(input.taskId);
-			if (input.callerSessionId) {
-				const key = this.#db.originForSessionId(input.callerSessionId);
-				const row = this.#db.sessionIdentityRows().find((entry) =>
-					entry.origin_key === key && entry.gjc_session_id === input.callerSessionId);
-				if (!key || key.startsWith("work/") || key !== originKey(origin) || !row?.origin_ref_json ||
-					originKey(validateOriginRef(JSON.parse(row.origin_ref_json))) !== key ||
-					this.#db.inboundHasQuarantinedNonterminalTurn(key))
-					throw new ProtocolError("unauthorized", "disposition caller identity changed");
-			}
-			if (this.#db.workTaskByThread(originKey(origin)) ||
-				(origin.platform === "discord" && this.#db.workTaskDiscordLocator(origin.conversationId)))
-				throw new ProtocolError("unauthorized", "mapped caller cannot dispose tasks");
-			// Revalidate the original declared scope, never a replacement checkout.
-			if (current.request.kind === "code_mutating" ||
-				this.#db.workTaskSourceGet(`worktree-admission-${current.taskId}`))
-				this.#originalWorktreeProof(current);
-			if (input.target.kind === "control") {
-				const control = this.#db.workControlGet(input.target.controlId);
-				if (control?.request.taskId === current.taskId && control.request.scope === "code_mutating")
-					this.#revalidateControlWorktree(current, control);
-			}
-			const sourceId = workTaskDispositionId(current.taskId, input.eventId, context.evidence.origin);
-			const existing = this.#db.workTaskSourceGet(sourceId);
-			let delivery: ChatMessagePayload | undefined;
-			// Missing mapped presentation never redirects the administrative decision.
-			// A retry cannot create an intent absent from its original atomic receipt.
-			if ((!existing || existing.deliveryId !== null) && current.thread && current.surfacePhase === "bound" &&
-				this.#options.taskSurfaceAvailable?.(current.thread) === true) {
-				const payload = buildDeliveryPayload(current.opRef, current.thread, workTaskDispositionText(input),
-					workTaskSourceDeliveryId(current.taskId, sourceId, current.thread), undefined, false);
-				if (!payload) throw new Error("task_payload_unavailable");
-				delivery = { ...payload, workTask: {
-					taskId: current.taskId, opRef: current.opRef, sourceId, mappedOnly: true,
-				} };
-			}
-			return this.#db.workTaskDispositionInTransaction(input, context.evidence, delivery);
-		}));
+		return this.#port.runExclusive(workSessionKey(task.laneName), async () =>
+			this.#db.withTransaction(() => {
+				this.#live();
+				const current = this.#task(input.taskId);
+				if (input.callerSessionId) {
+					const key = this.#db.originForSessionId(input.callerSessionId);
+					const row = this.#db
+						.sessionIdentityRows()
+						.find((entry) => entry.origin_key === key && entry.gjc_session_id === input.callerSessionId);
+					if (
+						!key ||
+						key.startsWith("work/") ||
+						key !== originKey(origin) ||
+						!row?.origin_ref_json ||
+						originKey(validateOriginRef(JSON.parse(row.origin_ref_json))) !== key ||
+						this.#db.inboundHasQuarantinedNonterminalTurn(key)
+					)
+						throw new ProtocolError("unauthorized", "disposition caller identity changed");
+				}
+				if (
+					this.#db.workTaskByThread(originKey(origin)) ||
+					(origin.platform === "discord" && this.#db.workTaskDiscordLocator(origin.conversationId))
+				)
+					throw new ProtocolError("unauthorized", "mapped caller cannot dispose tasks");
+				// Revalidate the original declared scope, never a replacement checkout.
+				if (
+					current.request.kind === "code_mutating" ||
+					this.#db.workTaskSourceGet(`worktree-admission-${current.taskId}`)
+				)
+					this.#originalWorktreeProof(current);
+				if (input.target.kind === "control") {
+					const control = this.#db.workControlGet(input.target.controlId);
+					if (control?.request.taskId === current.taskId && control.request.scope === "code_mutating")
+						this.#revalidateControlWorktree(current, control);
+				}
+				const sourceId = workTaskDispositionId(current.taskId, input.eventId, context.evidence.origin);
+				const existing = this.#db.workTaskSourceGet(sourceId);
+				let delivery: ChatMessagePayload | undefined;
+				// Missing mapped presentation never redirects the administrative decision.
+				// A retry cannot create an intent absent from its original atomic receipt.
+				if (
+					(!existing || existing.deliveryId !== null) &&
+					current.thread &&
+					current.surfacePhase === "bound" &&
+					this.#options.taskSurfaceAvailable?.(current.thread) === true
+				) {
+					const payload = buildDeliveryPayload(
+						current.opRef,
+						current.thread,
+						workTaskDispositionText(input),
+						workTaskSourceDeliveryId(current.taskId, sourceId, current.thread),
+						undefined,
+						false,
+					);
+					if (!payload) throw new Error("task_payload_unavailable");
+					delivery = {
+						...payload,
+						workTask: {
+							taskId: current.taskId,
+							opRef: current.opRef,
+							sourceId,
+							mappedOnly: true,
+						},
+					};
+				}
+				return this.#db.workTaskDispositionInTransaction(input, context.evidence, delivery);
+			}),
+		);
 	}
 	async steer(params: unknown, context?: WorkTaskAdmissionContext): Promise<WorkSteerResult> {
 		const input = validateWorkSteerParams(params);
 		if (input.taskId !== undefined) {
 			this.#live();
-			if (!context?.stableOrigin || originKey(context.stableOrigin) !== originKey(context.evidence.origin) ||
+			if (
+				!context?.stableOrigin ||
+				originKey(context.stableOrigin) !== originKey(context.evidence.origin) ||
 				context.evidence.eventId !== input.eventId ||
-				!["discord", "slack", "telegram", "loopback"].includes(context.stableOrigin.platform))
+				!["discord", "slack", "telegram", "loopback"].includes(context.stableOrigin.platform)
+			)
 				throw new ProtocolError("unauthorized", "explicit steering requires authenticated non-work caller evidence");
 			const task = this.#task(input.taskId);
 			if (task.opRef !== input.expectedOpRef || task.laneName !== input.name)
@@ -1634,37 +2183,74 @@ export class WorkLaneManager {
 				const proof = scope === "code_mutating" ? this.#originalWorktreeProof(current) : undefined;
 				if (proof) revalidateDedicatedWorktree(proof);
 				const control = this.#db.withTransaction(() => {
-					const sourceId = `explicit-${createHash("sha256").update(JSON.stringify([
-						current.taskId, context.evidence.origin, input.eventId, context.evidence.editId,
-					])).digest("hex")}`;
+					const sourceId = `explicit-${createHash("sha256")
+						.update(JSON.stringify([current.taskId, context.evidence.origin, input.eventId, context.evidence.editId]))
+						.digest("hex")}`;
 					const priorSource = this.#db.workTaskSourceGet(sourceId);
 					this.#db.workTaskSourceAppendInTransaction({
-						sourceId, taskId: current.taskId, kind: "instruction", body: input.text,
-						evidence: { ...context.evidence, observedAt: priorSource?.evidence.observedAt ?? context.evidence.observedAt },
-						supersedes: null, completeness: "complete", controlId: null, reportId: null,
+						sourceId,
+						taskId: current.taskId,
+						kind: "instruction",
+						body: input.text,
+						evidence: {
+							...context.evidence,
+							observedAt: priorSource?.evidence.observedAt ?? context.evidence.observedAt,
+						},
+						supersedes: null,
+						completeness: "complete",
+						controlId: null,
+						reportId: null,
 					});
-					const result = this.#db.workControlAdmitInTransaction({
-						taskId: current.taskId, expectedOpRef: input.expectedOpRef!, kind: "steer",
-						scope, body: input.text, evidence: context.evidence,
-					}, proof ? { taskId: current.taskId, opRef: current.opRef, cwd: current.request.cwd,
-						kind: "code_mutating", eventId: input.eventId!, sourceId, validatedAt: this.#at() } : undefined,
-					{ taskId: current.taskId, opRef: current.opRef, thread: current.thread!, sourceId });
+					const result = this.#db.workControlAdmitInTransaction(
+						{
+							taskId: current.taskId,
+							expectedOpRef: input.expectedOpRef!,
+							kind: "steer",
+							scope,
+							body: input.text,
+							evidence: context.evidence,
+						},
+						proof
+							? {
+									taskId: current.taskId,
+									opRef: current.opRef,
+									cwd: current.request.cwd,
+									kind: "code_mutating",
+									eventId: input.eventId!,
+									sourceId,
+									validatedAt: this.#at(),
+								}
+							: undefined,
+						{ taskId: current.taskId, opRef: current.opRef, thread: current.thread!, sourceId },
+					);
 					if (result.disposition === "conflict") throw new ProtocolError("invalid_params", "control payload conflict");
 					if (result.disposition === "created") {
-						if (proof) this.#db.workTaskSourceAppendInTransaction({
-							sourceId: `worktree-${result.record.controlId}`, taskId: current.taskId, kind: "decision",
-							body: JSON.stringify(proof), evidence: context.evidence, supersedes: null,
-							completeness: "complete", controlId: result.record.controlId, reportId: null,
-						});
+						if (proof)
+							this.#db.workTaskSourceAppendInTransaction({
+								sourceId: `worktree-${result.record.controlId}`,
+								taskId: current.taskId,
+								kind: "decision",
+								body: JSON.stringify(proof),
+								evidence: context.evidence,
+								supersedes: null,
+								completeness: "complete",
+								controlId: result.record.controlId,
+								reportId: null,
+							});
 						this.#controlObservation(current, result.record);
 					}
 					return result.record;
 				});
 				await this.#drainTaskControlsLocked(current);
 				const latest = this.#db.workControlGet(control.controlId)!;
-				const base = { route: "work_task" as const, taskId: current.taskId, opRef: current.opRef,
-					controlId: latest.controlId, acceptance: "durable" as const,
-					...(latest.reason ? { reason: latest.reason } : {}) };
+				const base = {
+					route: "work_task" as const,
+					taskId: current.taskId,
+					opRef: current.opRef,
+					controlId: latest.controlId,
+					acceptance: "durable" as const,
+					...(latest.reason ? { reason: latest.reason } : {}),
+				};
 				return latest.phase === "accepted"
 					? { ...base, delivery: "accepted", steered: true, clientRef: latest.clientRef! }
 					: { ...base, delivery: latest.phase === "sending" ? "held" : latest.phase, steered: false };
@@ -1947,8 +2533,10 @@ export class WorkLaneManager {
 					...(terminal ? { terminal } : {}),
 				}) ?? runtime;
 			if (!runtime.terminal) {
-				const task = !wasAccepted && runtime.sendPhase === "accepted"
-					? this.#db.workTaskByLane(runtime.sessionKey.slice("work/task/".length)) : undefined;
+				const task =
+					!wasAccepted && runtime.sendPhase === "accepted"
+						? this.#db.workTaskByLane(runtime.sessionKey.slice("work/task/".length))
+						: undefined;
 				if (task) await this.#port.runExclusive(runtime.sessionKey, () => this.#drainTaskControlsLocked(task));
 				return;
 			}
@@ -2023,8 +2611,10 @@ export class WorkLaneManager {
 					});
 					if (!updated) return;
 					runtime = updated;
-					if ((runtime.mode === "run" && this.#waiters.has(runtime.opRef)) ||
-						this.#db.workTaskByLane(runtime.sessionKey.slice("work/task/".length)))
+					if (
+						(runtime.mode === "run" && this.#waiters.has(runtime.opRef)) ||
+						this.#db.workTaskByLane(runtime.sessionKey.slice("work/task/".length))
+					)
 						observer.text = Buffer.byteLength(result.text, "utf8") <= 16 * 1024 ? result.text : undefined;
 				} else if (result.status === "unavailable" || reads >= 3) {
 					runtime =
@@ -2147,7 +2737,8 @@ export class WorkLaneManager {
 					};
 				}
 			}
-			const settled = this.#settleWithTaskResult(observer.text,
+			const settled = this.#settleWithTaskResult(
+				observer.text,
 				runtime.opRef,
 				runtime.version,
 				job,
@@ -2464,12 +3055,24 @@ export class WorkLaneManager {
 		return recovery;
 	}
 	async #recover(): Promise<void> {
+		let taskCursor = "";
+		do {
+			const page = this.#db.workTaskKeys(20, taskCursor);
+			for (const key of page.keys) {
+				if (this.#stopped) return;
+				try {
+					this.#recoverCoordinatorReport(key.taskId);
+				} catch (error) {
+					console.error(`work_review_recovery_held taskId=${key.taskId} reason=${failureReason(error)}`);
+				}
+			}
+			if (!page.nextTaskId) break;
+			taskCursor = page.nextTaskId;
+		} while (!this.#stopped);
 		const reportedInvalidAttempts = new Set<string>();
 		const quarantineInvalidAttempt = (error: WorkAttemptStateError) => {
 			if (!error.opRef || reportedInvalidAttempts.has(error.opRef)) return;
-			console.error(
-				`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`,
-			);
+			console.error(`work_recovery_invalid_attempt opRef=${JSON.stringify(error.opRef)} assertion=${error.assertion}`);
 			reportedInvalidAttempts.add(error.opRef);
 			const jobId = this.#db.workAttemptJobId(error.opRef);
 			if (jobId) this.#db.workAttemptQuarantineInvalid(jobId);

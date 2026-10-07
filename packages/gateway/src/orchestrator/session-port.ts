@@ -220,7 +220,12 @@ export type SessionSteerStatusResult =
 	| {
 			readonly status: "unavailable";
 			readonly clientRef: string;
-			readonly code: "identity_mismatch" | "invalid_evidence" | "query_refused" | "query_unavailable" | "transport_error";
+			readonly code:
+				| "identity_mismatch"
+				| "invalid_evidence"
+				| "query_refused"
+				| "query_unavailable"
+				| "transport_error";
 			readonly errorCode?: string;
 	  };
 
@@ -340,7 +345,10 @@ export class ModelNotSelectedError extends Error {
 export class PromptNotSubmittedError extends Error {
 	readonly phase = "model_preflight";
 
-	constructor(readonly opRef: string, cause: unknown) {
+	constructor(
+		readonly opRef: string,
+		cause: unknown,
+	) {
 		super("turn.prompt was not submitted by this call: model preflight failed", {
 			cause: sanitizeDiagnostic(cause instanceof Error ? cause.message : String(cause)).slice(0, 512),
 		});
@@ -784,8 +792,7 @@ export class BrokerSessionPort implements SessionPort {
 				assertRelayOwned();
 				const response = await relay.control("turn.prompt", { text, clientRef: input.opRef });
 				assertRelayOwned();
-				if (!validReceiptEnvelope(response, "control", "turn.prompt"))
-					throw uncertainPromptReceipt();
+				if (!validReceiptEnvelope(response, "control", "turn.prompt")) throw uncertainPromptReceipt();
 				if (response.ok === true) {
 					const receipt = recordOf(response.result);
 					// GJC v0.18.7 (f2bba356), session-runtime.ts submit():
@@ -813,8 +820,7 @@ export class BrokerSessionPort implements SessionPort {
 						taskKey: "gateway",
 					};
 				}
-				if (!isReceiptRefusal(response))
-					throw uncertainPromptReceipt();
+				if (!isReceiptRefusal(response)) throw uncertainPromptReceipt();
 				const error = relayFailure("turn.prompt", response);
 				if (envelopeErrorCode(error.details) === MODEL_NOT_SELECTED_CODE) throw new ModelNotSelectedError(input.opRef);
 				if (envelopeErrorCode(error.details) === CLIENT_REF_CONFLICT_CODE)
@@ -884,7 +890,18 @@ export class BrokerSessionPort implements SessionPort {
 		if (
 			!body ||
 			Object.keys(body).some(
-				(key) => !["accepted", "status", "clientRef", "commandId", "turnId", "acceptedAt", "terminalAt", "error", "ok"].includes(key),
+				(key) =>
+					![
+						"accepted",
+						"status",
+						"clientRef",
+						"commandId",
+						"turnId",
+						"acceptedAt",
+						"terminalAt",
+						"error",
+						"ok",
+					].includes(key),
 			) ||
 			(body.ok !== undefined && body.ok !== true) ||
 			((body.commandId !== undefined || body.turnId !== undefined) &&
@@ -892,7 +909,8 @@ export class BrokerSessionPort implements SessionPort {
 					(value) => typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value,
 				)) ||
 			[body.acceptedAt, body.terminalAt].some(
-				(value) => value !== undefined &&
+				(value) =>
+					value !== undefined &&
 					(typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > 8_640_000_000_000_000),
 			) ||
 			(typeof body.acceptedAt === "number" && typeof body.terminalAt === "number" && body.terminalAt < body.acceptedAt)
@@ -904,8 +922,7 @@ export class BrokerSessionPort implements SessionPort {
 			if (!isReceiptRefusal({ ok: false, error: body.error })) throw uncertain();
 			throw new GjcCliError("gjc sdk turn.steer rejected acceptance", 0, "", { code: "steer_refused", refused: true });
 		}
-		if (body.error !== undefined || body.terminalAt !== undefined || !isSteerAccepted(body))
-			throw uncertain();
+		if (body.error !== undefined || body.terminalAt !== undefined || !isSteerAccepted(body)) throw uncertain();
 	}
 
 	async lookupSteerStatus(input: SessionSteerStatusInput): Promise<SessionSteerStatusResult> {
@@ -1111,20 +1128,20 @@ export class BrokerSessionPort implements SessionPort {
 		// not permission for a caller to retry or replace an uncertain attempt.
 		const requestKey = `gw-close-${randomUUID()}`;
 		const response = await this.#cli(
-				[
-					"sdk",
-					"session",
-					"raw",
-					"global",
-					"--op",
-					"session.close",
-					"--idempotency-key",
-					requestKey,
-					"--json-input",
-					JSON.stringify({ sessionId }),
-				],
-				{ timeoutMs: 30_000 },
-			);
+			[
+				"sdk",
+				"session",
+				"raw",
+				"global",
+				"--op",
+				"session.close",
+				"--idempotency-key",
+				requestKey,
+				"--json-input",
+				JSON.stringify({ sessionId }),
+			],
+			{ timeoutMs: 30_000 },
+		);
 		assertCurrent();
 		parseEnvelope<unknown>(response, "session.close");
 		const envelope = recordOf(JSON.parse(response.stdout));
@@ -1520,12 +1537,26 @@ export function parseRunningJobs(response: CliResult): readonly RunningHostJob[]
 			(job.generation !== undefined && (typeof job.generation !== "string" || job.generation.length === 0)) ||
 			(job.backgrounded !== undefined && typeof job.backgrounded !== "boolean") ||
 			(job.foldReason !== undefined && typeof job.foldReason !== "string") ||
-			(job.deliveryState !== undefined && (typeof job.deliveryState !== "string" ||
-				!["pending", "delivered", "failed-visible"].includes(job.deliveryState))) ||
-			Object.keys(job).some((key) => ![
-				"id", "type", "kind", "label", "status", "startTime", "endTime", "metadata",
-				"generation", "backgrounded", "foldReason", "deliveryState",
-			].includes(key))
+			(job.deliveryState !== undefined &&
+				(typeof job.deliveryState !== "string" ||
+					!["pending", "delivered", "failed-visible"].includes(job.deliveryState))) ||
+			Object.keys(job).some(
+				(key) =>
+					![
+						"id",
+						"type",
+						"kind",
+						"label",
+						"status",
+						"startTime",
+						"endTime",
+						"metadata",
+						"generation",
+						"backgrounded",
+						"foldReason",
+						"deliveryState",
+					].includes(key),
+			)
 		)
 			throw new Error("runtime.jobs.list returned an invalid running job");
 		return {
@@ -1588,10 +1619,23 @@ export function parseWorkerOutputResponse(
 	const result = workerRecord(envelope?.result);
 	if (envelope?.ok !== true || !result) return { status: "unavailable", code: "invalid_evidence" };
 	if (
-		Object.keys(result).some((key) => ![
-			"status", "kind", "clientRef", "commandId", "turnId", "acceptedAt", "startedAt",
-			"terminalAt", "receiptState", "outcome", "content", "textSummary",
-		].includes(key))
+		Object.keys(result).some(
+			(key) =>
+				![
+					"status",
+					"kind",
+					"clientRef",
+					"commandId",
+					"turnId",
+					"acceptedAt",
+					"startedAt",
+					"terminalAt",
+					"receiptState",
+					"outcome",
+					"content",
+					"textSummary",
+				].includes(key),
+		)
 	)
 		return { status: "unavailable", code: "invalid_evidence" };
 	if (result.status === "unknown") return { status: "absent", code: "output_pending" };
@@ -1712,7 +1756,10 @@ function parseSteerStatus(clientRef: string, response: RelayResponse): SessionSt
 		return unavailable("invalid_evidence");
 	if (
 		Object.keys(body).some(
-			(key) => !["clientRef", "status", "commandId", "turnId", "acceptedAt", "terminalAt", "error", "accepted", "ok"].includes(key),
+			(key) =>
+				!["clientRef", "status", "commandId", "turnId", "acceptedAt", "terminalAt", "error", "accepted", "ok"].includes(
+					key,
+				),
 		) ||
 		(body.ok !== undefined && body.ok !== true) ||
 		(body.accepted !== undefined && body.accepted !== (body.status === "accepted")) ||
@@ -1980,7 +2027,9 @@ function relayFailure(operation: string, response: RelayResponse): GjcCliError {
 function validReceiptEnvelope(response: RelayResponse, kind: "control" | "query", name: string): boolean {
 	return (
 		recordOf(response) !== undefined &&
-		Object.keys(response).every((key) => ["type", "id", "operation", "query", "ok", "result", "page", "error"].includes(key)) &&
+		Object.keys(response).every((key) =>
+			["type", "id", "operation", "query", "ok", "result", "page", "error"].includes(key),
+		) &&
 		(response.type === undefined || response.type === `${kind}_response`) &&
 		(response.id === undefined || (typeof response.id === "string" && response.id.length > 0)) &&
 		(response.operation === undefined || (kind === "control" && response.operation === name)) &&

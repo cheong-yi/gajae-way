@@ -35,7 +35,10 @@ describe("profile 1.1 cutover", () => {
 	});
 
 	test("mixed-range client negotiates the highest mutual version", () => {
-		const result = negotiate({ supportedVersions: ["0.1", "1.0", PROFILE_VERSION], requiredCapabilities: ["work.tasks"] });
+		const result = negotiate({
+			supportedVersions: ["0.1", "1.0", PROFILE_VERSION],
+			requiredCapabilities: ["work.tasks"],
+		});
 		expect(result.ok).toBe(true);
 		if (result.ok) {
 			expect(result.negotiated.profileVersion).toBe("1.1");
@@ -44,7 +47,11 @@ describe("profile 1.1 cutover", () => {
 	});
 
 	test("matching profile without task capability rejects required task semantics", () => {
-		const result = negotiate({ supportedVersions: ["1.1"], requiredCapabilities: ["work.tasks"] }, ["1.1"], ["gateway.core"]);
+		const result = negotiate(
+			{ supportedVersions: ["1.1"], requiredCapabilities: ["work.tasks"] },
+			["1.1"],
+			["gateway.core"],
+		);
 		expect(result.ok).toBe(false);
 		if (!result.ok) expect(result.code).toBe("missing_required_capability");
 	});

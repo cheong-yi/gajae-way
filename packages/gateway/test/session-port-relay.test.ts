@@ -2,16 +2,16 @@
 // `serve --stdio` relay instead of spawning `gjc sdk session raw ...`. A relay
 // transport failure falls back to the CLI exactly once; a relay refusal is the
 // host's answer and never reaches the CLI.
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type CliResult, type CliRunner, TranscriptIncompleteError } from "@gajae-gateway/subsession";
 import { originKey } from "@gajae-gateway/protocol";
+import { type CliResult, type CliRunner, TranscriptIncompleteError } from "@gajae-gateway/subsession";
 import { LaneGovernor } from "../src/orchestrator/lane-governor";
-import { BrokerSessionPort, isSessionBusy } from "../src/orchestrator/session-port";
 import { isDefinitiveSteerRejection } from "../src/orchestrator/persona-session";
-import { TailRunner } from "../src/orchestrator/tail-runner";
+import { BrokerSessionPort, isSessionBusy } from "../src/orchestrator/session-port";
+import { type TailAttachInput, TailRunner } from "../src/orchestrator/tail-runner";
 import { WorkLaneManager } from "../src/orchestrator/work-lane";
 import { GatewayDatabase } from "../src/store/db";
 import {
@@ -47,7 +47,12 @@ async function fixture(options: {
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
 	const repo = join(home, "workspace");
 	const sessionId = options.sessionId ?? "sdk-1";
-	await createOwnedSessionFixture(database, authority, { sessionId, repo, originKey: options.originKey ?? "relay", epoch: 0 });
+	await createOwnedSessionFixture(database, authority, {
+		sessionId,
+		repo,
+		originKey: options.originKey ?? "relay",
+		epoch: 0,
+	});
 	const cli: string[][] = [];
 	const run: CliRunner = async (args) => {
 		cli.push([...args]);
@@ -59,12 +64,16 @@ async function fixture(options: {
 			? new Promise<ScriptedRelayReply>(() => {})
 			: options.mode === "refuse"
 				? { ok: false, error: { code: "invalid_params", message: "refused by host" } }
-				: options.relayReply(request) as ScriptedRelayReply,
+				: (options.relayReply(request) as ScriptedRelayReply),
 	);
 	const tailRunner = new TailRunner({ stream: relay.spawn, repo, requestTimeoutMs: 20 });
 	const sleeps: number[] = [];
 	const port = new BrokerSessionPort({
-		database, authority, cli: run, instanceId: "relay-1", tailRunner,
+		database,
+		authority,
+		cli: run,
+		instanceId: "relay-1",
+		tailRunner,
 		sleep: async (ms) => {
 			sleeps.push(ms);
 			throw new Error("ambiguous relay evidence must not enter busy retry");
@@ -80,6 +89,206 @@ const page = (value: Record<string, unknown>): CliResult => ({
 	stdout: JSON.stringify({ type: "query_response", ok: true, page: value }),
 	stderr: "",
 });
+
+// Drive only the provider interval by hand. Hello/request/test deadlines remain
+// native, and the existing fake stream still serializes every host frame.
+async function withProviderRelay(
+	run: (fixture: {
+		handle: Awaited<ReturnType<TailRunner["attach"]>>;
+		stream: ReturnType<typeof scriptedRelay>["streams"][number];
+		reverseRequests: Parameters<NonNullable<TailAttachInput["onReverseRequest"]>>[0][];
+		begin: (expiresAt: number) => Promise<string>;
+		flush: () => Promise<unknown>;
+		tick: (at: number) => void;
+		expectTimerCleared: () => void;
+	}) => Promise<void>,
+): Promise<void> {
+	let now = 0;
+	let heartbeat: (() => void) | undefined;
+	let timer: ReturnType<typeof setInterval> | undefined;
+	const relay = scriptedRelay(() => ({ ok: true, result: {} }));
+	const reverseRequests: Parameters<NonNullable<TailAttachInput["onReverseRequest"]>>[0][] = [];
+	const runner = new TailRunner({ stream: relay.spawn, repo: "/repo", now: () => now });
+	const handle = await runner.attach({
+		sessionId: "provider-session",
+		brokerGeneration: 0,
+		repo: "/repo",
+		onReverseRequest: (request) => {
+			reverseRequests.push(request);
+		},
+	});
+	const stream = relay.streams[0]!;
+	const nativeSetInterval = globalThis.setInterval;
+	const interval = spyOn(globalThis, "setInterval").mockImplementation(
+		new Proxy(nativeSetInterval, {
+			apply(target, _receiver, args) {
+				const [callback, delay, ...callbackArgs] = args;
+				expect(delay).toBe(3000);
+				if (typeof callback !== "function") throw new TypeError("Expected a heartbeat callback");
+				heartbeat = () => callback(...callbackArgs);
+				timer = target(() => {}, 2_147_483_647);
+				return timer;
+			},
+		}),
+	);
+	const clear = spyOn(globalThis, "clearInterval");
+	const flush = () => handle.query("session.status", {});
+	try {
+		await run({
+			handle,
+			stream,
+			reverseRequests,
+			begin: async (expiresAt) => {
+				handle.beginTurn("provider-turn");
+				await flush();
+				const registration = stream.written.find((frame) => frame.type === "register_provider")!;
+				const leaseId = `lease-${registration.id}`;
+				stream.host({
+					type: "lease_state",
+					leaseId,
+					active: true,
+					leaseExpiresAt: new Date(expiresAt).toISOString(),
+				});
+				await flush();
+				return leaseId;
+			},
+			flush,
+			tick: (at) => {
+				now = at;
+				expect(heartbeat).toBeDefined();
+				heartbeat!();
+			},
+			expectTimerCleared: () => {
+				expect(timer).toBeDefined();
+				expect(clear).toHaveBeenCalledWith(timer);
+			},
+		});
+	} finally {
+		await handle.close();
+		if (timer) clearInterval(timer);
+		interval.mockRestore();
+		clear.mockRestore();
+	}
+}
+
+test("provider relay advertises only permission.request and preserves its reverse-request route", async () => {
+	await withProviderRelay(async ({ handle, stream, begin, reverseRequests, flush }) => {
+		expect(stream.written.filter((frame) => frame.type === "register_provider")).toEqual([]);
+		const leaseId = await begin(6000);
+		handle.beginTurn("another-turn");
+		expect(stream.written.filter((frame) => frame.type === "register_provider")).toEqual([
+			{
+				type: "register_provider",
+				id: "gw-perm-0-provider-session",
+				connectionId: stream.connectionId,
+				capability: "permission",
+				definitions: { methods: ["request"] },
+			},
+		]);
+		const request = {
+			id: "permission-1",
+			connectionId: stream.connectionId,
+			leaseId,
+			capability: "permission",
+			payload: { method: "request", payload: { title: "Allow tool?" } },
+		};
+		stream.host({ type: "reverse_request", ...request });
+		await flush();
+		expect(reverseRequests).toEqual([request]);
+		await handle.sendReverseResponse({
+			id: request.id,
+			connectionId: request.connectionId,
+			leaseId,
+			result: { decision: "allow" },
+		});
+		expect(stream.written.at(-1)).toEqual({
+			type: "reverse_response",
+			id: request.id,
+			connectionId: request.connectionId,
+			leaseId,
+			ok: true,
+			result: { decision: "allow" },
+		});
+	});
+});
+
+test("provider relay close releases its lease before stream close exactly once across concurrent and repeated closes", async () => {
+	await withProviderRelay(async ({ handle, stream, begin, tick, expectTimerCleared }) => {
+		const leaseId = await begin(6000);
+		const nativeClose = stream.close.bind(stream);
+		const releasesAtClose: Record<string, unknown>[][] = [];
+		const close = spyOn(stream, "close").mockImplementation(() => {
+			releasesAtClose.push(stream.written.filter((frame) => frame.type === "lease_release"));
+			nativeClose();
+		});
+		try {
+			await Promise.all([handle.close(), handle.close()]);
+			await handle.close();
+			const releases = [{ type: "lease_release", leaseId }];
+			expect(releasesAtClose.length).toBeGreaterThan(0);
+			for (const observed of releasesAtClose) expect(observed).toEqual(releases);
+			expect(stream.written.filter((frame) => frame.type === "lease_release")).toEqual(releases);
+			expect(stream.closed).toBe(true);
+			expectTimerCleared();
+			const written = stream.written.length;
+			// Even a callback already queued at shutdown cannot renew a lease.
+			tick(3000);
+			expect(stream.written).toHaveLength(written);
+		} finally {
+			close.mockRestore();
+		}
+	});
+});
+
+for (const expiresAt of [6000, 5000]) {
+	test(`provider relay renews expiry ${expiresAt} at tick 3000 and follows host renewal without inventing TTL`, async () => {
+		await withProviderRelay(async ({ stream, begin, tick, flush }) => {
+			const leaseId = await begin(expiresAt);
+			const heartbeats = () => stream.written.filter((frame) => frame.type === "provider_heartbeat");
+			tick(3000);
+			expect(heartbeats()).toEqual([{ type: "provider_heartbeat", leaseId }]);
+			stream.host({
+				type: "lease_state",
+				leaseId,
+				active: true,
+				leaseExpiresAt: new Date(9000).toISOString(),
+			});
+			await flush();
+			tick(6000);
+			expect(heartbeats()).toEqual([
+				{ type: "provider_heartbeat", leaseId },
+				{ type: "provider_heartbeat", leaseId },
+			]);
+			// No host renewal follows the second heartbeat: expiry is authoritative.
+			tick(9000);
+			tick(12000);
+			expect(heartbeats()).toHaveLength(2);
+		});
+	});
+}
+
+for (const state of ["inactive", "inactive-without-expiry", "expired"] as const) {
+	test(`provider relay neither renews nor releases an ${state} lease`, async () => {
+		await withProviderRelay(async ({ handle, stream, begin, tick, flush }) => {
+			const leaseId = await begin(state === "expired" ? 3000 : 6000);
+			if (state !== "expired") {
+				stream.host({
+					type: "lease_state",
+					leaseId,
+					active: false,
+					...(state === "inactive" ? { leaseExpiresAt: new Date(6000).toISOString() } : {}),
+				});
+				await flush();
+			}
+			tick(3000);
+			tick(6000);
+			await handle.close();
+			expect(
+				stream.written.filter((frame) => frame.type === "provider_heartbeat" || frame.type === "lease_release"),
+			).toEqual([]);
+		});
+	});
+}
 
 type Case = {
 	readonly name: string;
@@ -319,7 +528,11 @@ test("session.last_assistant over the relay rejects an incomplete page without a
 // real line decoder, not a pre-projected TailHandle.control fake.
 const promptReceipt = { accepted: true, clientRef: "original", commandId: "command", turnId: "turn" };
 const steerReceipt = {
-	clientRef: "original", commandId: "command", turnId: "turn", status: "accepted", acceptedAt: 1_700_000_000_000,
+	clientRef: "original",
+	commandId: "command",
+	turnId: "turn",
+	status: "accepted",
+	acceptedAt: 1_700_000_000_000,
 };
 for (const operation of ["turn.prompt", "turn.steer"] as const) {
 	const receipt = operation === "turn.prompt" ? promptReceipt : steerReceipt;
@@ -344,21 +557,27 @@ for (const operation of ["turn.prompt", "turn.steer"] as const) {
 	] as const) {
 		test(`${operation}: raw ${name} remains uncertain without retry or definitive disposition`, async () => {
 			const f = await fixture({
-				mode: "answer", relayReply: () => reply,
-				cliReply: () => { throw new Error("CLI must not run"); },
+				mode: "answer",
+				relayReply: () => reply,
+				cliReply: () => {
+					throw new Error("CLI must not run");
+				},
 			});
 			const target = { sessionId: "sdk-1", repo: f.repo, relay: f.handle, text: "work" };
-			const failure = await (
-				operation === "turn.prompt"
-					? f.port.send({ ...target, opRef: "original" })
-					: f.port.steer({ ...target, clientRef: "original" })
+			const failure = await (operation === "turn.prompt"
+				? f.port.send({ ...target, opRef: "original" })
+				: f.port.steer({ ...target, clientRef: "original" })
 			).catch((error: unknown) => error);
 			expect(failure).toMatchObject({ details: { outcomeCertainty: "unknown" } });
 			expect(isSessionBusy(failure)).toBe(false);
 			expect(isDefinitiveSteerRejection(failure)).toBe(false);
-			expect(f.relay.requests).toEqual([{
-				type: "control_request", operation, input: { text: "work", clientRef: "original" },
-			}]);
+			expect(f.relay.requests).toEqual([
+				{
+					type: "control_request",
+					operation,
+					input: { text: "work", clientRef: "original" },
+				},
+			]);
 			expect(f.sleeps).toEqual([]);
 			expect(f.cli).toEqual([]);
 			await f.handle.close();
@@ -367,13 +586,18 @@ for (const operation of ["turn.prompt", "turn.steer"] as const) {
 
 	test(`${operation}: exact accepted receipt and legitimate routing metadata survive raw decoding`, async () => {
 		const f = await fixture({
-			mode: "answer", relayReply: () => ({ ok: true, operation, result: receipt }),
-			cliReply: () => { throw new Error("CLI must not run"); },
+			mode: "answer",
+			relayReply: () => ({ ok: true, operation, result: receipt }),
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
 		});
 		const target = { sessionId: "sdk-1", repo: f.repo, relay: f.handle, text: "work" };
 		if (operation === "turn.prompt") {
 			expect(await f.port.send({ ...target, opRef: "original" })).toMatchObject({
-				operationRef: "original", commandId: "command", turnId: "turn",
+				operationRef: "original",
+				commandId: "command",
+				turnId: "turn",
 			});
 		} else {
 			expect(await f.port.steer({ ...target, clientRef: "original" })).toBeUndefined();
@@ -387,13 +611,14 @@ for (const operation of ["turn.prompt", "turn.steer"] as const) {
 		const f = await fixture({
 			mode: "answer",
 			relayReply: () => ({ ok: false, error: { code: "busy", message: "occupied", outcomeCertainty: "not-applied" } }),
-			cliReply: () => { throw new Error("CLI must not run"); },
+			cliReply: () => {
+				throw new Error("CLI must not run");
+			},
 		});
 		const target = { sessionId: "sdk-1", repo: f.repo, relay: f.handle, text: "work" };
-		const failure = await (
-			operation === "turn.prompt"
-				? f.port.send({ ...target, opRef: "original", busyWaitMs: 0 })
-				: f.port.steer({ ...target, clientRef: "original" })
+		const failure = await (operation === "turn.prompt"
+			? f.port.send({ ...target, opRef: "original", busyWaitMs: 0 })
+			: f.port.steer({ ...target, clientRef: "original" })
 		).catch((error: unknown) => error);
 		expect(failure).toMatchObject({ details: { code: "busy", outcomeCertainty: "not-applied" } });
 		expect(isDefinitiveSteerRejection(failure)).toBe(operation === "turn.steer");
@@ -406,20 +631,34 @@ for (const operation of ["turn.prompt", "turn.steer"] as const) {
 test("raw query and ordinary control errors retain original certainty and evidence", async () => {
 	const error = { code: "busy", outcomeCertainty: "unknown", clientRef: "original", detail: { valid: false } };
 	const f = await fixture({
-		mode: "answer", relayReply: () => ({ ok: false, error }),
-		cliReply: () => { throw new Error("CLI must not run"); },
+		mode: "answer",
+		relayReply: () => ({ ok: false, error }),
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
 	});
 	expect(await f.handle.query("turn.result", { clientRef: "original" })).toMatchObject({ ok: false, error });
-	const failure = await f.port.setModel({
-		sessionId: "sdk-1", repo: f.repo, relay: f.handle, selection: "model",
-	}).catch((failure: unknown) => failure);
+	const failure = await f.port
+		.setModel({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			relay: f.handle,
+			selection: "model",
+		})
+		.catch((failure: unknown) => failure);
 	expect(failure).toMatchObject({ details: error });
-	const queryFailure = await f.port.fetchLastAssistant({
-		sessionId: "sdk-1", repo: f.repo, relay: f.handle,
-	}).catch((failure: unknown) => failure);
+	const queryFailure = await f.port
+		.fetchLastAssistant({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			relay: f.handle,
+		})
+		.catch((failure: unknown) => failure);
 	expect(queryFailure).toMatchObject({ details: error });
 	expect(f.relay.requests.map((request) => request.operation)).toEqual([
-		"turn.result", "model.set", "session.last_assistant",
+		"turn.result",
+		"model.set",
+		"session.last_assistant",
 	]);
 	expect(f.cli).toEqual([]);
 	await f.handle.close();
@@ -429,11 +668,18 @@ test("a matching ID with the wrong raw response kind is not a control refusal or
 	const f = await fixture({
 		mode: "answer",
 		relayReply: () => ({ type: "query_response", ok: false, error: { code: "busy" } }),
-		cliReply: () => { throw new Error("CLI must not run"); },
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
 	});
-	const failure = await f.port.setModel({
-		sessionId: "sdk-1", repo: f.repo, relay: f.handle, selection: "model",
-	}).catch((error: unknown) => error);
+	const failure = await f.port
+		.setModel({
+			sessionId: "sdk-1",
+			repo: f.repo,
+			relay: f.handle,
+			selection: "model",
+		})
+		.catch((error: unknown) => error);
 	expect(String(failure)).toContain("relay response kind does not match");
 	expect(isDefinitiveSteerRejection(failure)).toBe(false);
 	expect(f.relay.requests).toHaveLength(1);
@@ -446,9 +692,14 @@ test("original steer lookup accepts query metadata but not raw validity loss", a
 	const f = await fixture({
 		mode: "answer",
 		relayReply: () => ({
-			ok: true, query: "turn.steer_status", result: steerReceipt, ...(invalid ? { truncated: true } : {}),
+			ok: true,
+			query: "turn.steer_status",
+			result: steerReceipt,
+			...(invalid ? { truncated: true } : {}),
 		}),
-		cliReply: () => { throw new Error("CLI must not run"); },
+		cliReply: () => {
+			throw new Error("CLI must not run");
+		},
 	});
 	const target = { sessionId: "sdk-1", repo: f.repo, relay: f.handle, clientRef: "original" };
 	expect(await f.port.lookupSteerStatus(target)).toMatchObject({ status: "accepted", clientRef: "original" });
@@ -460,94 +711,143 @@ test("original steer lookup accepts query metadata but not raw validity loss", a
 });
 
 for (const lookup of [false, true]) {
-test(`raw unknown-certainty busy holds the original task control and blocks its successor (Q31=${lookup})`, async () => {
-	const taskId = "b7654d21-6806-4fdc-89ef-e2f9c038e4f9";
-	const name = `fm-${taskId}`;
-	const sessionId = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
-	const f = await fixture({
-		mode: "answer",
-		originKey: `work/task/${name}`,
-		sessionId,
-		relayReply: (request) => request.type === "query_request" ? ({
-			ok: true,
-			result: {
-				clientRef: request.input.clientRef,
-				status: "rejected",
-				acceptedAt: 1_700_000_000_000,
-				error: { code: "busy", message: "uncertain rejection", outcomeCertainty: "unknown" },
+	test(`raw unknown-certainty busy holds the original task control and blocks its successor (Q31=${lookup})`, async () => {
+		const taskId = "b7654d21-6806-4fdc-89ef-e2f9c038e4f9";
+		const name = `fm-${taskId}`;
+		const sessionId = "ad2f2494-2584-4d13-b7b6-c6ac24a1087f";
+		const f = await fixture({
+			mode: "answer",
+			originKey: `work/task/${name}`,
+			sessionId,
+			relayReply: (request) =>
+				request.type === "query_request"
+					? {
+							ok: true,
+							result: {
+								clientRef: request.input.clientRef,
+								status: "rejected",
+								acceptedAt: 1_700_000_000_000,
+								error: { code: "busy", message: "uncertain rejection", outcomeCertainty: "unknown" },
+							},
+						}
+					: { ok: false, error: { code: "busy", outcomeCertainty: "unknown" } },
+			cliReply: () => {
+				throw new Error("CLI must not run");
 			},
-		}) : ({ ok: false, error: { code: "busy", outcomeCertainty: "unknown" } }),
-		cliReply: () => { throw new Error("CLI must not run"); },
-	});
-	await mkdir(f.repo, { recursive: true });
-	const db = database!;
-	const coordinator = { platform: "discord", kind: "channel", conversationId: "100", boundaryId: "1" } as const;
-	const thread = { platform: "discord", kind: "thread", conversationId: "200", parentId: "100", boundaryId: "1" } as const;
-	await createOwnedSessionFixture(db, f.authority, {
-		sessionId: "persona-session", originKey: originKey(coordinator), epoch: 0, repo: f.repo,
-	});
-	// Only assignment/lifecycle is scripted. The original steering invocation
-	// crosses BrokerSessionPort and the real stdio decoder on the owned session.
-	class LookupPort extends ScriptedSessionPort {
-		override async lookupSteerStatus(input: Parameters<BrokerSessionPort["lookupSteerStatus"]>[0]) {
-			return lookup ? await f.port.lookupSteerStatus({ ...input, relay: f.handle }) : await super.lookupSteerStatus(input);
+		});
+		await mkdir(f.repo, { recursive: true });
+		const db = database!;
+		const coordinator = { platform: "discord", kind: "channel", conversationId: "100", boundaryId: "1" } as const;
+		const thread = {
+			platform: "discord",
+			kind: "thread",
+			conversationId: "200",
+			parentId: "100",
+			boundaryId: "1",
+		} as const;
+		await createOwnedSessionFixture(db, f.authority, {
+			sessionId: "persona-session",
+			originKey: originKey(coordinator),
+			epoch: 0,
+			repo: f.repo,
+		});
+		// Only assignment/lifecycle is scripted. The original steering invocation
+		// crosses BrokerSessionPort and the real stdio decoder on the owned session.
+		class LookupPort extends ScriptedSessionPort {
+			override async lookupSteerStatus(input: Parameters<BrokerSessionPort["lookupSteerStatus"]>[0]) {
+				return lookup
+					? await f.port.lookupSteerStatus({ ...input, relay: f.handle })
+					: await super.lookupSteerStatus(input);
+			}
 		}
-	}
-	const lifecycle = new LookupPort({
-		onBind: () => sessionId,
-		onSteer: (input) => f.port.steer({ ...input, relay: f.handle }),
-	});
-	const lanes = new LaneGovernor({ database: db, sessionPort: lifecycle, maxLanes: 4 });
-	const manager = new WorkLaneManager({
-		database: db, port: lifecycle, lanes, pollMs: 60_000, taskSurfaceAvailable: () => true,
-	});
-	const claimId = "29e0f8d7-b069-44bc-a747-5890b89ea174";
-	const at = "2026-10-06T05:00:00.000Z";
-	const context = {
-		stableOrigin: coordinator,
-		evidence: { principalId: "owner", origin: coordinator, eventId: "assignment", editId: null, evidenceAt: at, observedAt: at },
-	};
-	try {
-		await manager.start({
-			name, text: "Inspect evidence", cwd: f.repo, callerSessionId: "persona-session",
-			task: { taskId, kind: "read_only", surface: { parentOrigin: coordinator } },
-		}, context);
-		await manager.threadClaim({ taskId, claimId });
-		await manager.threadBind({ taskId, claimId, outcome: { kind: "bound", origin: thread } });
-		const task = db.workTaskGet(taskId)!;
-		for (const [eventId, text] of [["cli:first-control", "first-control"], ["cli:successor", "successor"]]) {
-			await manager.steer({
-				name, taskId, expectedOpRef: task.opRef, eventId, text,
-			}, { ...context, evidence: { ...context.evidence, eventId } });
+		const lifecycle = new LookupPort({
+			onBind: () => sessionId,
+			onSteer: (input) => f.port.steer({ ...input, relay: f.handle }),
+		});
+		const lanes = new LaneGovernor({ database: db, sessionPort: lifecycle, maxLanes: 4 });
+		const manager = new WorkLaneManager({
+			database: db,
+			port: lifecycle,
+			lanes,
+			pollMs: 60_000,
+			taskSurfaceAvailable: () => true,
+		});
+		const claimId = "29e0f8d7-b069-44bc-a747-5890b89ea174";
+		const at = "2026-10-06T05:00:00.000Z";
+		const context = {
+			stableOrigin: coordinator,
+			evidence: {
+				principalId: "owner",
+				origin: coordinator,
+				eventId: "assignment",
+				editId: null,
+				evidenceAt: at,
+				observedAt: at,
+			},
+		};
+		try {
+			await manager.start(
+				{
+					name,
+					text: "Inspect evidence",
+					cwd: f.repo,
+					callerSessionId: "persona-session",
+					task: { taskId, kind: "read_only", surface: { parentOrigin: coordinator } },
+				},
+				context,
+			);
+			await manager.threadClaim({ taskId, claimId });
+			await manager.threadBind({ taskId, claimId, outcome: { kind: "bound", origin: thread } });
+			const task = db.workTaskGet(taskId)!;
+			for (const [eventId, text] of [
+				["cli:first-control", "first-control"],
+				["cli:successor", "successor"],
+			]) {
+				await manager.steer(
+					{
+						name,
+						taskId,
+						expectedOpRef: task.opRef,
+						eventId,
+						text,
+					},
+					{ ...context, evidence: { ...context.evidence, eventId } },
+				);
+			}
+			await manager.drainTaskControls(taskId);
+			const controls = db.workControlList(taskId);
+			expect(controls.map((control) => control.phase)).toEqual(["held", "pending"]);
+			expect(controls[0]).toMatchObject({ reason: "steer_receipt_unresolved" });
+			expect(controls[1]?.sendingAt).toBeNull();
+			expect(f.relay.requests.filter((request) => request.type === "control_request")).toEqual([
+				{
+					type: "control_request",
+					operation: "turn.steer",
+					input: { text: "first-control", clientRef: controls[0]!.clientRef },
+				},
+			]);
+			const queries = f.relay.requests.filter((request) => request.type === "query_request");
+			if (lookup) {
+				expect(queries.length).toBeGreaterThan(0);
+				expect(
+					queries.every(
+						(request) =>
+							request.operation === "turn.steer_status" && request.input.clientRef === controls[0]!.clientRef,
+					),
+				).toBe(true);
+				expect(controls[0]?.request.expectedOpRef).toBe(task.opRef);
+				expect(db.workTaskGet(taskId)?.opRef).toBe(task.opRef);
+			} else {
+				expect(queries).toEqual([]);
+			}
+			expect(lifecycle.steers).toHaveLength(1);
+			expect(f.sleeps).toEqual([]);
+			expect(f.cli).toEqual([]);
+		} finally {
+			await manager.stop();
+			await f.handle.close();
 		}
-		await manager.drainTaskControls(taskId);
-		const controls = db.workControlList(taskId);
-		expect(controls.map((control) => control.phase)).toEqual(["held", "pending"]);
-		expect(controls[0]).toMatchObject({ reason: "steer_receipt_unresolved" });
-		expect(controls[1]?.sendingAt).toBeNull();
-		expect(f.relay.requests.filter((request) => request.type === "control_request")).toEqual([{
-			type: "control_request", operation: "turn.steer",
-			input: { text: "first-control", clientRef: controls[0]!.clientRef },
-		}]);
-		const queries = f.relay.requests.filter((request) => request.type === "query_request");
-		if (lookup) {
-			expect(queries.length).toBeGreaterThan(0);
-			expect(queries.every((request) =>
-				request.operation === "turn.steer_status" && request.input.clientRef === controls[0]!.clientRef,
-			)).toBe(true);
-			expect(controls[0]?.request.expectedOpRef).toBe(task.opRef);
-			expect(db.workTaskGet(taskId)?.opRef).toBe(task.opRef);
-		} else {
-			expect(queries).toEqual([]);
-		}
-		expect(lifecycle.steers).toHaveLength(1);
-		expect(f.sleeps).toEqual([]);
-		expect(f.cli).toEqual([]);
-	} finally {
-		await manager.stop();
-		await f.handle.close();
-	}
-});
+	});
 }
 
 for (const transport of ["cli", "relay"] as const) {
@@ -558,7 +858,9 @@ for (const transport of ["cli", "relay"] as const) {
 		let raw: Record<string, unknown> = {};
 		let contradiction: Record<string, unknown> = { error: { code: "terminal_uncertain" } };
 		const f = await fixture({
-			mode: "answer", originKey: `work/task/${name}`, sessionId,
+			mode: "answer",
+			originKey: `work/task/${name}`,
+			sessionId,
 			relayReply: (request) => {
 				expect(request.operation).toBe("turn.result");
 				return raw;
@@ -571,9 +873,18 @@ for (const transport of ["cli", "relay"] as const) {
 		await mkdir(f.repo, { recursive: true });
 		const db = database!;
 		const coordinator = { platform: "discord", kind: "channel", conversationId: "100", boundaryId: "1" } as const;
-		const thread = { platform: "discord", kind: "thread", conversationId: "200", parentId: "100", boundaryId: "1" } as const;
+		const thread = {
+			platform: "discord",
+			kind: "thread",
+			conversationId: "200",
+			parentId: "100",
+			boundaryId: "1",
+		} as const;
 		await createOwnedSessionFixture(db, f.authority, {
-			sessionId: "persona-session", originKey: originKey(coordinator), epoch: 0, repo: f.repo,
+			sessionId: "persona-session",
+			originKey: originKey(coordinator),
+			epoch: 0,
+			repo: f.repo,
 		});
 		class OutputPort extends ScriptedSessionPort {
 			override async fetchWorkerOutput(input: Parameters<BrokerSessionPort["fetchWorkerOutput"]>[0]) {
@@ -582,10 +893,20 @@ for (const transport of ["cli", "relay"] as const) {
 				raw = {
 					ok: true,
 					result: {
-						kind: "prompt", status: "terminal_ok", clientRef: input.opRef,
-						commandId: original.provenance.commandId, turnId: original.provenance.turnId,
-						terminalAt: original.provenance.terminalAt, receiptState: "present",
-						content: { version: 1, type: "text", text: original.text, byteLength: original.provenance.byteLength, truncated: false },
+						kind: "prompt",
+						status: "terminal_ok",
+						clientRef: input.opRef,
+						commandId: original.provenance.commandId,
+						turnId: original.provenance.turnId,
+						terminalAt: original.provenance.terminalAt,
+						receiptState: "present",
+						content: {
+							version: 1,
+							type: "text",
+							text: original.text,
+							byteLength: original.provenance.byteLength,
+							truncated: false,
+						},
 					},
 					...contradiction,
 				};
@@ -595,18 +916,35 @@ for (const transport of ["cli", "relay"] as const) {
 		const lifecycle = new OutputPort({ onBind: () => sessionId });
 		const lanes = new LaneGovernor({ database: db, sessionPort: lifecycle, maxLanes: 4 });
 		const manager = new WorkLaneManager({
-			database: db, port: lifecycle, lanes, pollMs: 5, taskSurfaceAvailable: () => true,
+			database: db,
+			port: lifecycle,
+			lanes,
+			pollMs: 5,
+			taskSurfaceAvailable: () => true,
 		});
 		const at = "2026-10-06T05:00:00.000Z";
 		const context = {
 			stableOrigin: coordinator,
-			evidence: { principalId: "owner", origin: coordinator, eventId: "assignment", editId: null, evidenceAt: at, observedAt: at },
+			evidence: {
+				principalId: "owner",
+				origin: coordinator,
+				eventId: "assignment",
+				editId: null,
+				evidenceAt: at,
+				observedAt: at,
+			},
 		};
 		try {
-			await manager.start({
-				name, text: "Inspect evidence", cwd: f.repo, callerSessionId: "persona-session",
-				task: { taskId, kind: "read_only", surface: { parentOrigin: coordinator } },
-			}, context);
+			await manager.start(
+				{
+					name,
+					text: "Inspect evidence",
+					cwd: f.repo,
+					callerSessionId: "persona-session",
+					task: { taskId, kind: "read_only", surface: { parentOrigin: coordinator } },
+				},
+				context,
+			);
 			const claimId = "29e0f8d7-b069-44bc-a747-5890b89ea174";
 			await manager.threadClaim({ taskId, claimId });
 			await manager.threadBind({ taskId, claimId, outcome: { kind: "bound", origin: thread } });
@@ -620,8 +958,12 @@ for (const transport of ["cli", "relay"] as const) {
 			expect(db.workTaskSourceGet(`final-${taskId}-original`)).toBeUndefined();
 			const held = db.workTaskGet(taskId);
 			for (contradiction of [
-				{ error: { code: "terminal_uncertain" } }, { truncated: true }, { valid: false },
-				{ query: "runtime.jobs.list" }, { complete: false }, { outcomeCertainty: "unknown" },
+				{ error: { code: "terminal_uncertain" } },
+				{ truncated: true },
+				{ valid: false },
+				{ query: "runtime.jobs.list" },
+				{ complete: false },
+				{ outcomeCertainty: "unknown" },
 			]) {
 				expect(await manager.recoverTaskReport(taskId)).toMatchObject({ disposition: "held" });
 				expect(db.workTaskGet(taskId)).toEqual(held);

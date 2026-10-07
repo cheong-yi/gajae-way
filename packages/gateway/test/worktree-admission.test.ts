@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { admitDedicatedWorktree, revalidateDedicatedWorktree } from "../src/orchestrator/worktree-admission";
 
 const directories: string[] = [];
-afterEach(async () => { for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true }); });
+afterEach(async () => {
+	for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
+});
 function git(cwd: string, ...args: string[]): void {
 	const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode !== 0) throw new Error(result.stderr.toString());
@@ -17,7 +19,17 @@ async function fixture() {
 	const worker = join(root, "worker");
 	await mkdir(primary);
 	git(primary, "init");
-	git(primary, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture");
+	git(
+		primary,
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"fixture",
+	);
 	git(primary, "worktree", "add", "-b", "worker", worker);
 	return { root, primary, worker };
 }

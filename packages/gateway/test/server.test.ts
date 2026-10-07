@@ -3,7 +3,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LOOPBACK_ORIGIN, originKey, PROFILE_VERSION, type OriginRef } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, type OriginRef, originKey, PROFILE_VERSION } from "@gajae-gateway/protocol";
 import { MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
 import { memoryRoot } from "../src/memory/doctrine";
@@ -631,7 +631,13 @@ test("ops.redeliver requeues expired rows by id or since and immediately publish
 	});
 	await waitFrame(client.frames, "unknown-redelivery");
 	expect(client.frames.find((frame) => frame.id === "unknown-redelivery").error.code).toBe("invalid_params");
-	client.send({ v: PROFILE_VERSION, type: "request", id: "bad-since", verb: "ops.redeliver", params: { since: "not-a-time" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "bad-since",
+		verb: "ops.redeliver",
+		params: { since: "not-a-time" },
+	});
 	await waitFrame(client.frames, "bad-since");
 	expect(client.frames.find((frame) => frame.id === "bad-since").error.code).toBe("invalid_params");
 	client.close();
@@ -1616,7 +1622,8 @@ test("group turns name the [SILENT] mechanism but never rule on whether the pers
 	for (let attempt = 0; attempt < 400 && preambles.length === 0; attempt++) await Bun.sleep(5);
 	await waitFrame(client.frames, "listen");
 	expect(client.frames.find((frame) => frame.id === "listen")).toMatchObject({
-		type: "response", result: { engaged: true },
+		type: "response",
+		result: { engaged: true },
 	});
 	// Speaking or not is the persona's call from its own rules/memory; the runtime
 	// only tells it how to stay quiet (live: the old "NOT addressed" stamp silenced
@@ -1672,7 +1679,8 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 	const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
 	expect(messages).toHaveLength(3);
 	expect(client.frames.find((frame) => frame.id === "dm")).toMatchObject({
-		type: "response", result: { engaged: true },
+		type: "response",
+		result: { engaged: true },
 	});
 	expect(messages[0].payload).toMatchObject({
 		text: "threaded answer",
@@ -1688,9 +1696,13 @@ test("[REPLY:id] parts thread to the referenced message and strip the directive"
 test("generic Discord discovery preserves ordinary DM replies beside corrupt and forged permanent mappings", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
-		schemaVersion: 1, home: directory,
-		configPath: join(directory, "config.json"), socketPath: join(directory, "gateway.sock"),
-		dbPath: join(directory, "gateway.db"), logVerbosity: "info", dmPolicy: "open",
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "d-owner", peerId: "42" } },
 	};
 	const database = await GatewayDatabase.open(config.dbPath);
@@ -1714,64 +1726,97 @@ test("generic Discord discovery preserves ordinary DM replies beside corrupt and
 		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 		await waitFor(client.frames, 1);
 		const thread: OriginRef = {
-			platform: "discord", kind: "thread", conversationId: "1556589606403842128",
-			parentId: "1511673764574793798", boundaryId: "1510336487894286436",
+			platform: "discord",
+			kind: "thread",
+			conversationId: "1556589606403842128",
+			parentId: "1511673764574793798",
+			boundaryId: "1510336487894286436",
 		};
 		const taskId = crypto.randomUUID();
 		const task = database.workTaskCreate({
-			taskId, opRef: "gw-persona-discovery-regression",
+			taskId,
+			opRef: "gw-persona-discovery-regression",
 			request: {
-				text: "Inspect without execution", kind: "read_only", cwd: directory,
-				coordinator: LOOPBACK_ORIGIN, surface: { thread },
-				evidence: { principalId: "owner:42", origin: thread, eventId: "assignment",
-					editId: null, evidenceAt: "2026-10-06T00:00:00.000Z", observedAt: "2026-10-06T00:00:00.000Z" },
+				text: "Inspect without execution",
+				kind: "read_only",
+				cwd: directory,
+				coordinator: LOOPBACK_ORIGIN,
+				surface: { thread },
+				evidence: {
+					principalId: "owner:42",
+					origin: thread,
+					eventId: "assignment",
+					editId: null,
+					evidenceAt: "2026-10-06T00:00:00.000Z",
+					observedAt: "2026-10-06T00:00:00.000Z",
+				},
 			},
 		}).record;
-		database.withTransaction(() => database.workTaskSurfaceInTransaction(taskId, task.version,
-			{ phase: "bound", thread, claimId: null, at: "2026-10-06T00:00:00.000Z" }));
+		database.withTransaction(() =>
+			database.workTaskSurfaceInTransaction(taskId, task.version, {
+				phase: "bound",
+				thread,
+				claimId: null,
+				at: "2026-10-06T00:00:00.000Z",
+			}),
+		);
 		const params = {
-			origin: thread, text: "Do not run a persona", messageId: "1544704223634260038",
+			origin: thread,
+			text: "Do not run a persona",
+			messageId: "1544704223634260038",
 			engagement: { mentioned: true, group: true, authorId: "42" },
 		};
 		const forgedOrigins: OriginRef[] = [
-			{ ...thread, parentId: "999" }, { ...thread, boundaryId: "999" },
+			{ ...thread, parentId: "999" },
+			{ ...thread, boundaryId: "999" },
 			{ platform: "discord", kind: "channel", conversationId: thread.conversationId },
 			{ platform: "discord", kind: "dm", conversationId: thread.conversationId, peerId: "42" },
 		];
 		for (const [index, origin] of forgedOrigins.entries()) {
-			expect(await chatRequest(client, `forged-${index}`, "chat.send", { ...params, origin }))
-				.toMatchObject({ type: "error", error: { code: "invalid_params" } });
+			expect(await chatRequest(client, `forged-${index}`, "chat.send", { ...params, origin })).toMatchObject({
+				type: "error",
+				error: { code: "invalid_params" },
+			});
 		}
 		for (const [index, engagement] of [
 			{ ...params.engagement, authorId: "43" },
 			{ ...params.engagement, authorIsBot: true },
 		].entries()) {
-			expect(await chatRequest(client, `unauthorized-${index}`, "chat.send", { ...params, engagement }))
-				.toMatchObject({ type: "error", error: { code: "unauthorized" } });
+			expect(await chatRequest(client, `unauthorized-${index}`, "chat.send", { ...params, engagement })).toMatchObject({
+				type: "error",
+				error: { code: "unauthorized" },
+			});
 		}
-		expect(await chatRequest(client, "forged-source", "chat.send",
-			{ ...params, originSource: { platformCreatedAt: 0 } }))
-			.toMatchObject({ type: "error", error: { code: "invalid_params" } });
+		expect(
+			await chatRequest(client, "forged-source", "chat.send", { ...params, originSource: { platformCreatedAt: 0 } }),
+		).toMatchObject({ type: "error", error: { code: "invalid_params" } });
 		for (const conversationId of [thread.conversationId, "retained-thread"]) {
 			// Deliberately corrupt storage through the fixture connection only.
 			raw.exec("PRAGMA ignore_check_constraints = ON");
 			try {
-				raw.query("UPDATE work_tasks SET thread_origin_key = ?, record_json = '{broken' WHERE task_id = ?")
+				raw
+					.query("UPDATE work_tasks SET thread_origin_key = ?, record_json = '{broken' WHERE task_id = ?")
 					.run(originKey({ ...thread, conversationId }), taskId);
 			} finally {
 				raw.exec("PRAGMA ignore_check_constraints = OFF");
 			}
 			for (const verb of ["chat.send", "chat.edit"] as const) {
-				expect(await chatRequest(client, `corrupt-${conversationId}-${verb}`, verb,
-					{ ...params, origin: { ...thread, conversationId } }))
-					.toMatchObject({ type: "error", error: { code: "verb_failed" } });
+				expect(
+					await chatRequest(client, `corrupt-${conversationId}-${verb}`, verb, {
+						...params,
+						origin: { ...thread, conversationId },
+					}),
+				).toMatchObject({ type: "error", error: { code: "verb_failed" } });
 			}
 		}
 		// Invalid generic segments still fail at ingress, not at task discovery.
 		for (const [index, conversationId] of ["", "1/parent=2", "1%"].entries()) {
-			expect(await chatRequest(client, `invalid-segment-${index}`, "chat.send",
-				{ ...params, origin: { platform: "discord", kind: "dm", conversationId, peerId: "42" } }))
-				.toMatchObject({ type: "error" });
+			expect(
+				await chatRequest(client, `invalid-segment-${index}`, "chat.send", {
+					...params,
+					origin: { platform: "discord", kind: "dm", conversationId, peerId: "42" },
+				}),
+			).toMatchObject({ type: "error" });
 		}
 		expect(binds).toEqual([]);
 		expect(prompts).toEqual([]);
@@ -1782,13 +1827,17 @@ test("generic Discord discovery preserves ordinary DM replies beside corrupt and
 		// Both accepted generic and canonical unmapped IDs must reach the persona,
 		// even while an independently corrupt permanent mapping remains retained.
 		for (const [index, conversationId] of ["c1", "1556589606403842999"].entries()) {
-			expect(await chatRequest(client, `ordinary-${index}`, "chat.send", {
-				origin: { platform: "discord", kind: "dm", conversationId, peerId: "42" },
-				text: `ordinary ${index}`, messageId: `ordinary-message-${index}`,
-				engagement: { mentioned: false, group: false, authorId: "42" },
-			})).toMatchObject({ type: "response", result: { engaged: true } });
+			expect(
+				await chatRequest(client, `ordinary-${index}`, "chat.send", {
+					origin: { platform: "discord", kind: "dm", conversationId, peerId: "42" },
+					text: `ordinary ${index}`,
+					messageId: `ordinary-message-${index}`,
+					engagement: { mentioned: false, group: false, authorId: "42" },
+				}),
+			).toMatchObject({ type: "response", result: { engaged: true } });
 			for (let attempt = 0; attempt < 400; attempt++) {
-				if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length > index) break;
+				if (client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message").length > index)
+					break;
 				await Bun.sleep(5);
 			}
 			const messages = client.frames.filter((frame) => frame.type === "event" && frame.event === "chat.message");
@@ -1894,7 +1943,13 @@ test("work.run runs a named worker session in the requested cwd and returns the 
 	});
 	expect(sessionPort.sends[0]).toMatchObject({ text: "fix the bug", repo: "/tmp/some-repo", codingRegister: true });
 	// Invalid names are rejected before touching the SessionPort.
-	client.send({ v: PROFILE_VERSION, type: "request", id: "bad", verb: "work.run", params: { name: "../evil", text: "x" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "bad",
+		verb: "work.run",
+		params: { name: "../evil", text: "x" },
+	});
 	await waitFor(client.frames, 3);
 	expect(client.frames.find((frame) => frame.type === "error" && frame.id === "bad")).toBeDefined();
 	client.close();
@@ -2105,7 +2160,13 @@ test("a stalled durable job holds the next work.run until resume (production pat
 	const client = await connect(config.socketPath);
 	client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
 	await waitFor(client.frames, 1);
-	client.send({ v: PROFILE_VERSION, type: "request", id: "w", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "w",
+		verb: "work.run",
+		params: { name: "stall-out", text: "x" },
+	});
 	await waitFor(client.frames, 2);
 	expect(client.frames.find((frame) => frame.type === "response" && frame.id === "w")).toBeDefined();
 	// Simulate the reconciliation outcome after repeated stalled continuations.
@@ -2121,7 +2182,13 @@ test("a stalled durable job holds the next work.run until resume (production pat
 		lane: first.lane,
 		json: JSON.stringify({ ...first, state: "stalled", stalledContinuations: MAX_STALLED_CONTINUATIONS }),
 	});
-	client.send({ v: PROFILE_VERSION, type: "request", id: "w2", verb: "work.run", params: { name: "stall-out", text: "x" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "w2",
+		verb: "work.run",
+		params: { name: "stall-out", text: "x" },
+	});
 	async function waitId2(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -2175,7 +2242,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	const jobId = `lanejob-${Buffer.from("stall-clear", "utf8").toString("hex")}`;
 
 	// First run succeeds (creates the job).
-	client.send({ v: PROFILE_VERSION, type: "request", id: "w1", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "w1",
+		verb: "work.run",
+		params: { name: "stall-clear", text: "x" },
+	});
 	async function waitId3(id: string): Promise<void> {
 		for (let attempt = 0; attempt < 400 && !client.frames.some((f) => f.id === id && f.type !== undefined); attempt++)
 			await Bun.sleep(5);
@@ -2195,7 +2268,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	});
 
 	// Ordinary call: held.
-	client.send({ v: PROFILE_VERSION, type: "request", id: "w2", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "w2",
+		verb: "work.run",
+		params: { name: "stall-clear", text: "x" },
+	});
 	await waitId3("w2");
 	expect(client.frames.find((frame) => frame.id === "w2" && frame.type === "response")?.result).toMatchObject({
 		held: true,
@@ -2221,7 +2300,13 @@ test("resuming a stalled job clears the hold durably: the next ordinary call is 
 	expect(afterResume.escalations.some((entry) => entry.includes("operator resume acknowledged"))).toBe(true);
 
 	// The NEXT ordinary call is not held by the old stalled state.
-	client.send({ v: PROFILE_VERSION, type: "request", id: "w4", verb: "work.run", params: { name: "stall-clear", text: "x" } });
+	client.send({
+		v: PROFILE_VERSION,
+		type: "request",
+		id: "w4",
+		verb: "work.run",
+		params: { name: "stall-clear", text: "x" },
+	});
 	await waitId3("w4");
 	expect(client.frames.find((frame) => frame.id === "w4" && frame.type === "response")?.result).toMatchObject({
 		held: false,
@@ -2829,7 +2914,13 @@ for (const verb of ["work.start", "work.run"] as const) {
 	test(`session.list preserves fresh ${verb} worker identity before and after settlement`, async () => {
 		const f = await workSocketFixture();
 		const name = "identity-worker";
-		f.client.send({ v: PROFILE_VERSION, type: "request", id: "worker", verb, params: { name, text: "work", cwd: directory } });
+		f.client.send({
+			v: PROFILE_VERSION,
+			type: "request",
+			id: "worker",
+			verb,
+			params: { name, text: "work", cwd: directory },
+		});
 		for (let i = 0; i < 600 && f.port.sends.length === 0; i++) await Bun.sleep(5);
 		expect(f.port.sends).toHaveLength(1);
 		const opRef = f.port.sends[0]!.opRef;

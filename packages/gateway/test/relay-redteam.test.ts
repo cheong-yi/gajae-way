@@ -376,10 +376,14 @@ for (const accepts of [true, false]) {
 
 test("RT08 client_ref_conflict is typed and actor queries status without resending", async () => {
 	const host = new Host((frame, stream) =>
-		stream.answer(frame, {}, {
-			code: "client_ref_conflict",
-			message: "A submission with this clientRef is already retained; never reuse a clientRef for retry.",
-		}),
+		stream.answer(
+			frame,
+			{},
+			{
+				code: "client_ref_conflict",
+				message: "A submission with this clientRef is already retained; never reuse a clientRef for retry.",
+			},
+		),
 	);
 	const real = await broker(host);
 	await expect(real.port.send(real.input)).rejects.toMatchObject({

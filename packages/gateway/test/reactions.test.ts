@@ -294,7 +294,8 @@ test("engagement.reaction rejects a missing target, a bad action and a loopback 
 		],
 		["e4", { origin: ORIGIN, targetMessageId: "m1", emoji: "👍", action: "add" }],
 	];
-	for (const [id, params] of cases) client.send({ v: PROFILE_VERSION, type: "request", id, verb: "engagement.reaction", params });
+	for (const [id, params] of cases)
+		client.send({ v: PROFILE_VERSION, type: "request", id, verb: "engagement.reaction", params });
 	await settle();
 	for (const [id] of cases) {
 		const error = client.frames.find((frame) => frame.type === "error" && frame.id === id);

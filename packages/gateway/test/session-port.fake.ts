@@ -293,7 +293,10 @@ export class ScriptedSessionPort implements SessionPort {
 			const details = error instanceof GjcCliError ? error.details : undefined;
 			if (typeof details === "object" && details !== null && "refused" in details && details.refused === true) {
 				this.#steerStatuses.set(key, {
-					status: "rejected", clientRef: input.clientRef, acceptedAt, terminalAt: Date.now(),
+					status: "rejected",
+					clientRef: input.clientRef,
+					acceptedAt,
+					terminalAt: Date.now(),
 					...("code" in details && typeof details.code === "string" ? { errorCode: details.code } : {}),
 				});
 			}

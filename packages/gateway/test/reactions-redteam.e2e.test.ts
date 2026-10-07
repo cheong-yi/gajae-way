@@ -21,8 +21,8 @@ import { join } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilenceToken,
-	parseReactionReply,
 	PROFILE_VERSION,
+	parseReactionReply,
 	REACTION_ALLOWLIST,
 	REACTIONS_PER_MESSAGE_CAP,
 	REACTIONS_PER_TURN_CAP,

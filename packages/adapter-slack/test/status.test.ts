@@ -35,8 +35,9 @@ function fixture() {
 	const removes: string[] = [];
 	const posts: unknown[] = [];
 	const statuses: string[] = [];
+	const statusTimes: number[] = [];
 	const errors: string[] = [];
-	const timers = new Set<{ fn: () => void; ms: number }>();
+	const timers = new Set<{ fn: () => void; ms: number; due: number }>();
 	let statusFailure: Error | undefined;
 	const api = {
 		async addReaction(channel: string, ts: string, name: string) {
@@ -48,6 +49,7 @@ function fixture() {
 		async setThreadStatus(channel: string, threadTs: string, status: string) {
 			if (statusFailure) throw statusFailure;
 			statuses.push(`${channel}:${threadTs}:${status}`);
+			statusTimes.push(clock);
 		},
 		async postMessage(channel: string, text: string, threadTs?: string) {
 			posts.push([channel, text, threadTs]);
@@ -58,12 +60,12 @@ function fixture() {
 		api,
 		{ error: (text: string) => errors.push(text) },
 		(fn, ms) => {
-			const timer = { fn, ms, unref() {} };
+			const timer = { fn, ms, due: clock + ms, unref() {} };
 			timers.add(timer);
 			return timer;
 		},
 		(timer) => {
-			timers.delete(timer as { fn: () => void; ms: number });
+			timers.delete(timer as { fn: () => void; ms: number; due: number });
 		},
 		() => clock,
 	);
@@ -74,10 +76,24 @@ function fixture() {
 		removes,
 		posts,
 		statuses,
+		statusTimes,
 		errors,
 		timers,
 		tick(ms: number) {
 			clock += ms;
+		},
+		async advance(ms: number) {
+			const end = clock + ms;
+			for (;;) {
+				const next = [...timers].filter((timer) => timer.due <= end).sort((a, b) => a.due - b.due)[0];
+				if (!next) break;
+				clock = next.due;
+				timers.delete(next);
+				next.fn();
+				await flush();
+			}
+			clock = end;
+			await flush();
 		},
 		failStatus(error: Error | undefined) {
 			statusFailure = error;
@@ -509,6 +525,77 @@ test("Slack presence: a change arriving during the last pass is still applied", 
 	expect(names(f.removes)).toEqual(["hourglass_flowing_sand"]);
 	await f.status.clear("C1");
 });
+
+test("Slack presence: unchanged 10s heartbeats cannot postpone native status refresh", async () => {
+	const f = fixture();
+	f.status.arm(origin, "C1:1.000");
+	await flush();
+	await f.advance(20_000);
+	await f.status.update(progress({ elapsedMs: 720_000, activity: { kind: "tool", label: "bash" } }));
+	const stableStatus = f.statuses.at(-1);
+	const start = f.statuses.length;
+	// Five minutes exceeds two native expiry windows; clock and effort stay capped/stable.
+	for (let elapsed = 10_000; elapsed <= 300_000; elapsed += 10_000) {
+		await f.advance(10_000);
+		await f.status.update(progress({ elapsedMs: 720_000 + elapsed, activity: { kind: "tool", label: "bash" } }));
+	}
+	expect(f.statusTimes.slice(start)).toEqual([45_000, 90_000, 135_000, 180_000, 225_000, 270_000, 315_000]);
+	expect(f.statuses.slice(start)).toEqual(Array(7).fill(stableStatus));
+	await f.status.clear("C1");
+	const cleared = f.statuses.length;
+	await f.advance(180_000);
+	expect(f.statuses.length).toBe(cleared);
+	expect(f.statuses.at(-1)).toBe("C1:1.000:");
+});
+
+for (const retirement of ["clear", "replacement", "same-message"] as const) {
+	test(`Slack presence: in-flight refresh cannot reclaim ownership after ${retirement}`, async () => {
+		const f = fixture();
+		f.status.arm(origin, "C1:1.000");
+		await flush();
+		const oldTimer = [...f.timers].find((timer) => timer.ms === WORKING_STATUS_REFRESH_MS);
+		expect(oldTimer).toBeDefined();
+		const setStatus = f.api.setThreadStatus;
+		let release!: () => void;
+		let blocked = false;
+		f.api.setThreadStatus = async (channel, threadTs, status) => {
+			await setStatus(channel, threadTs, status);
+			if (!blocked && status) {
+				blocked = true;
+				await new Promise<void>((resolve) => (release = resolve));
+			}
+		};
+		await f.advance(45_000);
+		expect(blocked).toBe(true);
+		await f.advance(5_000);
+		if (retirement === "clear") await f.status.clear("C1");
+		else f.status.arm(origin, retirement === "replacement" ? "C1:2.000" : "C1:1.000");
+		await flush();
+		// Complete the obsolete callback after the new owner's timer is already armed.
+		await f.advance(5_000);
+		release();
+		await flush();
+		const settled = f.statuses.length;
+		// Even an already queued callback from the old timer must be inert.
+		await oldTimer?.fn();
+		await flush();
+		expect(f.statuses.length).toBe(settled);
+		await f.advance(40_000);
+		if (retirement === "clear") {
+			expect(f.statuses.length).toBe(settled);
+			expect(f.statuses.at(-1)).toBe("C1:1.000:");
+		} else {
+			expect(f.statuses.length).toBe(settled + 1);
+			expect(f.statusTimes.at(-1)).toBe(95_000);
+			const target = retirement === "replacement" ? "2.000" : "1.000";
+			expect(f.statuses.at(-1)).toBe(`C1:${target}:${presenceStatusText({ phase: "queued", clock: 0, effort: -1 })}`);
+		}
+		await f.status.clear("C1");
+		const cleared = f.statuses.length;
+		await f.advance(180_000);
+		expect(f.statuses.length).toBe(cleared);
+	});
+}
 
 test("Slack presence: periodic refresh keeps status alive across multiple turns", async () => {
 	const f = fixture();
