@@ -13,7 +13,9 @@ import {
 	encodeFrame,
 	type Frame,
 	FrameDecoder,
+	type FrameWriterSink,
 	LOOPBACK_ORIGIN,
+	OrderedFrameWriter,
 	type OriginRef,
 	PROFILE_VERSION,
 	ProtocolError,
@@ -42,7 +44,7 @@ export function processStartedAt(): string {
 }
 
 interface Transport {
-	write(data: string): Promise<void>;
+	write(frame: Frame): Promise<void>;
 	close(): void | Promise<void>;
 }
 
@@ -55,6 +57,12 @@ interface Pending {
 export class GajaewayClient {
 	static async connectSocket(path: string, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
+		const decoder = new TextDecoder();
+		const socketSink: FrameWriterSink = {
+			write: (_bytes: Uint8Array) => 0,
+			close: () => {},
+		};
+		let writer: OrderedFrameWriter;
 		const signal = options?.signal;
 		if (signal?.aborted) throw new Error("client connection aborted");
 		let rejectAbort!: (reason: Error) => void;
@@ -72,15 +80,24 @@ export class GajaewayClient {
 		const connecting = Bun.connect<undefined>({
 			unix: path,
 			socket: {
-				open() {},
+				open(socket) {
+					socketSink.write = (bytes: Uint8Array) => socket.write(bytes);
+					socketSink.close = () => socket.end();
+					writer = new OrderedFrameWriter(socketSink, (error) => {
+						client.#fail(error as Error);
+					});
+				},
 				data(_socket, data) {
-					client.#receive(new TextDecoder().decode(data));
+					client.#receive(decoder.decode(data, { stream: true }));
 				},
 				close() {
 					client.#fail(new Error("gateway connection closed"));
 				},
 				error(_socket, error) {
 					client.#fail(error);
+				},
+				drain(_socket) {
+					writer?.drain();
 				},
 			},
 		});
@@ -97,11 +114,12 @@ export class GajaewayClient {
 			throw error;
 		}
 		client.#transport = {
-			write: async (data) => {
-				socket.write(data);
+			write: async (frame) => {
+				writer.write(frame);
+				await writer.settled();
 			},
 			close: () => {
-				socket.end();
+				writer?.close();
 			},
 		};
 		if (client.#disconnectError) {
@@ -124,7 +142,8 @@ export class GajaewayClient {
 	static async connectStdio(transport: StdioTransport, options?: GajaewayClientOptions): Promise<GajaewayClient> {
 		const client = new GajaewayClient(undefined, options);
 		client.#transport = {
-			write: async (data) => {
+			write: async (frame) => {
+				const data = encodeFrame(frame);
 				const writable = transport.writable;
 				if ("getWriter" in writable) {
 					const writer = writable.getWriter();
@@ -206,7 +225,8 @@ export class GajaewayClient {
 		const transport = this.#transport;
 		if (!transport) throw new Error("client is not connected");
 		const id = `${++this.#id}`;
-		const encoded = encodeFrame({ v: PROFILE_VERSION, type: "request", id, verb, params });
+		const frame: Frame = { v: PROFILE_VERSION, type: "request", id, verb, params };
+		encodeFrame(frame);
 		const promise = new Promise<T>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				this.#pending.delete(id);
@@ -215,7 +235,7 @@ export class GajaewayClient {
 			this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
 		});
 		try {
-			await transport.write(encoded);
+			await transport.write(frame);
 		} catch (error) {
 			this.#fail(error instanceof Error ? error : new Error(String(error)));
 		}
@@ -278,24 +298,24 @@ export class GajaewayClient {
 				this.#fail(new Error(`gateway negotiation timed out after ${this.#requestTimeoutMs}ms`));
 			}, this.#requestTimeoutMs);
 			void transport
-				.write(
-					encodeFrame({
+				.write({
 						v: PROFILE_VERSION,
 						type: "hello",
 						payload: {
 							supportedVersions: [PROFILE_VERSION],
 							clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
 						},
-					}),
-				)
+					})
 				.catch((error) => this.#fail(error instanceof Error ? error : new Error(String(error))));
 		});
 		return this.#negotiated;
 	}
 
 	async #readStdio(readable: StdioTransport["readable"]): Promise<void> {
+		const decoder = new TextDecoder();
 		try {
-			for await (const chunk of readable as AsyncIterable<Uint8Array>) this.#receive(new TextDecoder().decode(chunk));
+			for await (const chunk of readable as AsyncIterable<Uint8Array>)
+				this.#receive(decoder.decode(chunk, { stream: true }));
 			this.#fail(new Error("gateway connection closed"));
 		} catch (error) {
 			this.#fail(error instanceof Error ? error : new Error(String(error)));
@@ -326,7 +346,13 @@ export class GajaewayClient {
 						this.#pending.delete(frame.id);
 						pending.reject(error);
 					}
-				} else this.#emit("__negotiation_error", error, frame);
+				} else {
+					if (error.code === "malformed_frame" || error.code === "payload_too_large") {
+						this.#fail(error);
+					} else {
+						this.#emit("__negotiation_error", error, frame);
+					}
+				}
 				continue;
 			}
 			if (frame.type === "response") {

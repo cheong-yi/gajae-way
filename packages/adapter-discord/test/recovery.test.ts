@@ -1562,3 +1562,32 @@ test("accepted thread follow-ups arm presence and typing while overheard channel
 	expect(armed).toHaveLength(4);
 	expect(began).toHaveLength(4);
 });
+
+test("a channel mention answered in a new thread types in the thread and arms presence on the parent message", async () => {
+	const cursorPath = join(home, "typing-new-thread", "recovery-cursor.json");
+	const began: string[] = [];
+	const armed: unknown[][] = [];
+	const typing = { begin: (id: string) => void began.push(id), refresh: () => {}, end: () => {} };
+	const status = { arm: (...args: unknown[]) => void armed.push(args) };
+	const gateway = recoveryGateway(
+		"socket",
+		{ channels: { fetch: async () => fakeChannel([]) } },
+		{ tokenFile: "token", token: "redacted", configPath: "config", channels: { "channel-1": {} } } as never,
+		typing,
+		status as never,
+		cursorPath,
+		() => bot,
+		{ request: async () => ({ engaged: true }), onChatMessage: () => () => {} } as never,
+		async () => {},
+	);
+	const threadOrigin = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "thread-1",
+		parentId: "channel-1",
+	} as const;
+	const engagement = { group: true, mentioned: true, authorId: "u" } as never;
+	await gateway.requestInbound("m-1", threadOrigin, "<@bot> hey", engagement, undefined, undefined, undefined, "channel-1");
+	expect(began).toEqual(["thread-1"]);
+	expect(armed).toEqual([["thread-1", "m-1", engagement, "channel-1"]]);
+});

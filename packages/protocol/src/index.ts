@@ -159,6 +159,7 @@ export {
 	ProtocolError,
 	type ProtocolErrorPayload,
 } from "./errors";
+export { type FrameWriterSink, OrderedFrameWriter, type OrderedFrameWriterOptions } from "./frame-writer";
 export {
 	decodeFrame,
 	type ErrorFrame,

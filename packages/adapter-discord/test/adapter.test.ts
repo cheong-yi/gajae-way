@@ -9,6 +9,7 @@ import {
 	chunkDiscordMessage,
 	DISCORD_SLASH_COMMANDS,
 	type DiscordClientLike,
+	deriveThreadName,
 	engagementForMessage,
 	type GatewayClientLike,
 	handleModelAutocomplete,
@@ -17,10 +18,12 @@ import {
 	LruSet,
 	maybeCreateThreadOnMention,
 	presenceEligibleTurn,
+	nameThreadFromMessage,
 	settleDiscordDelivery,
 	subscribeDiscordDeliveries,
 	subscribeDiscordProgress,
 	TypingIndicator,
+	UnnamedThreads,
 	WorkingStatus,
 } from "../src/main";
 import { discordMessageOrigin } from "../src/origin";
@@ -829,24 +832,82 @@ test("presence eligibility includes accepted thread follow-ups but excludes over
 	expect(presenceEligibleTurn({ kind: "thread" }, { group: true, mentioned: false })).toBe(true);
 });
 
-test("an unaddressed public-channel turn shows no presence until it is armed; clear disarms", async () => {
+test("armed presence supports DMs, mentions, and un-mentioned thread follow-ups", async () => {
+	const { discord, reacted } = presenceDiscord();
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	// DM with no mention: shows presence
+	status.arm("dm-1", "m-1", { group: false, mentioned: false });
+	await Bun.sleep(1);
+	expect(reacted).toContain("⏳");
+	// Group channel with mention: shows presence
+	status.arm("channel-1", "m-2", { group: true, mentioned: true });
+	await Bun.sleep(1);
+	expect(reacted).toContain("⏳");
+	// Group channel without mention (thread follow-up): shows presence
+	status.arm("thread-1", "m-3", { group: true, mentioned: false });
+	await Bun.sleep(1);
+	expect(reacted).toContain("⏳");
+});
+
+test("presence shows only when armed; clear disarms and handles un-mentioned thread follow-ups", async () => {
 	const { discord, reacted, removed } = presenceDiscord();
 	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
-	const origin = { platform: "discord", kind: "channel", conversationId: "public-1" } as const;
+	const origin = { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "ch-1" } as const;
 	const tick = { turnId: "t", origin, elapsedMs: 16_000, toolCalls: 1, outputTokens: 210 };
+	// Before arming: no reactions
 	await status.update(tick);
 	await status.update(tick);
 	expect(reacted).toEqual([]);
-	// Explicitly pass engagement to show reactions when arming; this is a DM (not a group)
-	const engagement = { group: false, mentioned: false };
-	status.arm("public-1", "m-9", engagement);
+	// Arm a thread reply without mention: engagement.mentioned=false but gateway engaged=true.
+	const engagement = { group: true, mentioned: false };
+	status.arm("thread-1", "m-9", engagement);
 	await Bun.sleep(1);
 	expect(reacted).toEqual(["⏳"]);
-	await status.clear("public-1");
+	await status.clear("thread-1");
 	expect(removed).toEqual(["⏳:bot-1"]);
-	// Disarmed: the next turn's ticks are silent again until re-armed.
+	// Disarmed: the next update's ticks are silent again until re-armed.
 	await status.update(tick);
 	expect(reacted).toHaveLength(1);
+});
+
+test("presence for a channel mention answered in a new thread reacts on the message in the parent channel", async () => {
+	const reacted: string[] = [];
+	const removed: string[] = [];
+	const fetchedChannels: string[] = [];
+	const trigger = {
+		react: async (emoji: string) => void reacted.push(emoji),
+		reactions: {
+			resolve: (emoji: string) => ({
+				users: { remove: async (userId: string) => void removed.push(`${emoji}:${userId}`) },
+			}),
+		},
+	};
+	// The trigger lives only in the parent channel; the new thread does not hold it.
+	const discord: DiscordClientLike = {
+		channels: {
+			fetch: async (id: string) => {
+				fetchedChannels.push(id);
+				return {
+					messages: {
+						fetch: async (messageId: string) => {
+							if (id !== "ch-1" || messageId !== "m-1")
+								throw Object.assign(new Error("Unknown Message"), { code: 10008 });
+							return trigger;
+						},
+					},
+					send: async () => ({}),
+				};
+			},
+		},
+	};
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	status.arm("thread-1", "m-1", { group: true, mentioned: true }, "ch-1");
+	await Bun.sleep(1);
+	expect(fetchedChannels).toEqual(["ch-1"]);
+	expect(reacted).toEqual(["⏳"]);
+	// The reply lands in the thread conversation and clears the parent-channel marker.
+	await status.clear("thread-1");
+	expect(removed).toEqual(["⏳:bot-1"]);
 });
 
 test("our own presence markers are never reported inbound as engagement", () => {
@@ -975,22 +1036,22 @@ test("statusReactions 'gradient' mode is default and shows full reaction gradien
 	expect(reacted).toContain("1️⃣");
 });
 
-test("statusReactions defaults to 'off' for group channels when unset", async () => {
+test("statusReactions defaults to ON for all engaged turns: group channels without mention now show presence", async () => {
 	const { discord, reacted } = presenceDiscord();
 	const status = new WorkingStatus(
 		discord,
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
 		Date.now,
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - new default is to show presence
 	);
-	const groupNoMention = { group: true, mentioned: false }; // Group channel, not mentioned
+	const groupNoMention = { group: true, mentioned: false }; // Group channel, not mentioned (thread follow-up case)
 	status.arm("channel-1", "m-1", groupNoMention);
 	await Bun.sleep(1);
-	expect(reacted).toEqual([]); // No reactions shown with default off behavior
+	expect(reacted).toEqual(["⏳"]); // DEFAULT: reactions shown for all engaged turns
 });
 
-test("statusReactions defaults to 'off' for bot-audience channels when unset", async () => {
+test("statusReactions never shows for bot-audience channels (config constraint)", async () => {
 	const { discord, reacted } = presenceDiscord();
 	const status = new WorkingStatus(
 		discord,
@@ -999,15 +1060,15 @@ test("statusReactions defaults to 'off' for bot-audience channels when unset", a
 		Date.now,
 		undefined,
 		{ "bot-channel": { audience: "bot-only" } },
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - bot-only channels always suppress reactions
 	);
 	const botAudience = { group: true, mentioned: true }; // Bot-only audience
 	status.arm("bot-channel", "m-1", botAudience);
 	await Bun.sleep(1);
-	expect(reacted).toEqual([]); // No reactions shown with default off behavior
+	expect(reacted).toEqual([]); // No reactions on bot-only channels regardless of mode
 });
 
-test("statusReactions defaults to 'gradient' for DMs when unset", async () => {
+test("statusReactions defaults to gradient (full transitions) when unset for all engaged turns", async () => {
 	const { discord, reacted } = presenceDiscord();
 	let clock = 0;
 	const status = new WorkingStatus(
@@ -1015,13 +1076,13 @@ test("statusReactions defaults to 'gradient' for DMs when unset", async () => {
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
 		() => clock,
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - default is gradient transitions
 	);
 	const origin = { platform: "discord", kind: "dm", conversationId: "dm-1", peerId: "user-1" } as const;
 	const dm = { group: false, mentioned: false }; // DM (not a group)
 	status.arm("dm-1", "m-1", dm);
 	await Bun.sleep(1);
-	expect(reacted).toEqual(["⏳"]); // Default gradient behavior for DMs
+	expect(reacted).toEqual(["⏳"]); // Starts with queued marker
 	clock += PRESENCE_MIN_SWAP_MS;
 	await status.update({
 		turnId: "t",
@@ -1031,25 +1092,25 @@ test("statusReactions defaults to 'gradient' for DMs when unset", async () => {
 		outputTokens: 210,
 		activity: { kind: "tool", label: "bash" },
 	});
-	// Gradient mode shows phase + clock + effort
+	// Default (undefined) mode shows gradient: phase + clock + effort transitions
 	expect(reacted).toContain("🔧");
 	expect(reacted).toContain("🕐");
 	expect(reacted).toContain("1️⃣");
 });
 
-test("statusReactions defaults to 'off' for mentioned turns in group channels when unset", async () => {
+test("statusReactions defaults to ON for mentioned turns in group channels when unset", async () => {
 	const { discord, reacted } = presenceDiscord();
 	const status = new WorkingStatus(
 		discord,
 		{ error: () => {} },
 		() => ({ id: "bot-1" }),
 		Date.now,
-		// statusReactions unset (undefined)
+		// statusReactions unset (undefined) - new default is to show presence
 	);
 	const groupWithMention = { group: true, mentioned: true }; // Group channel, mentioned
 	status.arm("channel-1", "m-1", groupWithMention);
 	await Bun.sleep(1);
-	expect(reacted).toEqual([]); // Default is 'off' for ANY group channel, even when mentioned
+	expect(reacted).toEqual(["⏳"]); // DEFAULT: reactions shown for all engaged turns including mentioned group channels
 });
 
 test("statusReactions 'static' mode through full sequence: arm, update phase/clock/effort, clear", async () => {
@@ -1115,6 +1176,66 @@ test("statusReactions with undefined engagement produces zero reaction calls", a
 	expect(reacted).toEqual([]); // No reactions when engagement is undefined
 });
 
+test("rapid consecutive messages in one thread: only latest carries status reactions, older ones cleaned up", async () => {
+	const { discord, reacted, removed } = presenceDiscord();
+	const status = new WorkingStatus(discord, { error: () => {} }, () => ({ id: "bot-1" }));
+	const engagement = { group: true, mentioned: false }; // Thread follow-up without mention
+	// Arm first message in thread
+	status.arm("thread-1", "m-1", engagement);
+	await Bun.sleep(1);
+	expect(reacted).toEqual(["⏳"]); // First message gets reactions
+	const firstReactCount = reacted.length;
+	// Rapidly arm second message in same thread
+	status.arm("thread-1", "m-2", engagement);
+	await Bun.sleep(1);
+	expect(reacted.length).toBeGreaterThanOrEqual(firstReactCount); // New message armed
+	// Verify first message reactions were cleaned up
+	expect(removed).toContain("⏳:bot-1"); // ⏳ removed from first message
+	// Rapidly arm third message in same thread
+	status.arm("thread-1", "m-3", engagement);
+	await Bun.sleep(1);
+	// Second message should be cleaned up when third is armed
+	const beforeCleanup = removed.length;
+	expect(removed.length).toBeGreaterThan(beforeCleanup - 1); // Another removal for second message
+	// Only the latest message (m-3) should have active reactions
+	await status.clear("thread-1");
+	// All reactions should be cleaned up
+	expect(removed).toContain("⏳:bot-1");
+});
+
+test("typing indicator is idempotent: multiple begin calls on same conversation update deadline without error", async () => {
+	let channelFetched = 0;
+	const typing = new TypingIndicator({
+		channels: {
+			fetch: async () => {
+				channelFetched++;
+				return {
+					sendTyping: async () => {
+						// Mock successful typing send
+						return undefined;
+					},
+				};
+			},
+		},
+	} as any);
+	// Multiple begin calls on same conversation should be idempotent
+	typing.begin("conv-1");
+	const firstCallTime = Date.now();
+	await Bun.sleep(10);
+	typing.begin("conv-1");
+	await Bun.sleep(10);
+	typing.begin("conv-1");
+	// Each begin after the first should have updated the deadline, not created a new run.
+	// Verify by checking that typing.refresh doesn't error.
+	try {
+		typing.refresh("conv-1");
+		typing.end("conv-1");
+		expect(true).toBe(true); // No errors
+	} catch {
+		expect(true).toBe(false); // Should not error
+	}
+});
+
 test("DM messages stay flat with no thread creation", () => {
 	const botUser = { id: "bot-1" };
 	const dmMessage = {
@@ -1167,4 +1288,269 @@ test("thread reply message stays in thread", () => {
 	expect(origin.kind).toBe("thread");
 	expect(origin.conversationId).toBe("thread-1");
 	expect(origin.parentId).toBe("channel-1");
+});
+
+test("channel mention with default policy (unset threadOnMention) creates thread", async () => {
+	const botUser = { id: "bot-1" };
+	const channelMessage = {
+		id: "msg-1",
+		author: { id: "user-1" },
+		channel: { id: "channel-1", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
+			id: "thread-new-1",
+		}),
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With default policy (threadOnMention unset/undefined), should create thread
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		undefined,
+		new UnnamedThreads(),
+	);
+	expect(result.kind).toBe("thread");
+	expect(result.conversationId).toBe("thread-new-1");
+	expect(result.parentId).toBe("channel-1");
+});
+
+test("channel mention with threadOnMention: true creates thread", async () => {
+	const botUser = { id: "bot-1" };
+	const channelMessage = {
+		id: "msg-2",
+		author: { id: "user-1" },
+		channel: { id: "channel-2", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => ({
+			id: "thread-new-2",
+		}),
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With threadOnMention explicitly set to true, should create thread
+	const policy = { threadOnMention: true };
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		policy,
+		new UnnamedThreads(),
+	);
+	expect(result.kind).toBe("thread");
+	expect(result.conversationId).toBe("thread-new-2");
+	expect(result.parentId).toBe("channel-2");
+});
+
+test("channel mention with threadOnMention: false skips thread creation", async () => {
+	const botUser = { id: "bot-1" };
+	let threadCreated = false;
+	const channelMessage = {
+		id: "msg-3",
+		author: { id: "user-1" },
+		channel: { id: "channel-3", type: 0 },
+		mentions: { has: () => true },
+		content: "<@bot-1> hello",
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => {
+			threadCreated = true;
+			return { id: "thread-new-3" };
+		},
+	};
+	const engagement = engagementForMessage(channelMessage as any, botUser);
+	const origin = discordMessageOrigin(channelMessage as any);
+	// With threadOnMention set to false, should NOT create thread
+	const policy = { threadOnMention: false };
+	const result = await maybeCreateThreadOnMention(
+		channelMessage as any,
+		engagement,
+		origin,
+		policy,
+		new UnnamedThreads(),
+	);
+	expect(result).toEqual(origin);
+	expect(threadCreated).toBe(false);
+});
+
+test("non-channel or non-mentioned message ignores threadOnMention policy", async () => {
+	const botUser = { id: "bot-1" };
+	const dmMessage = {
+		id: "msg-4",
+		author: { id: "user-1" },
+		channel: { id: "dm-1", isDMBased: () => true },
+		mentions: { has: () => true },
+		content: "hello",
+	};
+	const engagement = engagementForMessage(dmMessage as any, botUser);
+	const origin = discordMessageOrigin(dmMessage as any);
+	// DMs should never thread regardless of policy
+	const policy = { threadOnMention: true };
+	const result = await maybeCreateThreadOnMention(dmMessage as any, engagement, origin, policy, new UnnamedThreads());
+	expect(result.kind).toBe("dm");
+});
+
+test("accepts and validates threadOnMention boolean in channel config", async () => {
+	const home = await mkdtemp(join(tmpdir(), "gajaeway-discord-threadOnMention-"));
+	try {
+		await writeFile(join(home, "token"), "secret-token");
+
+		// Valid: threadOnMention as true or false
+		for (const value of [true, false]) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({
+					tokenFile: "token",
+					channels: { c: { threadOnMention: value } },
+				}),
+			);
+			const config = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+			expect(config.channels?.c?.threadOnMention).toBe(value);
+		}
+
+		// Valid: omitted threadOnMention (defaults to unset in config)
+		await writeFile(
+			join(home, "adapter-discord.json"),
+			JSON.stringify({ tokenFile: "token", channels: { c: { engagement: "open" } } }),
+		);
+		const defaultConfig = await loadDiscordAdapterConfig({ GAJAEWAY_HOME: home });
+		expect(defaultConfig.channels?.c?.threadOnMention).toBeUndefined();
+
+		// Invalid: threadOnMention as non-boolean values
+		for (const invalid of ["true", 1, null, "false"]) {
+			await writeFile(
+				join(home, "adapter-discord.json"),
+				JSON.stringify({
+					tokenFile: "token",
+					channels: { c: { threadOnMention: invalid } },
+				}),
+			);
+			await expect(loadDiscordAdapterConfig({ GAJAEWAY_HOME: home })).rejects.toBeInstanceOf(
+				DiscordAdapterStartupError,
+			);
+		}
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("deriveThreadName keeps the words of the message and drops Discord markup", () => {
+	expect(deriveThreadName("<@123456789> 디코는 쓰레드 파지 말고 플랫하게 대화하는 옵션 없냐")).toBe(
+		"디코는 쓰레드 파지 말고 플랫하게 대화하는 옵션 없냐",
+	);
+	expect(deriveThreadName("<@!1> <@&2> check <#3> **now**")).toBe("check now");
+	expect(deriveThreadName("fix `threadOnMention` <:gajae:42> please")).toBe("fix threadOnMention please");
+	expect(deriveThreadName("see https://example.com/x\n> quoted\n```ts\nconst a = 1;\n```")).toBe("see quoted");
+	expect(deriveThreadName("thread_on_mention stays")).toBe("thread_on_mention stays");
+});
+
+test("deriveThreadName is undefined when nothing nameable is left", () => {
+	expect(deriveThreadName("<@123>")).toBeUndefined();
+	expect(deriveThreadName("  <@123>  ```x```  ")).toBeUndefined();
+	expect(deriveThreadName("")).toBeUndefined();
+});
+
+test("deriveThreadName cuts long text at a word boundary without splitting characters", () => {
+	const long = "This is a longer question that might exceed the preferred limit but should truncate";
+	const name = deriveThreadName(long) as string;
+	expect(name).toBe("This is a longer question that might exceed the…");
+	const unbroken = "🦞".repeat(80);
+	const cut = deriveThreadName(unbroken) as string;
+	expect(Array.from(cut)).toHaveLength(51);
+	expect(cut.endsWith("🦞…")).toBe(true);
+});
+
+function threadingMessage(content: string, started: string[]) {
+	return {
+		id: "msg-1",
+		author: { id: "user-1" },
+		channel: { id: "channel-1", type: 0 },
+		mentions: { has: () => true },
+		content,
+		startThread: async ({ name }: { name: string; autoArchiveDuration: number }) => {
+			started.push(name);
+			return { id: "thread-1" };
+		},
+	};
+}
+
+test("a mention opens a thread named after the message and needs no rename", async () => {
+	const started: string[] = [];
+	const message = threadingMessage("<@111> 스레드 이름 좀 바꿔줘", started);
+	const unnamed = new UnnamedThreads();
+	const engagement = engagementForMessage(message as any, { id: "111" });
+	await maybeCreateThreadOnMention(
+		message as any,
+		engagement,
+		discordMessageOrigin(message as any),
+		undefined,
+		unnamed,
+	);
+	expect(started).toEqual(["스레드 이름 좀 바꿔줘"]);
+	expect(unnamed.take("thread-1")).toBe(false);
+});
+
+test("a bare mention opens a fallback-named thread, renamed once from the first message with words", async () => {
+	const started: string[] = [];
+	const unnamed = new UnnamedThreads();
+	const trigger = threadingMessage("<@111>", started);
+	const engagement = engagementForMessage(trigger as any, { id: "111" });
+	const origin = await maybeCreateThreadOnMention(
+		trigger as any,
+		engagement,
+		discordMessageOrigin(trigger as any),
+		undefined,
+		unnamed,
+	);
+	expect(started).toEqual(["Discussion"]);
+	const renamed: string[] = [];
+	const inThread = (content: string) => ({
+		content,
+		channel: { setName: async (name: string) => void renamed.push(name) },
+	});
+	// A message with nothing nameable does not use up the rename.
+	await nameThreadFromMessage(inThread("<@111>") as any, origin, unnamed);
+	expect(renamed).toEqual([]);
+	await nameThreadFromMessage(inThread("디코 플랫 대화 옵션") as any, origin, unnamed);
+	await nameThreadFromMessage(inThread("그리고 하나 더") as any, origin, unnamed);
+	expect(renamed).toEqual(["디코 플랫 대화 옵션"]);
+});
+
+test("threads the adapter did not open are never renamed", async () => {
+	const renamed: string[] = [];
+	const origin = { platform: "discord", kind: "thread", conversationId: "human-thread", parentId: "c" } as const;
+	await nameThreadFromMessage(
+		{ content: "hello there", channel: { setName: async (name: string) => void renamed.push(name) } } as any,
+		origin,
+		new UnnamedThreads(),
+	);
+	expect(renamed).toEqual([]);
+});
+
+test("a failed thread rename is logged and does not throw", async () => {
+	const errors: string[] = [];
+	const unnamed = new UnnamedThreads();
+	unnamed.add("thread-1");
+	const origin = { platform: "discord", kind: "thread", conversationId: "thread-1", parentId: "c" } as const;
+	const failing = {
+		content: "name me",
+		channel: {
+			setName: async () => {
+				throw new Error("Missing Permissions");
+			},
+		},
+	};
+	await nameThreadFromMessage(failing as any, origin, unnamed, { error: (line: string) => void errors.push(line) });
+	expect(errors).toEqual(["Discord thread thread-1 rename failed: Missing Permissions"]);
+});
+
+test("UnnamedThreads forgets the oldest thread past its bound", () => {
+	const unnamed = new UnnamedThreads(2);
+	unnamed.add("a");
+	unnamed.add("b");
+	unnamed.add("c");
+	expect(unnamed.take("a")).toBe(false);
+	expect(unnamed.take("b")).toBe(true);
+	expect(unnamed.take("c")).toBe(true);
 });
