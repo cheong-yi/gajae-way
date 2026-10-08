@@ -610,3 +610,167 @@ test("A03 callerSessionId is an untrusted routing hint on the owner-trusted sock
 	)!;
 	await silencePersona(f, internalReport.opRef);
 });
+
+// Issue #435: lane report thread routing for channel root origins
+test("AC-435 Slack channel root trigger routes lane report to thread", async () => {
+	const slackChannelOrigin: OriginRef = { platform: "slack", kind: "channel", conversationId: "C_issue435_slack" };
+	const f = await fixture({
+		ownerTarget: slackChannelOrigin,
+		channels: { "slack:C_issue435_slack": { engagement: "open", audience: "all" } },
+	});
+	const triggerMessageId = "C_issue435_slack:1700000000.000435";
+	const persona = await startPersonaTurn(f, slackChannelOrigin, triggerMessageId);
+	const lane = await startLane(f, "ac435-slack-worker", persona.sessionId);
+	expect(lane.error).toBeUndefined();
+	await settleLane(f, lane.result.opRef, "slack thread result");
+	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportRows = await eventually(
+		() => f.database.inboundTurnRows(persona.opRef),
+		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
+		"lane report row for AC-435 slack",
+	);
+	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
+	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
+	expect(laneReportOrigin.kind).toBe("thread");
+	expect(laneReportOrigin.platform).toBe("slack");
+	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
+	expect(laneReportOrigin.parentId).toBe(slackChannelOrigin.conversationId);
+	f.port.complete(persona.opRef, "ack");
+});
+
+test("AC-435 Discord channel root trigger routes lane report to thread", async () => {
+	const discordChannelOrigin: OriginRef = { platform: "discord", kind: "channel", conversationId: "discord-ch-435" };
+	const f = await fixture({
+		ownerTarget: discordChannelOrigin,
+		channels: { "discord-ch-435": { engagement: "open", audience: "all" } },
+	});
+	const triggerMessageId = "discord-trigger-msg-id";
+	const persona = await startPersonaTurn(f, discordChannelOrigin, triggerMessageId);
+	const lane = await startLane(f, "ac435-discord-worker", persona.sessionId);
+	expect(lane.error).toBeUndefined();
+	await settleLane(f, lane.result.opRef, "discord thread result");
+	const reportId = f.database.workAttemptGet(lane.result.opRef)!.reportId;
+	const reportRows = await eventually(
+		() => f.database.inboundTurnRows(persona.opRef),
+		(rows) => rows.some((row) => row.source === "lane_report" && row.message_id === reportId),
+		"lane report row for AC-435 discord",
+	);
+	const laneReportRow = reportRows.find((row) => row.source === "lane_report" && row.message_id === reportId)!;
+	const laneReportOrigin = JSON.parse(laneReportRow.origin_ref_json) as OriginRef;
+	expect(laneReportOrigin.kind).toBe("thread");
+	expect(laneReportOrigin.platform).toBe("discord");
+	expect(laneReportOrigin.conversationId).toBe(triggerMessageId);
+	expect(laneReportOrigin.parentId).toBe(discordChannelOrigin.conversationId);
+	f.port.complete(persona.opRef, "ack");
+});
+
+// Review repair: #resolveCaller must thread only to a nonterminal turn of the
+// CURRENT session epoch; retired-epoch turns stay recovery subjects.
+const retiredTriggerId = "retired-held-trigger";
+
+function seedRetiredHeldTurn(f: Awaited<ReturnType<typeof fixture>>): number {
+	f.database.inboundEnqueue({
+		messageId: retiredTriggerId,
+		originKey: rootKey,
+		originRefJson: JSON.stringify(rootOrigin),
+		body: "turn from the retired epoch",
+	});
+	f.database.inboundBindTurn({
+		messageId: retiredTriggerId,
+		originKey: rootKey,
+		epoch: 0,
+		opRef: "gw-retired-held-turn",
+		sessionId: crypto.randomUUID(),
+	});
+	f.database.inboundTurnAccept("gw-retired-held-turn");
+	const epoch = f.database.rebindEpoch(rootKey);
+	expect(f.database.inboundNonterminalTurns(rootKey)).toHaveLength(1);
+	return epoch;
+}
+
+function bindOriginSession(f: Awaited<ReturnType<typeof fixture>>, sessionId: string, epoch: number): void {
+	const authority = f.database.inspectBrokerAuthority().authority;
+	if (!authority) throw new Error("test broker authority missing");
+	const recorded = f.database.recordOwnedBinding({
+		authority,
+		sessionId,
+		originKey: rootKey,
+		epoch,
+		repo: join(f.home, "workspace"),
+	});
+	if (!recorded) throw new Error("current fixture binding lost its epoch");
+}
+
+function seedEpochTurn(
+	f: Awaited<ReturnType<typeof fixture>>,
+	messageId: string,
+	sessionId: string,
+	epoch: number,
+	opRef: string,
+): void {
+	f.database.inboundEnqueue({
+		messageId,
+		originKey: rootKey,
+		originRefJson: JSON.stringify(rootOrigin),
+		body: "current epoch turn",
+	});
+	f.database.inboundBindTurn({ messageId, originKey: rootKey, epoch, opRef, sessionId });
+	f.database.inboundTurnAccept(opRef);
+}
+
+function personaParent(f: Awaited<ReturnType<typeof fixture>>, opRef: string) {
+	const parent = f.database.workAttemptGet(opRef)?.parent;
+	if (parent?.kind !== "persona") throw new Error(`expected persona parent for ${opRef}`);
+	return parent;
+}
+
+test("caller persona parent threads to the current-epoch trigger, not the retired held one", async () => {
+	const f = await fixture();
+	const epoch = seedRetiredHeldTurn(f);
+	const currentSessionId = crypto.randomUUID();
+	bindOriginSession(f, currentSessionId, epoch);
+	seedEpochTurn(f, "current-epoch-trigger", currentSessionId, epoch, "gw-current-epoch-turn");
+	const lane = await startLane(f, "retired-vs-current", currentSessionId);
+	expect(lane.error).toBeUndefined();
+	const parent = personaParent(f, lane.result.opRef);
+	expect(parent.originKey).toBe(rootKey);
+	expect(parent.triggerMessageId).toBe("current-epoch-trigger");
+});
+
+test("caller persona parent leaves no trigger when the current epoch has no attributable turn", async () => {
+	const f = await fixture();
+	const epoch = seedRetiredHeldTurn(f);
+	const currentSessionId = crypto.randomUUID();
+	bindOriginSession(f, currentSessionId, epoch);
+	const lane = await startLane(f, "retired-only", currentSessionId);
+	expect(lane.error).toBeUndefined();
+	const parent = personaParent(f, lane.result.opRef);
+	expect(parent.originKey).toBe(rootKey);
+	expect(parent.triggerMessageId).toBeUndefined();
+	expect(f.database.inboundNonterminalTurns(rootKey)).toHaveLength(1);
+});
+
+test("caller persona parent leaves no trigger when the current-epoch turn belongs to another session", async () => {
+	const f = await fixture();
+	const callerSessionId = crypto.randomUUID();
+	bindOriginSession(f, callerSessionId, 0);
+	seedEpochTurn(f, "foreign-session-trigger", crypto.randomUUID(), 0, "gw-foreign-session-turn");
+	const lane = await startLane(f, "foreign-session-caller", callerSessionId);
+	expect(lane.error).toBeUndefined();
+	const parent = personaParent(f, lane.result.opRef);
+	expect(parent.originKey).toBe(rootKey);
+	expect(parent.triggerMessageId).toBeUndefined();
+});
+
+test("ownerTarget parent threads to the current-epoch trigger, not the retired held one", async () => {
+	const f = await fixture();
+	const epoch = seedRetiredHeldTurn(f);
+	const ownerSessionId = crypto.randomUUID();
+	bindOriginSession(f, ownerSessionId, epoch);
+	seedEpochTurn(f, "owner-current-trigger", ownerSessionId, epoch, "gw-owner-current-turn");
+	const lane = await startLane(f, "owner-retired-vs-current");
+	expect(lane.error).toBeUndefined();
+	const parent = personaParent(f, lane.result.opRef);
+	expect(parent.originKey).toBe(rootKey);
+	expect(parent.triggerMessageId).toBe("owner-current-trigger");
+});

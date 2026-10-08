@@ -8,7 +8,7 @@ import { pinnedGjcCandidatePaths, preflightGjcRuntime, readPinnedGjcVersion } fr
 describe("GJC version pinning", () => {
 	it("reads pinned gjc version from gateway package.json", () => {
 		const version = readPinnedGjcVersion();
-		expect(version).toBe("0.18.7");
+		expect(version).toBe("0.18.8");
 	});
 
 	it("validates exact version match with pinnedVersion option", async () => {

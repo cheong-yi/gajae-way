@@ -462,10 +462,21 @@ export class WorkLaneManager {
 		const lanePrefix = "work/task/";
 		const callerLane = callerOrigin?.startsWith(lanePrefix) ? callerOrigin.slice(lanePrefix.length) : undefined;
 		let callerPersona: OriginRef | undefined;
+		let triggerMessageId: string | undefined;
 		if (callerOrigin && callerLane === undefined) {
 			try {
 				const origin = parseOriginKey(callerOrigin);
-				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) callerPersona = origin;
+				if (["discord", "slack", "telegram", "loopback"].includes(origin.platform)) {
+					callerPersona = origin;
+					// Thread only to a nonterminal turn of the CURRENT session epoch that is
+					// bound to the presented caller session; retired-epoch turns are never
+					// attributable, so no current match leaves the parent without a trigger.
+					const callerEpoch = this.#db.getSessionRecord(callerOrigin)?.epoch;
+					if (callerEpoch !== undefined) {
+						const callerTurns = this.#db.inboundNonterminalTurns(callerOrigin, callerEpoch);
+						triggerMessageId = callerTurns.find((turn) => turn.sessionId === input.callerSessionId)?.triggerMessageId;
+					}
+				}
 			} catch {
 				/* Unknown and non-persona origins fall back to ownerTarget for starts. */
 			}
@@ -492,7 +503,12 @@ export class WorkLaneManager {
 			return null;
 		}
 		if (callerPersona) {
-			const parent: WorkParent = { kind: "persona", originKey: originKey(callerPersona), origin: callerPersona };
+			const parent: WorkParent = {
+				kind: "persona",
+				originKey: originKey(callerPersona),
+				origin: callerPersona,
+				...(triggerMessageId ? { triggerMessageId } : {}),
+			};
 			console.error(`work_parent_resolved verb=start name=${input.name} source=session kind=persona`);
 			return parent;
 		}
@@ -501,7 +517,22 @@ export class WorkLaneManager {
 			try {
 				validateOriginRef(owner);
 				if (["discord", "slack", "telegram", "loopback"].includes(owner.platform)) {
-					const parent: WorkParent = { kind: "persona", originKey: originKey(owner), origin: structuredClone(owner) };
+					// Thread only to a nonterminal turn of the owner origin's CURRENT
+					// session epoch; retired-epoch turns are recovery subjects, not
+					// report targets.
+					let ownerTriggerMessageId: string | undefined;
+					const ownerOriginKey = originKey(owner);
+					const ownerEpoch = this.#db.getSessionRecord(ownerOriginKey)?.epoch;
+					if (ownerEpoch !== undefined) {
+						const ownerTurns = this.#db.inboundNonterminalTurns(ownerOriginKey, ownerEpoch);
+						ownerTriggerMessageId = ownerTurns[0]?.triggerMessageId;
+					}
+					const parent: WorkParent = {
+						kind: "persona",
+						originKey: ownerOriginKey,
+						origin: structuredClone(owner),
+						...(ownerTriggerMessageId ? { triggerMessageId: ownerTriggerMessageId } : {}),
+					};
 					console.error(`work_parent_resolved verb=start name=${input.name} source=owner kind=persona`);
 					return parent;
 				}
