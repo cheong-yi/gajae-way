@@ -1,171 +1,308 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { ProtocolError } from "@gajae-gateway/protocol";
+import { type SlackHistoryPage, SlackWebApi } from "../src/api";
+import { type GatewayClientLike, ReconnectingGateway, startSlackAdapter } from "../src/main";
 import {
 	classifyRecoveryFailure,
 	EMPTY_RECOVERY_STATE,
+	loadRecoveryCursors,
 	RECOVERY_MAX_ATTEMPTS,
 	type RecoveryCursorState,
 	recordAttempt,
 } from "../src/recovery";
+import type { WebSocketLike } from "../src/socket";
 
-describe("Recovery dead-lettering after N timeout attempts (issue #420 acceptance)", () => {
-	test("timeout error is classified as terminal-message, not retryable", () => {
-		// Create a timeout error (what the client emits after 30s)
-		const timeoutError = new ProtocolError("verb_failed", "request timed out after 30000ms");
+const cleanups: Array<() => Promise<unknown> | void> = [];
+afterEach(async () => {
+	for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+});
 
-		const classification = classifyRecoveryFailure(timeoutError);
+const originalTs = "1700000000.123456";
+const originalId = `C1:${originalTs}`;
+// The exact error the SDK's request timer raises when a deadline expires with no
+// response (packages/sdk/src/client.ts): a silent link, not a payload refusal.
+const deadline = () => new ProtocolError("verb_failed", "request timed out after 40ms");
 
-		// Should be terminal-message so it counts toward RECOVERY_MAX_ATTEMPTS
-		expect(classification).toBe("terminal-message");
+describe("Recovery failure classification", () => {
+	test("request deadline errors are retryable, never terminal", () => {
+		expect(classifyRecoveryFailure(deadline())).toBe("retryable");
 	});
 
-	test("connection errors remain retryable (not timeout)", () => {
-		const connectionError = new Error("gateway is not connected");
-		const classification = classifyRecoveryFailure(connectionError);
-
-		// Should be retryable, not terminal
-		expect(classification).toBe("retryable");
-	});
-
-	test("client closed error remains retryable (not timeout)", () => {
-		const closedError = new Error("client closed");
-		const classification = classifyRecoveryFailure(closedError);
-
-		expect(classification).toBe("retryable");
-	});
-
-	test("message times out once: recorded as terminal-message attempt", () => {
-		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
-
-		const messageId = "slack-msg-1";
-		const conversationId = "C123";
-		const timeoutError = new ProtocolError("verb_failed", "request timed out after 30000ms");
-		const classification = classifyRecoveryFailure(timeoutError);
-
-		const { state: newState, exhausted } = recordAttempt(
-			state,
-			messageId,
-			conversationId,
-			classification,
-			"timeout",
-			Date.now(),
+	test("explicit invalid_params and payload_too_large refusals are terminal", () => {
+		expect(classifyRecoveryFailure(Object.assign(new Error("refused"), { code: "invalid_params" }))).toBe(
+			"terminal-message",
 		);
-
-		state = newState;
-
-		// After one timeout attempt (terminal-message classification)
-		expect(state.attempts[messageId]?.attempts).toBe(1);
-		expect(exhausted).toBe(false); // Should not be exhausted yet
-
-		// Recovery cursor should keep retrying until RECOVERY_MAX_ATTEMPTS
-		expect(RECOVERY_MAX_ATTEMPTS).toBeGreaterThan(1);
+		expect(classifyRecoveryFailure(Object.assign(new Error("too big"), { code: "payload_too_large" }))).toBe(
+			"terminal-message",
+		);
 	});
 
-	test("message times out N times: dead-lettered after RECOVERY_MAX_ATTEMPTS", () => {
+	test("link and close errors remain retryable", () => {
+		expect(classifyRecoveryFailure(new Error("gateway is not connected"))).toBe("retryable");
+		expect(classifyRecoveryFailure(new Error("client closed"))).toBe("retryable");
+		expect(classifyRecoveryFailure(new Error("connection closed"))).toBe("retryable");
+	});
+
+	test("unrecognized failures stay write-path-unknown", () => {
+		expect(classifyRecoveryFailure(new Error("boom"))).toBe("write-path-unknown");
+	});
+});
+
+describe("Recovery attempt budget accounting", () => {
+	test("repeated deadline failures never spend the terminal budget", () => {
 		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
+		for (let i = 0; i < RECOVERY_MAX_ATTEMPTS + 2; i++) {
+			const result = recordAttempt(
+				state,
+				"slack-msg-1",
+				"C123",
+				classifyRecoveryFailure(deadline()),
+				"request timed out after 40ms",
+				Date.now(),
+			);
+			state = result.state;
+			expect(result.exhausted).toBe(false);
+		}
+		expect(state.attempts["slack-msg-1"]?.attempts).toBe(0);
+		expect(state.deadLetters).toEqual([]);
+	});
 
-		const messageId = "slack-msg-2";
-		const conversationId = "C123";
-		const timeoutError = new ProtocolError("verb_failed", "request timed out after 30000ms");
-		const classification = classifyRecoveryFailure(timeoutError);
+	test("a link outage in between never increments a recorded terminal count", () => {
+		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
+		state = recordAttempt(state, "slack-msg-2", "C123", "terminal-message", "invalid_params", Date.now()).state;
+		expect(state.attempts["slack-msg-2"]?.attempts).toBe(1);
+		state = recordAttempt(state, "slack-msg-2", "C123", "retryable", "offline", Date.now()).state;
+		expect(state.attempts["slack-msg-2"]?.attempts).toBe(1);
+	});
 
+	test("explicit payload refusals exhaust exactly at RECOVERY_MAX_ATTEMPTS", () => {
+		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
 		let exhausted = false;
-
-		// Record RECOVERY_MAX_ATTEMPTS failures
 		for (let i = 0; i < RECOVERY_MAX_ATTEMPTS; i++) {
-			const result = recordAttempt(state, messageId, conversationId, classification, "timeout", Date.now());
+			const result = recordAttempt(state, "slack-msg-3", "C123", "terminal-message", "payload_too_large", Date.now());
 			state = result.state;
 			exhausted = result.exhausted;
 		}
-
-		// After RECOVERY_MAX_ATTEMPTS terminal-message failures, should be exhausted
-		expect(state.attempts[messageId]?.attempts).toBe(RECOVERY_MAX_ATTEMPTS);
+		expect(state.attempts["slack-msg-3"]?.attempts).toBe(RECOVERY_MAX_ATTEMPTS);
 		expect(exhausted).toBe(true);
 	});
+});
 
-	test("message with connection error does NOT count toward attempts", () => {
-		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
+class Client implements GatewayClientLike {
+	readonly calls: Array<{ verb: string; params: unknown }> = [];
+	failure?: Error;
+	engaged = false;
+	async request<T>(verb: string, params?: unknown): Promise<T> {
+		this.calls.push({ verb, params });
+		if (this.failure) throw this.failure;
+		return { engaged: this.engaged } as T;
+	}
+	onChatMessage() {
+		return () => {};
+	}
+}
 
-		const messageId = "slack-msg-3";
-		const conversationId = "C123";
+class Api extends SlackWebApi {
+	historyMessages: Record<string, unknown>[] = [];
+	readonly historyCalls: string[] = [];
+	constructor() {
+		super("unused", async () => {
+			throw new Error("Slack test must not fetch");
+		});
+	}
+	override async authTest() {
+		return { user_id: "UBOT", bot_id: "B1", user: "bot", team_id: "T1", team: "Workspace" };
+	}
+	override async usersInfo(id: string) {
+		return { id, name: id };
+	}
+	override async conversationsInfo(id: string) {
+		return { id, name: id };
+	}
+	override async connectionsOpen() {
+		return { url: "wss://slack.test" };
+	}
+	override async conversationsHistory(channel: string) {
+		this.historyCalls.push(channel);
+		return { messages: this.historyMessages, has_more: false };
+	}
+	override async conversationsReplies(): Promise<SlackHistoryPage> {
+		return { messages: [], has_more: false };
+	}
+	override async postMessage(channel: string, text: string) {
+		return { channel, ts: "2.0", text };
+	}
+	override async addReaction() {}
+}
 
-		// Record many connection errors (retryable classification)
-		for (let i = 0; i < 10; i++) {
-			const connectionError = new Error("gateway is not connected");
-			const classification = classifyRecoveryFailure(connectionError);
+class Socket implements WebSocketLike {
+	onopen: WebSocketLike["onopen"] = null;
+	onmessage: WebSocketLike["onmessage"] = null;
+	onclose: WebSocketLike["onclose"] = null;
+	onerror: WebSocketLike["onerror"] = null;
+	send() {}
+	close() {}
+}
 
-			const result = recordAttempt(state, messageId, conversationId, classification, "offline", Date.now());
-			state = result.state;
-		}
+/** Same composition the adapter suite drives: production startSlackAdapter + cursor store. */
+async function fixture() {
+	// Same guard as the B7 reproduction harness, scoped per fixture and restored on
+	// cleanup: no adapter built here can ever open a real gateway socket.
+	const connect = spyOn(ReconnectingGateway.prototype, "connect").mockImplementation(async () => {});
+	cleanups.push(() => connect.mockRestore());
+	const home = await mkdtemp(join(tmpdir(), "slack-timeout-recovery-"));
+	cleanups.push(() => rm(home, { recursive: true, force: true }));
+	const api = new Api();
+	const recoveryCursorPath = join(home, "cursor.json");
+	const adapter = await startSlackAdapter(
+		{
+			botToken: "xoxb-test",
+			appToken: "xapp-test",
+			botTokenFile: "bot",
+			appTokenFile: "app",
+			configPath: "test",
+			gatewaySocket: join(home, "absent.sock"),
+			channels: { C1: { engagement: "open" } },
+		},
+		{
+			api,
+			recoveryCursorPath,
+			now: () => 1_700_000_100_000,
+			log: { log() {}, error() {} },
+			socketFactory: () => {
+				const socket = new Socket();
+				queueMicrotask(() => socket.onopen?.({}));
+				return socket;
+			},
+		},
+	);
+	cleanups.push(() => {
+		adapter.socket.stop();
+		adapter.recovery.stop();
+		adapter.gateway.stop();
+	});
+	// Deterministic hand-driven passes: no scheduler, no auto-recovery on connect.
+	adapter.recovery.stop();
+	await adapter.recovery.idle();
+	adapter.gateway.onConnected = undefined;
+	const client = new Client();
+	adapter.gateway.adoptClient(client);
+	return {
+		api,
+		client,
+		gateway: adapter.gateway,
+		recoveryCursorPath,
+		recoverMissedMessages: adapter.recoverMissedMessages,
+		/**
+		 * Every failed send detaches the link (production scheduleReconnect), so each
+		 * pass re-adopts the client first, exactly like a reconnect between passes.
+		 */
+		pass: async (failure?: Error) => {
+			client.failure = failure;
+			adapter.gateway.adoptClient(client);
+			return adapter.recoverMissedMessages();
+		},
+	};
+}
 
-		// Should not increase attempts counter (retryable doesn't count)
-		const attempts = state.attempts[messageId]?.attempts ?? 0;
-		expect(attempts).toBe(0);
+describe("Composed production recovery regression", () => {
+	test("repeated request deadlines never dead-letter or advance the cursor; restoration admits the original", async () => {
+		const f = await fixture();
+		f.api.historyMessages = [{ type: "message", user: "U1", ts: originalTs, text: "valid unchanged payload" }];
+		// More passes than the terminal budget: the old defect exhausted it at three.
+		for (let i = 0; i < RECOVERY_MAX_ATTEMPTS + 1; i++) expect(await f.pass(deadline())).toBe(false);
+		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.attempts[originalId]).toMatchObject({ attempts: 0, classification: "retryable" });
+		expect(cursors.deadLetters).toEqual([]);
+		expect(cursors.recoveredThrough.C1).toBeUndefined();
+
+		// Link restored: the same original id is retried and admitted.
+		expect(await f.pass()).toBe(true);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe(originalTs);
+		expect(cursors.attempts[originalId]).toBeUndefined();
+		expect(cursors.deadLetters).toEqual([]);
+		const sends = f.client.calls.filter((call) => call.verb === "chat.send");
+		// One send per deadline pass plus the restored admission.
+		expect(sends).toHaveLength(RECOVERY_MAX_ATTEMPTS + 2);
+		expect(sends.every((call) => (call.params as { messageId: string }).messageId === originalId)).toBe(true);
 	});
 
-	test("message times out once, then connection error: only 1 attempt recorded", () => {
-		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
+	test("an already-admitted message deduplicates through the real gateway client, not a test-side map", async () => {
+		const f = await fixture();
+		// Seed the admission through the actual gateway client: its own admission
+		// memory records the ack; no live ingress runs and no cursor moves.
+		const seeded = await f.gateway.requestRecovered(
+			originalId,
+			{ platform: "slack", kind: "channel", conversationId: "C1" },
+			"hello",
+			{ mentioned: false, group: true, authorId: "U1" },
+		);
+		expect(seeded.verdict).toBe("acked");
+		const sends = () => f.client.calls.filter((call) => call.verb === "chat.send");
+		expect(sends()).toHaveLength(1);
+		expect((sends()[0].params as { messageId: string }).messageId).toBe(originalId);
+		expect((await loadRecoveryCursors(f.recoveryCursorPath)).recoveredThrough).toEqual({});
 
-		const messageId = "slack-msg-4";
-		const conversationId = "C123";
+		// Recovery meets the same id from history. The cursor starts empty, so only an
+		// actual delivered/duplicate verdict can advance it — the id cannot have been
+		// filtered out by the fetch window — and the unchanged send count proves the
+		// verdict came back "duplicate" from the gateway client's admission memory.
+		f.api.historyMessages = [{ type: "message", user: "U1", ts: originalTs, text: "hello" }];
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(sends()).toHaveLength(1);
+		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe(originalTs);
+		expect(cursors.attempts).toEqual({});
+		expect(cursors.deadLetters).toEqual([]);
 
-		// First: timeout (terminal-message)
-		let result = recordAttempt(state, messageId, conversationId, "terminal-message", "timeout", Date.now());
-		state = result.state;
-
-		expect(state.attempts[messageId]?.attempts).toBe(1);
-
-		// Then: connection error (retryable)
-		result = recordAttempt(state, messageId, conversationId, "retryable", "offline", Date.now());
-		state = result.state;
-
-		// Still only 1 attempt (retryable doesn't increment)
-		expect(state.attempts[messageId]?.attempts).toBe(1);
+		// The closed window keeps it that way: a later pass fetches nothing new.
+		expect(await f.recoverMissedMessages()).toBe(true);
+		expect(sends()).toHaveLength(1);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.recoveredThrough.C1).toBe(originalTs);
 	});
 
-	test("multiple messages: each tracks attempts independently", () => {
-		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
+	test("explicit invalid_params and payload_too_large each spend the terminal budget and dead-letter", async () => {
+		const f = await fixture();
+		const refusal = (code: string) => Object.assign(new Error(`fixture refusal ${code}`), { code });
 
-		const msg1 = "slack-msg-5";
-		const msg2 = "slack-msg-6";
-		const conversationId = "C123";
+		f.api.historyMessages = [{ type: "message", user: "U1", ts: originalTs, text: "poison-a" }];
+		const invalid = refusal("invalid_params");
+		expect(await f.pass(invalid)).toBe(false);
+		expect(await f.pass(invalid)).toBe(false);
+		let cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.attempts[originalId]?.attempts).toBe(2);
+		expect(cursors.deadLetters).toEqual([]);
+		expect(cursors.recoveredThrough.C1).toBeUndefined();
+		expect(await f.pass(invalid)).toBe(true);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.deadLetters).toHaveLength(1);
+		expect(cursors.deadLetters[0]).toMatchObject({
+			messageId: originalId,
+			classification: "terminal-message",
+			attempts: RECOVERY_MAX_ATTEMPTS,
+		});
+		expect(cursors.recoveredThrough.C1).toBe(originalTs);
 
-		// Message 1: 1 timeout
-		let result = recordAttempt(state, msg1, conversationId, "terminal-message", "timeout", Date.now());
-		state = result.state;
-
-		// Message 2: 2 timeouts
-		result = recordAttempt(state, msg2, conversationId, "terminal-message", "timeout", Date.now());
-		state = result.state;
-		result = recordAttempt(state, msg2, conversationId, "terminal-message", "timeout", Date.now());
-		state = result.state;
-
-		// Message 1 should have 1 attempt
-		expect(state.attempts[msg1]?.attempts).toBe(1);
-		// Message 2 should have 2 attempts
-		expect(state.attempts[msg2]?.attempts).toBe(2);
-	});
-
-	test("exhausted message does not retry again (filtered out before recovery)", () => {
-		let state: RecoveryCursorState = EMPTY_RECOVERY_STATE;
-
-		const messageId = "slack-msg-7";
-		const conversationId = "C123";
-
-		// Exhaust the message with timeouts
-		for (let i = 0; i < RECOVERY_MAX_ATTEMPTS; i++) {
-			const result = recordAttempt(state, messageId, conversationId, "terminal-message", "timeout", Date.now());
-			state = result.state;
-		}
-
-		// Message should be marked as exhausted and will not be retried
-		// (in the real adapter, exhausted messages are moved to dead-letter)
-		const maxAttempts = state.attempts[messageId];
-		expect(maxAttempts?.attempts).toBe(RECOVERY_MAX_ATTEMPTS);
-
-		// If a future pass tries to retry this message, the adapter code should skip it
-		// because attempts >= RECOVERY_MAX_ATTEMPTS
-		const shouldRetry = !maxAttempts || maxAttempts.attempts < RECOVERY_MAX_ATTEMPTS;
-		expect(shouldRetry).toBe(false);
+		// A second poison message in the same channel gets its own full budget.
+		const laterTs = "1700000001.123456";
+		f.api.historyMessages = [{ type: "message", user: "U1", ts: laterTs, text: "poison-b" }];
+		const oversized = refusal("payload_too_large");
+		expect(await f.pass(oversized)).toBe(false);
+		expect(await f.pass(oversized)).toBe(false);
+		expect(await f.pass(oversized)).toBe(true);
+		cursors = await loadRecoveryCursors(f.recoveryCursorPath);
+		expect(cursors.deadLetters).toHaveLength(2);
+		expect(cursors.deadLetters[1]).toMatchObject({
+			messageId: `C1:${laterTs}`,
+			classification: "terminal-message",
+			attempts: RECOVERY_MAX_ATTEMPTS,
+		});
+		expect(cursors.deadLetterDigest.C1?.count).toBe(2);
+		expect(cursors.recoveredThrough.C1).toBe(laterTs);
 	});
 });

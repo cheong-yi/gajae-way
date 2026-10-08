@@ -14,6 +14,8 @@ import {
 	type WorkTaskDispositionBasis,
 	type WorkTaskDispositionParams,
 } from "@gajae-gateway/protocol";
+import { ReconnectingGateway, type SlashInteractionLike, handleSlashCommand } from "../../adapter-discord/src/main";
+import { GajaewayClient } from "../../sdk/src/client";
 import type { GatewayConfig } from "../src/config";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { GatewayDatabase, workTaskDispositionId, workTaskSourceDeliveryId } from "../src/store/db";
@@ -2463,4 +2465,120 @@ test("task jobs cursor and context preserve corrupt task isolation without inven
 	expect(Buffer.byteLength(JSON.stringify(context))).toBeLessThanOrEqual(16 * 1024);
 	expect(context.manifest.length).toBeGreaterThan(0);
 	expect(f.port.sends).toHaveLength(0);
+});
+
+test("cold mapped slash is refused truthfully with no persona mutation or reconnect", async () => {
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
+	// The permanent mapping lives only in the gateway store: the adapter has never
+	// run discovery, so the truthful refusal must come back from the wire itself.
+	const wire = await f.request(
+		"chat.send",
+		event({
+			messageId: "slash-wire-proof",
+			text: "/reset",
+			originSource: undefined,
+			engagement: { authorId: "42", mentioned: true, group: true },
+		}),
+	);
+	expect(wire.error?.code).toBe("invalid_params");
+	expect(wire.error?.detail?.reasonCode).toBe("mapped_slash_unsupported");
+
+	// Cold composition: real handleSlashCommand -> ReconnectingGateway with an
+	// injected live SDK client -> requestInbound -> the real gateway fixture.
+	const cursorDir = await mkdtemp(join(tmpdir(), "discord-cold-slash-"));
+	const client = await GajaewayClient.connectSocket(f.config.socketPath, { clientName: "adapter-discord" });
+	cleanup.push(async () => {
+		await client.close();
+		await rm(cursorDir, { recursive: true, force: true });
+	});
+	const gw = new ReconnectingGateway(
+		f.config.socketPath,
+		{
+			channels: {
+				fetch: async () => {
+					throw new Error("cold slash must not touch Discord");
+				},
+			},
+		},
+		{
+			tokenFile: join(cursorDir, "token"),
+			token: "cold-slash-token",
+			configPath: join(cursorDir, "adapter-discord.json"),
+			channels: {},
+		},
+		undefined,
+		undefined,
+		join(cursorDir, "cursor.json"),
+		() => ({ id: "900" }),
+		client,
+		async () => {},
+	);
+
+	// Admission already created the original worker: capture every state the
+	// slash could touch and require it to be identical afterwards instead of
+	// assuming pristine zeros.
+	const threadKey = originKey(thread);
+	const dmOrigin = { platform: "discord", kind: "dm", conversationId: "300", peerId: "42" } as const;
+	const taskBefore = f.db.workTaskGet(taskId);
+	const controlsBefore = f.db.workControlList(taskId);
+	const sessionBefore = f.db.getSession(threadKey);
+	const threadModelBefore = f.db.conversationModelGet(threadKey);
+	const dmModelBefore = f.db.conversationModelGet(originKey(dmOrigin));
+	const sendsBefore = f.port.sends.slice();
+	const bindsBefore = f.port.binds.slice();
+	const steersBefore = f.port.steers.slice();
+
+	const replies: Array<{ content: string; ephemeral?: boolean }> = [];
+	const interaction: SlashInteractionLike = {
+		isChatInputCommand: () => true,
+		commandName: "reset",
+		id: "itx-cold-mapped",
+		user: { id: "42", username: "bellman" },
+		channel: { id: thread.conversationId, type: 11, parentId: thread.parentId, guildId: thread.boundaryId },
+		reply: async (options) => {
+			replies.push(options);
+		},
+	};
+	const adapterErrors: string[] = [];
+	const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+		adapterErrors.push(args.map(String).join(" "));
+	});
+	try {
+		await handleSlashCommand(interaction, gw, { error: (line: string) => adapterErrors.push(line) });
+	} finally {
+		errorSpy.mockRestore();
+	}
+	expect(replies).toHaveLength(1);
+	expect(replies[0]?.ephemeral).toBe(true);
+	expect(replies[0]?.content).toContain("not supported in mapped task threads");
+	expect(replies[0]?.content).toContain("No task or session change was made.");
+	expect(replies[0]?.content).not.toContain("session reset");
+	expect(replies[0]?.content).not.toContain("not authorized");
+	// The refusal stayed truthful: no dead-link log from requestInbound and no
+	// failure log from the slash handler.
+	expect(adapterErrors.filter((line) => line.includes("Discord chat.send failed"))).toEqual([]);
+	expect(adapterErrors.filter((line) => line.includes("Discord slash command failed"))).toEqual([]);
+	expect(gw.recoveryRetryPending).toBe(false);
+	// Ordinary slash routing outside the permanent mapping is unchanged and proves
+	// the link survived the refusal (a reconnect would have cleared the client).
+	const normal = await gw.requestInbound("slash-normal-model", dmOrigin, "/model", {
+		mentioned: false,
+		group: false,
+		authorId: "42",
+	});
+	expect(normal).toMatchObject({ engaged: true });
+	// Nothing the slash could reach changed: no control, session, model, task
+	// record, or session-port activity beyond what admission had already done.
+	expect(f.db.workControlList(taskId)).toEqual(controlsBefore);
+	expect(f.db.workTaskGet(taskId)).toEqual(taskBefore);
+	expect(f.db.getSession(threadKey)).toEqual(sessionBefore);
+	expect(f.db.conversationModelGet(threadKey)).toEqual(threadModelBefore);
+	expect(f.db.conversationModelGet(originKey(dmOrigin))).toEqual(dmModelBefore);
+	expect(f.port.sends).toEqual(sendsBefore);
+	expect(f.port.binds).toEqual(bindsBefore);
+	expect(f.port.steers).toEqual(steersBefore);
+	expect(f.db.workTaskDiscordLocator(thread.conversationId)).toEqual({ taskId });
+	await gw.cursorsFlushed;
 });

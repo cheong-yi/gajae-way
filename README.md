@@ -46,7 +46,7 @@ Chat frontends are easy. What is hard is everything that happens when a real bot
 
 The cockpit is exceptions-first: selected state, outstanding owner actions, and evidence-linked results rather than a transcript mirror. Open a task's mapped thread for its assignment, accepted/refused/held steering outcomes, available proven checkpoints, errors, and final disposition. Authenticated owner steering there needs no coordinator approval, but stays task-local and within admission scope. Broader direction must explicitly name targets; each target has its own outcome. Context shared across sessions is evidence, not automatically propagated instructions or authoritative memory.
 
-On request, bounded context must identify its sources and revisions, evidence time separately from rendering time, and stale, missing, raced, or omitted material. Notify immediately of a cleared exception only when a previously requested owner action is no longer needed; otherwise update task detail and the next requested digest quietly. No scheduled digest or every-completion notice is prescribed.
+On request, bounded context must identify its sources and revisions, evidence time separately from rendering time, and stale, missing, raced, or omitted material. The original task answer publishes to its mapped thread independently of coordinator report admission; review is agent-led over the complete retained answer, with genuine owner questions stored as durable records. A review still outstanding stays visibly pending on existing coordinator turns, with no automatic clearance notice, reminder, or digest schedule and no guaranteed eventual review. On Discord, slash commands inside mapped task threads are explicitly refused and full slash support is backlogged; ordinary slash commands elsewhere are unchanged.
 
 Mutation-capable tasks require pre-provisioned dedicated Git worktrees, not an OS sandbox. Recovery observes original identities and retrieves original results; it does not replay prompts or tools. Missing results may hide committed effects. Physical delivery is at-least-once, and unavailable output remains incomplete. See [architecture](docs/architecture.md#worker-lanes), [deployment](docs/deployment.md#upgrades), and the [operator runbook](docs/runbooks/gajaeway-v1.md#configuration-and-credentials) for the contract and remaining qualification gates. Vision-led autonomy and an unattended factory are outside Part 1.
 
@@ -127,18 +127,33 @@ subsequent briefs must carry these commands and report failures without weakenin
 native configuration or narrowing coverage:
 
 ```sh
-bun .gajaestack/typescript/check.ts --quick # lint packages/ and scripts/; not changed-only
-bun .gajaestack/typescript/check.ts         # full native tsconfig typecheck, then lint
-bun test packages                         # independent native package tests
+bun run gajaestack-check --quick # lint packages/ and scripts/; not changed-only
+bun run gajaestack-check         # full native tsconfig typecheck, then lint
+bun -e 'import {check} from "gajaestack/check"; process.exit(await check())' # equivalent installed export
+bun test packages               # independent native package tests
 ```
 
-Only the standalone `typescript` asset is adopted. It uses installed local
+Only standalone `typescript` checks are selected. Gajaestack is a pinned native
+dev dependency, not a copied checker. Its content-addressed local tarball and
+[source/digest receipt](.gajaestack/packages/source-receipt.json) are retained in
+`.gajaestack/packages/`; keep these with `package.json` and `bun.lock`. The checker
+requires Bun >=1.4.2. Reproduce installation from an already provisioned native
+dependency cache with scripts disabled:
+
+```sh
+bun install --frozen-lockfile --offline --ignore-scripts --backend=copyfile
+```
+
+It resolves scope from the consumer root and uses installed local
 tsc/Biome and existing `tsconfig.json`/`biome.json`; it does not format or install
-tools. Quick mode does not typecheck, and a failed typecheck stops full-mode lint.
+tools. Installed quick mode requires Git and conservatively lints the full
+declared scope. It does not typecheck, and a failed typecheck stops full-mode lint.
+Neither checker mode runs the independent `bun test packages` completion command.
 No Gajaestack Bun preload or CI binding is activated; the existing conformance
 preload is unchanged. Required checks are completion instructions, not automatic
 enforcement or a claim that the baseline is green. Focused affected tests remain
-necessary for behavioral changes.
+necessary for behavioral changes. Selective agent-guidance loading is unverified
+and is not part of this package migration's acceptance.
 
 Firstmate retains Gajaeway/GJC execution ownership and PCD evidence discipline.
 Meaningful slices still require paired Luna6/Sol6.1 review; this adoption does not

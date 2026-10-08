@@ -649,6 +649,41 @@ function lateReceiptReconciled(current: WorkAttemptRuntime, next: WorkAttemptRun
 	);
 }
 
+/**
+ * Exact original terminal status re-observed for a locally settled attempt:
+ * explicit present receipt on this op's clientRef, coherent times bounded by
+ * the attempt start and the observation, and stable command/turn identity for
+ * binding the stored output. Missing evidence never qualifies.
+ */
+export function localSettledTerminalStatus(
+	runtime: Pick<WorkAttemptRuntime, "opRef" | "startedAt">,
+	status: PromptStatusBody | undefined,
+	observedAtMs: number,
+): status is PromptStatusBody {
+	if (!status) return false;
+	const startMs = Date.parse(runtime.startedAt);
+	const terminalAt = status.terminalAt;
+	if (
+		!Number.isFinite(startMs) ||
+		!Number.isFinite(observedAtMs) ||
+		status.status !== "terminal_ok" ||
+		status.receiptState !== "present" ||
+		status.clientRef !== runtime.opRef ||
+		typeof status.commandId !== "string" ||
+		status.commandId.length === 0 ||
+		typeof status.turnId !== "string" ||
+		status.turnId.length === 0 ||
+		terminalAt === undefined ||
+		!Number.isFinite(terminalAt) ||
+		terminalAt < startMs ||
+		terminalAt > observedAtMs
+	)
+		return false;
+	for (const time of [status.acceptedAt, status.startedAt]) {
+		if (time !== undefined && (!Number.isFinite(time) || time < startMs || time > terminalAt)) return false;
+	}
+	return status.acceptedAt === undefined || status.startedAt === undefined || status.acceptedAt <= status.startedAt;
+}
 /** Length-delimited identity hashing; independent of target, output and recovery time. */
 export function workAttemptDeliveryId(instanceId: string, jobId: string, opRef: string): string {
 	return `work-${createHash("sha256")
@@ -1841,7 +1876,7 @@ export class GatewayDatabase {
 					try {
 						const control = this.workControlGet(row.control_id)!;
 						if (control.phase !== "held" || control.receipt !== null) continue;
-						this.#workTaskDispositionControl(task, control);
+						this.#workTaskDispositionControl(task, control, unavailable);
 						controls.push({
 							kind: "control",
 							controlId: control.controlId,
@@ -1890,7 +1925,7 @@ export class GatewayDatabase {
 		});
 	}
 
-	#workTaskDispositionControl(task: WorkTask, control: WorkControl): void {
+	#workTaskDispositionControl(task: WorkTask, control: WorkControl, runtimeUnavailable: boolean): void {
 		taskAssert(
 			control.request.taskId === task.taskId &&
 				control.request.expectedOpRef === task.opRef &&
@@ -1898,6 +1933,7 @@ export class GatewayDatabase {
 				control.epoch === task.epoch,
 			"identity",
 		);
+		if (!runtimeUnavailable) return;
 		// Direct controls without a retained admission hash cannot independently
 		// authenticate a client reference when the runtime is unreadable.
 		const route = this.workTaskSourceGet(`route-${control.controlId}`);
@@ -2322,6 +2358,7 @@ export class GatewayDatabase {
 			identity: WorkTaskAttemptIdentity;
 			text: string;
 			at: string;
+			status: PromptStatusBody;
 			proof: {
 				source: "turn.result";
 				fullness: "original";
@@ -2343,13 +2380,26 @@ export class GatewayDatabase {
 		if (!task || task.version !== expectedVersion) return undefined;
 		this.#assertNotQuarantined("work", task.jobId);
 		const runtime = this.#workTaskRuntime(task, input.identity);
-		const status = runtime.terminal?.status;
+		const terminal = runtime.terminal;
+		const status = input.status;
 		const proof = input.proof;
+		// Broker settlements keep matching their immutable recorded status; a local
+		// settlement admits only the exact status re-observed for this attempt.
+		if (terminal?.kind === "local")
+			taskAssert(
+				runtime.settledAt !== null && localSettledTerminalStatus(runtime, status, Date.parse(input.at)),
+				"identity",
+			);
+		else
+			taskAssert(
+				terminal?.kind === "broker" &&
+					runtime.settledAt !== null &&
+					terminal.status !== undefined &&
+					taskJson(status) === taskJson(terminal.status),
+				"identity",
+			);
 		taskAssert(
-			runtime.terminal?.kind === "broker" &&
-				runtime.settledAt !== null &&
-				status &&
-				proof.source === "turn.result" &&
+			proof.source === "turn.result" &&
 				proof.fullness === "original" &&
 				proof.contentVersion === 1 &&
 				proof.sessionId === runtime.sessionId &&
@@ -2373,7 +2423,7 @@ export class GatewayDatabase {
 			sourceId: `supplement-proof-${taskId}-original`,
 			taskId,
 			kind: "decision",
-			body: taskJson({ identity: input.identity, proof }),
+			body: taskJson({ identity: input.identity, proof, status }),
 			evidence: {
 				principalId: "gateway",
 				origin: task.thread!,
@@ -2787,39 +2837,10 @@ export class GatewayDatabase {
 		);
 	}
 
-	/** Reference an already joined inbox/fallback row, never invent notification acceptance. */
-	workControlNotificationInTransaction(
-		controlId: string,
-		expectedVersion: number,
-		disposition: NonNullable<WorkControl["notificationDisposition"]>,
-	): WorkControl | undefined {
-		this.requireTransaction();
-		const control = this.workControlGet(controlId);
-		if (!control || control.version !== expectedVersion) return undefined;
-		const task = this.workTaskGet(control.request.taskId);
-		taskAssert(task, "unavailable");
-		this.#assertNotQuarantined("work", task.jobId);
-		taskAssert(control.notificationDisposition === null && disposition.id === control.notificationId, "identity");
-		const destination = originKey(task.request.coordinator);
-		taskAssert(
-			disposition.kind === "inbound"
-				? this.#database
-						.query("SELECT 1 FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND source = 'lane_report'")
-						.get(disposition.id, destination)
-				: disposition.kind === "delivery" &&
-						this.#database
-							.query("SELECT 1 FROM deliveries WHERE delivery_id = ? AND turn_id = ? AND origin_key = ?")
-							.get(disposition.id, task.opRef, destination),
-			"identity",
-		);
-		const next = { ...control, notificationDisposition: disposition, version: control.version + 1 };
-		this.#workControlCas(control, next);
-		return next;
-	}
-
 	workTaskSourceAppendInTransaction(input: WorkTaskSourceInput, delivery?: ChatMessagePayload): WorkTaskSource {
 		taskAssert(input.administrative === undefined && !/^disposition-[0-9a-f]{64}$/.test(input.sourceId), "invalid");
 		taskAssert(!/^unavailability-[0-9a-f]{64}$/.test(input.sourceId), "invalid");
+		taskAssert(input.review === undefined && !input.sourceId.startsWith("review-"), "invalid");
 		return this.#workTaskSourceAppendInTransaction(input, delivery);
 	}
 
@@ -3386,7 +3407,7 @@ export class GatewayDatabase {
 			}
 			const prior = this.#workTaskReviews(task.taskId).at(-1);
 			taskAssert((prior?.review?.reviewId ?? null) === input.expectedReviewId, "order");
-			const source = this.workTaskSourceAppendInTransaction({
+			const source = this.#workTaskSourceAppendInTransaction({
 				sourceId,
 				taskId: task.taskId,
 				kind: "decision",
@@ -3566,7 +3587,7 @@ export class GatewayDatabase {
 						control.clientRef === request.target.clientRef,
 					"identity",
 				);
-				if (request.validationUnavailable) this.#workTaskDispositionControl(task, control);
+				if (request.validationUnavailable) this.#workTaskDispositionControl(task, control, true);
 			} else
 				taskAssert(
 					request.target.reportId === null ||

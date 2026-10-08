@@ -325,10 +325,9 @@ export function classifyRecoveryFailure(error: unknown): RecoveryFailureClass {
 	const code = (error as { code?: unknown } | null | undefined)?.code;
 	if (code === "invalid_params" || code === "payload_too_large") return "terminal-message";
 	const message = error instanceof Error ? error.message : String(error);
-	// Request timeouts indicate the message payload itself consistently fails the gateway;
-	// link outages and connection errors ('not connected', 'client closed') are retryable.
-	if (/request timed out/i.test(message)) return "terminal-message";
-	if (/not connected|connection closed|client closed/i.test(message)) return "retryable";
+	// A request deadline that expires without any response is as silent as a closed
+	// link: it names no payload, so it never spends the terminal budget.
+	if (/request timed out|not connected|connection closed|client closed/i.test(message)) return "retryable";
 	return "write-path-unknown";
 }
 

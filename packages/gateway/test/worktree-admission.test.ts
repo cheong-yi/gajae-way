@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rename, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { admitDedicatedWorktree, revalidateDedicatedWorktree } from "../src/orchestrator/worktree-admission";
@@ -75,4 +75,38 @@ test("coordinator nested within worker cannot claim dedicated isolation", async 
 	const coordinator = join(f.worker, "coordinator");
 	await mkdir(coordinator);
 	expect(() => admitDedicatedWorktree(f.worker, coordinator)).toThrow();
+});
+
+test("missing or prunable sibling worktree cannot block a valid target", async () => {
+	const f = await fixture();
+	const other = join(f.root, "other");
+	git(f.primary, "worktree", "add", "-b", "other", other);
+	await rm(other, { recursive: true, force: true });
+	const listing = Bun.spawnSync(["git", "-C", f.worker, "worktree", "list", "--porcelain"], { stdout: "pipe" });
+	expect(listing.stdout.toString()).toContain("prunable");
+	const proof = admitDedicatedWorktree(f.worker, f.primary);
+	expect(proof.cwd).toBe(f.worker);
+	expect(() => revalidateDedicatedWorktree(proof)).not.toThrow();
+});
+
+test("selected registration drifting to a missing root fails closed", async () => {
+	const f = await fixture();
+	await writeFile(join(f.primary, ".git", "worktrees", "worker", "gitdir"), join(f.root, "gone", ".git"));
+	expect(() => admitDedicatedWorktree(f.worker, f.primary)).toThrow();
+});
+
+test("administrative backpointer forged to another worktree fails closed", async () => {
+	const f = await fixture();
+	const other = join(f.root, "other");
+	git(f.primary, "worktree", "add", "-b", "other", other);
+	await writeFile(join(f.worker, ".git"), `gitdir: ${join(f.primary, ".git", "worktrees", "other")}`);
+	expect(() => admitDedicatedWorktree(f.worker, f.primary)).toThrow();
+});
+
+test("two registrations naming the selected root fail admission", async () => {
+	const f = await fixture();
+	const other = join(f.root, "other");
+	git(f.primary, "worktree", "add", "-b", "other", other);
+	await writeFile(join(f.primary, ".git", "worktrees", "other", "gitdir"), join(f.worker, ".git"));
+	expect(() => admitDedicatedWorktree(f.worker, f.primary)).toThrow();
 });

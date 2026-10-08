@@ -7,6 +7,7 @@
       "devDependencies": {
         "@biomejs/biome": "2.5.2",
         "@types/bun": "^1.3.14",
+        "gajaestack": "./.gajaestack/packages/gajaestack-0.1.0-e6c93c8fe5b0811ad1a26ac2574d192f694c182f7cad9d40b0efce29a63a9b65.tgz",
         "typescript": "^5.9.3",
       },
     },
@@ -172,6 +173,8 @@
     "discord.js": ["discord.js@14.27.0", "", { "dependencies": { "@discordjs/builders": "^1.14.1", "@discordjs/collection": "1.5.3", "@discordjs/formatters": "^0.6.2", "@discordjs/rest": "^2.6.2", "@discordjs/util": "^1.2.0", "@discordjs/ws": "^1.2.3", "@sapphire/snowflake": "3.5.5", "discord-api-types": "^0.38.49", "fast-deep-equal": "3.1.3", "lodash.snakecase": "4.1.1", "magic-bytes.js": "^1.13.0", "tslib": "^2.6.3", "undici": "^6.27.0" } }, "sha512-qHbFlFG2N7y3LjPySYsL6A1+BnX6bkTVgo842EX0CqVPk/KTMwZkojPHEXKsQUpWZNyz5BISNHK1cPpQw0+m4A=="],
 
     "fast-deep-equal": ["fast-deep-equal@3.1.3", "", {}, "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q=="],
+
+    "gajaestack": ["gajaestack@./.gajaestack/packages/gajaestack-0.1.0-e6c93c8fe5b0811ad1a26ac2574d192f694c182f7cad9d40b0efce29a63a9b65.tgz", { "bin": { "gajaestack-check": "./typescript/check.ts" } }, "sha512-MNyYI+uuKzfzMJRxrr/A48Tg67J/ktSfsVmpQJ0vwuubvaUZfAC0aaZ1+0pgD7McvbLy5+8mPBnxoCUFr3CfaQ=="],
 
     "lodash": ["lodash@4.18.1", "", {}, "sha512-dMInicTPVE8d1e5otfwmmjlxkZoUpiVLwyeTdUsi/Caj/gfzzblBcCE5sRHV/AsjuCmxWrte2TNGSYuCeCq+0Q=="],
 

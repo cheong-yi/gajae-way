@@ -19,6 +19,7 @@
 	"devDependencies": {
 		"@biomejs/biome": "2.5.2",
 		"@types/bun": "^1.3.14",
+		"gajaestack": "./.gajaestack/packages/gajaestack-0.1.0-e6c93c8fe5b0811ad1a26ac2574d192f694c182f7cad9d40b0efce29a63a9b65.tgz",
 		"typescript": "^5.9.3"
 	},
 	"engines": {

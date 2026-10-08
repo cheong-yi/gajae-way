@@ -41,9 +41,13 @@ test("Discord event-time guidance is platform-only and uses viewer-local timesta
 	expect(loopback).not.toContain("<t:UNIX:f>");
 });
 
-async function connect(
-	socketPath: string,
-): Promise<{ send(value: unknown): void; frames: any[]; wireLines: string[]; close(): void }> {
+async function connect(socketPath: string): Promise<{
+	send(value: unknown): void;
+	writeRaw(bytes: Uint8Array): void;
+	frames: any[];
+	wireLines: string[];
+	close(): void;
+}> {
 	const frames: any[] = [];
 	const wireLines: string[] = [];
 	let buffered = Buffer.alloc(0);
@@ -65,7 +69,13 @@ async function connect(
 			},
 		},
 	});
-	return { send: (value) => socket.write(`${JSON.stringify(value)}\n`), frames, wireLines, close: () => socket.end() };
+	return {
+		send: (value) => socket.write(`${JSON.stringify(value)}\n`),
+		writeRaw: (bytes) => socket.write(bytes),
+		frames,
+		wireLines,
+		close: () => socket.end(),
+	};
 }
 
 async function waitFor(frames: any[], count: number): Promise<void> {
@@ -3016,4 +3026,124 @@ test("status reports each connected client's generation and flags an adapter old
 	stale.close();
 	fresh.close();
 	anonymous.close();
+});
+
+type SplitGate = {
+	buffer: Buffer;
+	splitAt: number;
+	splitDone: boolean;
+	/** Production data-callback deliveries performed while the gate was armed. */
+	deliveries: number;
+};
+type ListenOptions = { socket: { data: (socket: unknown, data: Buffer) => void } };
+
+test("a request split mid-codepoint at the real socket.data callback recovers the exact payload (#420)", async () => {
+	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-split-receive-"));
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open" as const,
+	};
+	const database = await GatewayDatabase.open(config.dbPath);
+	const sessionPort = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, sessionPort, join(directory, "agent"));
+	let splitGate: SplitGate | undefined;
+
+	// Wrap the real Bun.listen data callback: the production handler must receive the
+	// dangling lead byte and the continuation bytes as two separate deliveries no matter
+	// how the kernel fragments the socket write. Test-side interception only - no
+	// product seam. Outside the armed window the handler sees raw OS data unchanged.
+	const bun = Bun as unknown as { listen: (options: ListenOptions) => unknown };
+	const originalListen = bun.listen;
+	bun.listen = (options: ListenOptions) => {
+		const realData = options.socket.data;
+		options.socket.data = (socket, data) => {
+			const gate = splitGate;
+			if (!gate) return realData(socket, data);
+			gate.buffer = Buffer.concat([gate.buffer, data]);
+			if (!gate.splitDone) {
+				if (gate.buffer.length < gate.splitAt) return;
+				gate.splitDone = true;
+				const head = gate.buffer.subarray(0, gate.splitAt);
+				const rest = gate.buffer.subarray(gate.splitAt);
+				gate.buffer = Buffer.alloc(0);
+				gate.deliveries++;
+				realData(socket, head);
+				if (rest.length === 0) return;
+				gate.deliveries++;
+				realData(socket, rest);
+				return;
+			}
+			const tail = gate.buffer;
+			gate.buffer = Buffer.alloc(0);
+			gate.deliveries++;
+			realData(socket, tail);
+		};
+		return originalListen(options);
+	};
+	try {
+		server = await startUnixServer({ config, database, sessionPort, onStop: () => database.close() });
+		const client = await connect(config.socketPath);
+		client.send({ v: PROFILE_VERSION, type: "hello", payload: { supportedVersions: [PROFILE_VERSION] } });
+		await waitFor(client.frames, 1);
+
+		const origin = { platform: "discord" as const, kind: "channel" as const, conversationId: "C1" };
+		const text = "한글 테스트 안녕하세요";
+		const probe = `${JSON.stringify({ v: PROFILE_VERSION, type: "request", id: "probe", verb: "gateway.status" })}\n`;
+		const chat = `${JSON.stringify({
+			v: PROFILE_VERSION,
+			type: "request",
+			id: "split-chat",
+			verb: "chat.send",
+			params: {
+				origin,
+				text,
+				messageId: "split-mb-1",
+				engagement: { mentioned: false, group: false, authorId: "human" },
+			},
+		})}\n`;
+		const probeBytes = Buffer.from(probe, "utf8");
+		const chatBytes = Buffer.from(chat, "utf8");
+		const lead = chatBytes.findIndex((byte) => byte >= 0xc0);
+		expect(lead).toBeGreaterThan(0);
+		// A continuation byte follows the cut: the boundary sits inside one codepoint.
+		expect(chatBytes[lead + 1] & 0xc0).toBe(0x80);
+
+		const splitAt = probeBytes.length + lead + 1;
+		splitGate = { buffer: Buffer.alloc(0), splitAt, splitDone: false, deliveries: 0 };
+		client.writeRaw(Buffer.concat([probeBytes, chatBytes]));
+		await waitFrame(client.frames, "probe");
+		expect(client.frames.find((frame) => frame.id === "probe")).toMatchObject({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: "probe",
+		});
+		await waitFrame(client.frames, "split-chat");
+		// Wait for the complete request before asserting both callback deliveries:
+		// the kernel may deliver the remainder after the probe response.
+		expect(splitGate?.splitDone).toBe(true);
+		expect(splitGate?.deliveries).toBeGreaterThanOrEqual(2);
+		// Exact gateway writer payload: the response frame, key for key.
+		expect(client.frames.find((frame) => frame.id === "split-chat")).toEqual({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: "split-chat",
+			result: { turnId: null, engaged: false },
+		});
+		// Exact persisted payload: the decoded request body reached the context ledger
+		// byte-for-byte; a non-streaming decode of the split would yield U+FFFD here.
+		expect(database.contextUnread(originKey(origin)).map((row) => row.body)).toEqual([text]);
+		// No decode/protocol error frames, and exactly the two responses in order.
+		expect(client.frames.filter((frame) => frame.type === "error")).toEqual([]);
+		const responses = client.frames.filter((frame) => frame.type === "response").map((frame) => frame.id);
+		expect(responses).toEqual(["probe", "split-chat"]);
+		client.close();
+	} finally {
+		bun.listen = originalListen;
+		splitGate = undefined;
+	}
 });

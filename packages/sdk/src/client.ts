@@ -234,11 +234,13 @@ export class GajaewayClient {
 			}, this.#requestTimeoutMs);
 			this.#pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
 		});
-		try {
-			await transport.write(frame);
-		} catch (error) {
+		// Adopt the deadline-bearing response promise before any write progress:
+		// a stalled drain must not strand the timeout rejection as an unhandled
+		// rejection while the caller waits behind the ordered writer. Write
+		// failures stay terminal through the existing disconnect path.
+		void transport.write(frame).catch((error) => {
 			this.#fail(error instanceof Error ? error : new Error(String(error)));
-		}
+		});
 		return promise;
 	}
 
@@ -299,13 +301,13 @@ export class GajaewayClient {
 			}, this.#requestTimeoutMs);
 			void transport
 				.write({
-						v: PROFILE_VERSION,
-						type: "hello",
-						payload: {
-							supportedVersions: [PROFILE_VERSION],
-							clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
-						},
-					})
+					v: PROFILE_VERSION,
+					type: "hello",
+					payload: {
+						supportedVersions: [PROFILE_VERSION],
+						clientInfo: { name: this.#clientName, startedAt: processStartedAt() },
+					},
+				})
 				.catch((error) => this.#fail(error instanceof Error ? error : new Error(String(error))));
 		});
 		return this.#negotiated;

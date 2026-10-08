@@ -11,6 +11,7 @@ import {
 	type OriginRef,
 	PRESENCE_ALL_MARKERS,
 	type PresenceState,
+	ProtocolError,
 	presenceInitial,
 	presenceMarkersFor,
 	presenceTransition,
@@ -1003,32 +1004,67 @@ export async function fetchMappedThread(
 	return verifyMappedThread(await discord.channels.fetch(origin.conversationId, { force: true }), origin);
 }
 
-/** One bounded pass in the adapter's existing reconciliation loop, not a scheduler. */
+export interface DiscordTaskDiscoveryContinuation {
+	readonly afterTaskId: string | undefined;
+	readonly origins: ReadonlyMap<string, WorkTaskThreadOrigin>;
+	/** Actual sweep errors, not exhaustion of a single pass's page budget. */
+	readonly incomplete: boolean;
+}
+
+/** At most 100 pages per pass, retaining sweep evidence in the existing recovery owner. */
 export async function reconcileDiscordWorkTasks(
 	gateway: Pick<GatewayClientLike, "request">,
 	discord: DiscordClientLike,
 	log: Pick<Console, "error"> = console,
 	knownOrigins: ReadonlyMap<string, WorkTaskThreadOrigin> = new Map(),
-): Promise<{ readonly origins: ReadonlyMap<string, WorkTaskThreadOrigin>; readonly incomplete: boolean }> {
-	const origins = new Map<string, WorkTaskThreadOrigin>();
-	const cursors = new Set<string>();
-	let afterTaskId: string | undefined;
-	let incomplete = false;
+	continuation?: DiscordTaskDiscoveryContinuation,
+): Promise<{
+	readonly origins: ReadonlyMap<string, WorkTaskThreadOrigin>;
+	readonly incomplete: boolean;
+	/** Retained sweep state; undefined once the sweep reaches its end. */
+	readonly continuation: DiscordTaskDiscoveryContinuation | undefined;
+}> {
+	const origins = new Map(continuation?.origins);
+	let afterTaskId = continuation?.afterTaskId;
+	let incomplete = continuation?.incomplete ?? false;
 	let projectionDiagnostics = 0;
-	const projectionFailure = (message: string) => {
+	const discoveryFailure = (message: string) => {
 		incomplete = true;
 		if (projectionDiagnostics++ < 20) log.error(`Discord task discovery incomplete: ${message}`);
 	};
+	const unfinished = () => ({
+		origins: new Map([...knownOrigins, ...origins]),
+		incomplete: true,
+		continuation: { afterTaskId, origins, incomplete },
+	});
+	/** Preserve partial addressing and the exact cursor even when a later page fails. */
+	const stop = (message: string) => {
+		discoveryFailure(message);
+		return unfinished();
+	};
 	for (let page = 0; page < 100; page++) {
-		const result = await gateway.request<WorkJobsResult>(
-			"work.jobs",
-			validateWorkJobsParams(afterTaskId === undefined ? undefined : { afterTaskId }),
-		);
-		if (!Array.isArray(result.tasks) || result.tasks.length > 20) throw new Error("Invalid work.jobs task page");
+		let result: WorkJobsResult;
+		try {
+			result = await gateway.request<WorkJobsResult>(
+				"work.jobs",
+				validateWorkJobsParams(afterTaskId === undefined ? undefined : { afterTaskId }),
+			);
+			if (
+				!Array.isArray(result.tasks) ||
+				result.tasks.length > 20 ||
+				result.tasks.some((task) => typeof task !== "object" || !task)
+			) {
+				throw new Error("Invalid work.jobs task page");
+			}
+		} catch (error) {
+			// A failure after successful pages keeps this pass's accumulated origins and
+			// the cursor it reached: the next pass resumes instead of restarting the sweep.
+			return stop(errorMessage(error));
+		}
 		// Projection errors contain identities, not recoverable surface facts. Never
 		// turn a tombstone into a claim, an origin, or permission to create a thread.
 		if (!Array.isArray(result.taskErrors) || result.taskErrors.length + result.tasks.length > 20) {
-			projectionFailure("Invalid work.jobs taskErrors page");
+			discoveryFailure("Invalid work.jobs taskErrors page");
 		}
 		const errorIds = new Set<string>();
 		if (Array.isArray(result.taskErrors))
@@ -1051,19 +1087,20 @@ export async function reconcileDiscordWorkTasks(
 					errorIds.add(error.taskId);
 					if (duplicate || result.tasks.some((task) => task.taskId === error.taskId))
 						throw new Error("Conflicting projection error identity");
-					projectionFailure(
+					discoveryFailure(
 						`task ${error.taskId} projection unavailable: ${JSON.stringify(error.reason.slice(0, 256))}`,
 					);
 				} catch {
-					projectionFailure("Invalid work.jobs taskErrors entry");
+					discoveryFailure("Invalid work.jobs taskErrors entry");
 				}
 			}
 		for (const task of result.tasks) {
 			if (errorIds.has(task.taskId)) continue;
-			const surface = task.surface;
-			const claimId = "claimId" in surface && surface.claimId ? surface.claimId : task.taskId;
+			let claimId = task.taskId;
 			let mayHold = false;
 			try {
+				const surface = task.surface;
+				claimId = "claimId" in surface && surface.claimId ? surface.claimId : task.taskId;
 				if (surface.phase === "held") continue;
 				if (surface.phase === "bound") {
 					origins.set(surface.origin.conversationId, surface.origin);
@@ -1174,19 +1211,29 @@ export async function reconcileDiscordWorkTasks(
 				}
 			}
 		}
-		if (result.nextTaskId === undefined)
+		const nextTaskId = result.nextTaskId;
+		if (nextTaskId === undefined) {
 			return {
 				// An incomplete scan cannot establish that previously known addressing
 				// disappeared. Retention is not proof the target is currently usable.
+				// A clean completed sweep includes its retained prefix, but not stale mappings.
 				origins: incomplete ? new Map([...knownOrigins, ...origins]) : origins,
 				incomplete,
+				continuation: undefined,
 			};
-		validateWorkJobsParams({ afterTaskId: result.nextTaskId });
-		if (cursors.has(result.nextTaskId)) throw new Error("work.jobs cursor loop");
-		cursors.add(result.nextTaskId);
-		afterTaskId = result.nextTaskId;
+		}
+		try {
+			validateWorkJobsParams({ afterTaskId: nextTaskId });
+		} catch (error) {
+			return stop(errorMessage(error));
+		}
+		// Keyset pages must strictly advance: a repeat or regression can only spin the
+		// prefix, so this pass stops and the next one resumes from the last good cursor.
+		if (afterTaskId !== undefined && !(nextTaskId > afterTaskId)) return stop("work.jobs cursor loop");
+		afterTaskId = nextTaskId;
 	}
-	throw new Error("work.jobs discovery page bound exceeded");
+	// A budget boundary is not a failed sweep; its clean suffix may finish normally.
+	return unfinished();
 }
 
 export async function settleDiscordDelivery(
@@ -1548,7 +1595,16 @@ export async function startDiscordAdapter(config: LoadedDiscordAdapterConfig): P
 			// spoken message is answered in voice and text both, without the
 			// persona having to ask for it.
 			const spoken = firstVoiceMessage(message) !== undefined;
-			gateway.sendInbound(message.id as string, origin, body, engagement, receivedAt, spoken, message.createdTimestamp, messageChannelId);
+			gateway.sendInbound(
+				message.id as string,
+				origin,
+				body,
+				engagement,
+				receivedAt,
+				spoken,
+				message.createdTimestamp,
+				messageChannelId,
+			);
 		});
 	});
 	// An edit is an update of a message the persona may already have read, not a
@@ -1776,8 +1832,26 @@ export async function handleSlashCommand(
 					: { content: "not authorized for session commands here", ephemeral: true },
 		);
 	} catch (error) {
+		if (mappedSlashRefusal(error)) {
+			await interaction.reply({
+				content: `/${command} is not supported in mapped task threads. Use a normal message to steer this task. No task or session change was made.`,
+				ephemeral: true,
+			});
+			return;
+		}
 		log.error(`Discord slash command failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
+}
+
+function mappedSlashRefusal(error: unknown): boolean {
+	return (
+		error instanceof ProtocolError &&
+		error.code === "invalid_params" &&
+		typeof error.detail === "object" &&
+		error.detail !== null &&
+		"reasonCode" in error.detail &&
+		error.detail.reasonCode === "mapped_slash_unsupported"
+	);
 }
 
 /** Outcome of one recovery send; every failure carries its classification. */
@@ -1802,6 +1876,7 @@ export class ReconnectingGateway {
 	readonly #unreadableRecoveryTargets = new Map<string, number>();
 	#recoverableIds = new Set<string>();
 	#mappedOrigins: ReadonlyMap<string, WorkTaskThreadOrigin> = new Map();
+	#discovery: DiscordTaskDiscoveryContinuation | undefined;
 
 	constructor(
 		readonly socketPath: string,
@@ -1888,22 +1963,26 @@ export class ReconnectingGateway {
 			const pruned = pruneKnownDms(this.#cursors, Date.now());
 			if (pruned !== this.#cursors) this.persist(pruned);
 			const configuredIds = Object.keys(this.config.channels ?? {});
-			let tasks: Awaited<ReturnType<typeof reconcileDiscordWorkTasks>>;
-			try {
-				tasks = await reconcileDiscordWorkTasks(this.#client, this.discord, console, this.#mappedOrigins);
-			} catch (error) {
-				console.error(`Discord task discovery incomplete: ${errorMessage(error)}`);
-				tasks = { origins: this.#mappedOrigins, incomplete: true };
-			}
+			// Discovery is total: an unfinished sweep hands back its accumulated origins,
+			// the cursor to resume from and the errors it already observed, so only a
+			// finished sweep starts the next one from scratch.
+			const tasks = await reconcileDiscordWorkTasks(
+				this.#client,
+				this.discord,
+				console,
+				this.#mappedOrigins,
+				this.#discovery,
+			);
+			let incomplete = tasks.incomplete;
 			this.#mappedOrigins = tasks.origins;
+			this.#discovery = tasks.continuation;
 			const queue = [...configuredIds, ...Object.keys(this.#cursors.knownDms), ...tasks.origins.keys()];
 			if (queue.length === 0) {
-				completed = !tasks.incomplete;
+				completed = !incomplete;
 				return;
 			}
 			const seen = new Set<string>();
 			this.#recoverableIds = new Set(queue);
-			let incomplete = tasks.incomplete;
 			for (let index = 0; index < queue.length; index++) {
 				const conversationId = queue[index] as string;
 				if (seen.has(conversationId)) continue;
@@ -2253,7 +2332,16 @@ export class ReconnectingGateway {
 		platformCreatedAt?: number,
 		messageChannelId?: string,
 	): void {
-		void this.requestInbound(messageId, origin, text, engagement, receivedAt, voice, platformCreatedAt, messageChannelId);
+		void this.requestInbound(
+			messageId,
+			origin,
+			text,
+			engagement,
+			receivedAt,
+			voice,
+			platformCreatedAt,
+			messageChannelId,
+		);
 	}
 
 	/**
@@ -2432,6 +2520,8 @@ export class ReconnectingGateway {
 				}
 				return "acked";
 			} catch (error) {
+				// A permanent mapped-surface refusal is not a transport outage or a retry.
+				if (mappedSlashRefusal(error)) throw error;
 				// Never silent (#176): a live message the gateway did not accept is only
 				// recovered by the next backfill pass, so the drop must be traceable to
 				// the message and conversation it belongs to.

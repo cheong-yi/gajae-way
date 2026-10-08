@@ -37,21 +37,21 @@ export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): Ded
 		)
 			throw new Error();
 		const records = git("worktree", "list", "--porcelain", "-z").split("\0\0").filter(Boolean);
-		const paths = records.map((record) => {
+		// Unrelated registrations may be missing or prunable; only the selected record's integrity gates this target.
+		const registrations = records.map((record) => {
 			const fields = record.split("\0");
 			const field = fields.find((item) => item.startsWith("worktree "));
-			if (!field || fields.some((item) => item.startsWith("prunable"))) throw new Error();
-			return realpathSync(field.slice(9));
+			if (!field) throw new Error();
+			return {
+				root: registeredRoot(field.slice(9)),
+				prunable: fields.some((item) => item.startsWith("prunable")),
+			};
 		});
-		const primary = paths[0];
-		if (
-			!primary ||
-			paths.filter((path) => path === target).length !== 1 ||
-			target === primary ||
-			overlaps(target, coordinator) ||
-			overlaps(target, primary)
-		)
-			throw new Error();
+		// Exactly one intact registration must name the canonical selected root.
+		const selected = registrations.filter((registration) => registration.root === target);
+		if (selected.length !== 1 || selected[0].prunable) throw new Error();
+		const primary = registrations[0]?.root;
+		if (!primary || target === primary || overlaps(target, coordinator) || overlaps(target, primary)) throw new Error();
 		// The linked administrative directory must point back to this exact worktree.
 		if (realpathSync(readFileSync(resolve(gitDir, "gitdir"), "utf8").trim()) !== realpathSync(resolve(target, ".git")))
 			throw new Error();
@@ -75,6 +75,15 @@ function overlaps(a: string, b: string): boolean {
 		return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
 	};
 	return inside(a, b) || inside(b, a);
+}
+
+/** Unresolvable registration paths (vanished directories) cannot name the selected root. */
+function registeredRoot(registered: string): string | undefined {
+	try {
+		return realpathSync(registered);
+	} catch {
+		return undefined;
+	}
 }
 
 /** Re-read Git registration and realpaths immediately before transport; fail closed on drift. */

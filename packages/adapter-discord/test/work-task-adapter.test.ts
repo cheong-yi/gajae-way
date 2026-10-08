@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,12 +10,15 @@ import type {
 	WorkThreadBindParams,
 	WorkThreadClaimParams,
 } from "@gajae-gateway/protocol";
+import { ProtocolError } from "@gajae-gateway/protocol";
 import { ChannelType } from "discord.js";
 import {
 	type DiscordClientLike,
 	type DiscordInboundMessage,
+	type DiscordTaskDiscoveryContinuation,
 	decideInbound,
 	describeMessageEdit,
+	handleSlashCommand,
 	type GatewayClientLike,
 	ReconnectingGateway,
 	reconcileDiscordWorkTasks,
@@ -99,6 +102,10 @@ function inbound(createdTimestamp: number): DiscordInboundMessage {
 		channel: { id: origin.conversationId, type: ChannelType.PublicThread, parentId: origin.parentId },
 	};
 }
+
+/** Canonical, strictly ascending work-task keyset ids for discovery pagination fixtures. */
+const keyAt = (index: number) => `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+const keyIndex = (cursor: string) => Number.parseInt(cursor.slice(-12), 16);
 
 // No SDK connection or Discord client is created in these boundary fixtures.
 test("fresh claim precedes one create, exact verification precedes bind, and rediscovery never recreates", async () => {
@@ -184,7 +191,7 @@ test("selected thread claims then verifies and binds without creation permission
 	expect(events).toEqual(["work.jobs", "work.thread.claim", "verify", "work.thread.bind"]);
 });
 
-test("discovery follows nextTaskId, retains bound recovery targets, and rejects cursor loops", async () => {
+test("discovery follows nextTaskId, retains bound recovery targets, and stops without progress on cursor loops", async () => {
 	const nextOrigin = { ...origin, conversationId: "1556589606403842129" };
 	const pages: unknown[] = [];
 	const client = gateway((verb, params) => {
@@ -197,24 +204,136 @@ test("discovery follows nextTaskId, retains bound recovery targets, and rejects 
 	const result = await reconcileDiscordWorkTasks(client, { channels: { fetch: async (id) => thread({ id }) } }, quiet);
 	expect(pages).toEqual([undefined, { afterTaskId: taskId }]);
 	expect([...result.origins.keys()]).toEqual([origin.conversationId, nextOrigin.conversationId]);
+	const diagnostics: string[] = [];
 	let calls = 0;
-	await expect(
-		reconcileDiscordWorkTasks(
-			gateway(() => {
-				calls++;
-				return { jobs: [], tasks: [], taskErrors: [], nextTaskId: taskId };
-			}),
-			{
-				channels: {
-					fetch: async () => {
-						throw new Error("must not fetch");
-					},
+	const stalled = await reconcileDiscordWorkTasks(
+		gateway(() => {
+			calls++;
+			return { jobs: [], tasks: [], taskErrors: [], nextTaskId: taskId };
+		}),
+		{
+			channels: {
+				fetch: async () => {
+					throw new Error("must not fetch");
 				},
 			},
-			quiet,
-		),
-	).rejects.toThrow("cursor loop");
+		},
+		{ error: (line) => diagnostics.push(line) },
+	);
+	// A cursor that never advances stops the pass after the page that repeated it,
+	// returning the position instead of throwing the accumulated work away.
 	expect(calls).toBe(2);
+	expect(stalled.incomplete).toBe(true);
+	expect(stalled.continuation?.afterTaskId).toBe(taskId);
+	expect(stalled.continuation?.incomplete).toBe(true);
+	expect([...stalled.origins.keys()]).toEqual([]);
+	expect(diagnostics).toEqual([expect.stringContaining("cursor loop")]);
+});
+
+test("a mid-sweep failure keeps accumulated origins and the cursor; the error stays sticky", async () => {
+	const secondOrigin = { ...origin, conversationId: "1556589606403842132" };
+	const diagnostics: string[] = [];
+	const requests: unknown[] = [];
+	let broken = true;
+	const client = gateway((verb, params) => {
+		expect(verb).toBe("work.jobs");
+		requests.push(params);
+		if (broken && requests.length === 3) throw new Error("gateway link dropped");
+		const start = params === undefined ? 0 : keyIndex((params as { afterTaskId: string }).afterTaskId) + 1;
+		const end = Math.min(start + 20, 60);
+		const tasks = Array.from({ length: end - start }, (_, offset) => {
+			const index = start + offset;
+			if (index === 0) return task({ phase: "bound", origin }, keyAt(0));
+			if (index === 50) return task({ phase: "bound", origin: secondOrigin }, keyAt(50));
+			return task({ phase: "held", reason: "queued" }, keyAt(index));
+		});
+		return { jobs: [], tasks, taskErrors: [], ...(end < 60 ? { nextTaskId: keyAt(end - 1) } : {}) };
+	});
+	const discord = { channels: { fetch: async (id: string) => thread({ id }) } };
+	const first = await reconcileDiscordWorkTasks(client, discord, { error: (line) => diagnostics.push(line) });
+	// Pages 0 and 1 succeeded before page 2 failed: their origins and the cursor page
+	// 2 would have started from are returned, not thrown away.
+	expect(requests).toEqual([undefined, { afterTaskId: keyAt(19) }, { afterTaskId: keyAt(39) }]);
+	expect(first.incomplete).toBe(true);
+	expect(first.continuation?.afterTaskId).toBe(keyAt(39));
+	expect(first.continuation?.incomplete).toBe(true);
+	expect([...(first.continuation?.origins ?? new Map()).keys()]).toEqual([origin.conversationId]);
+	expect([...first.origins.keys()]).toEqual([origin.conversationId]);
+	expect(diagnostics).toEqual([expect.stringContaining("gateway link dropped")]);
+
+	broken = false;
+	const second = await reconcileDiscordWorkTasks(
+		client,
+		discord,
+		{ error: (line) => diagnostics.push(line) },
+		first.origins,
+		first.continuation,
+	);
+	expect(requests[3]).toEqual({ afterTaskId: keyAt(39) });
+	// The resumed pass pages cleanly, but the sweep's earlier failure is sticky:
+	// the sweep ends unclean, so known mappings merge in and the owner retries a
+	// fresh sweep instead of quiescing or pruning.
+	expect(second.incomplete).toBe(true);
+	expect(second.continuation).toBeUndefined();
+	expect([...second.origins.keys()]).toEqual([origin.conversationId, secondOrigin.conversationId]);
+});
+
+test("cursor safety: backward or repeated cursors stop the pass and keep known mappings", async () => {
+	const diagnostics: string[] = [];
+	const known: ReadonlyMap<string, WorkTaskThreadOrigin> = new Map([[origin.conversationId, origin]]);
+	const discord = {
+		channels: {
+			fetch: async () => {
+				throw new Error("must not fetch");
+			},
+		},
+	};
+	const log = { error: (line: string) => diagnostics.push(line) };
+
+	// A backward cursor would rescan the prefix forever; the pass stops on it.
+	const backwardPages: unknown[] = [];
+	let served = 0;
+	const backward = await reconcileDiscordWorkTasks(
+		gateway((verb, params) => {
+			expect(verb).toBe("work.jobs");
+			backwardPages.push(params);
+			return ++served === 1
+				? { jobs: [], tasks: [], taskErrors: [], nextTaskId: keyAt(50) }
+				: { jobs: [], tasks: [], taskErrors: [], nextTaskId: keyAt(10) };
+		}),
+		discord,
+		log,
+		known,
+	);
+	expect(backwardPages).toEqual([undefined, { afterTaskId: keyAt(50) }]);
+	expect(backward.incomplete).toBe(true);
+	expect(backward.continuation?.afterTaskId).toBe(keyAt(50));
+	expect(backward.continuation?.incomplete).toBe(true);
+	expect([...backward.origins.values()]).toEqual([origin]);
+
+	// A resumed sweep that repeats its own continuation stops after that single page.
+	const resumedPages: unknown[] = [];
+	const repeat: DiscordTaskDiscoveryContinuation = {
+		afterTaskId: keyAt(50),
+		origins: new Map<string, WorkTaskThreadOrigin>(),
+		incomplete: false,
+	};
+	const resumed = await reconcileDiscordWorkTasks(
+		gateway((verb, params) => {
+			expect(verb).toBe("work.jobs");
+			resumedPages.push(params);
+			return { jobs: [], tasks: [], taskErrors: [], nextTaskId: keyAt(50) };
+		}),
+		discord,
+		log,
+		known,
+		repeat,
+	);
+	expect(resumedPages).toEqual([{ afterTaskId: keyAt(50) }]);
+	expect(resumed.incomplete).toBe(true);
+	expect(resumed.continuation?.afterTaskId).toBe(keyAt(50));
+	expect([...resumed.origins.values()]).toEqual([origin]);
+	expect(diagnostics.filter((line) => line.includes("cursor loop"))).toHaveLength(2);
 });
 
 test("persisted duplicate create claim keeps the original claim ID and holds without creating", async () => {
@@ -961,6 +1080,324 @@ test("existing recovery pass discovers a bound task outside configured channels 
 			await gw.recoverMissedMessages();
 		}
 		expect(gw.recoveryRetryPending).toBe(false);
+	} finally {
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("stable 2020-key sweeps quiesce on clean EOF; stale mappings prune only on a clean sweep", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-task-continuation-"));
+	const prefixOrigin = { ...origin, conversationId: "1556589606403842130" };
+	const staleOrigin = { ...origin, conversationId: "1556589606403842132" };
+	const suffixOrigin = { ...origin, conversationId: "1556589606403842131" };
+	const total = 2020;
+	// Sweep 1 proves every mapping including the one that later goes stale; sweep 2
+	// drops that task's binding so only its finished clean sweep may prune it.
+	let staleBound = true;
+	const discovery: unknown[] = [];
+	const mutations: string[] = [];
+	const fetches: string[] = [];
+	const fetchPasses: string[][] = [];
+	const discoveryErrors: string[] = [];
+	const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+		discoveryErrors.push(args.map(String).join(" "));
+	});
+	try {
+		const client = gateway((verb, params) => {
+			if (verb !== "work.jobs") {
+				mutations.push(verb);
+				throw new Error(`unexpected ${verb}`);
+			}
+			discovery.push(params);
+			const start = params === undefined ? 0 : keyIndex((params as { afterTaskId: string }).afterTaskId) + 1;
+			const end = Math.min(start + 20, total);
+			const tasks: WorkTaskProjection[] = [];
+			for (let index = start; index < end; index++) {
+				if (index === 0) tasks.push(task({ phase: "bound", origin: prefixOrigin }, keyAt(0)));
+				else if (index === 10 && staleBound) tasks.push(task({ phase: "bound", origin: staleOrigin }, keyAt(10)));
+				else if (index === total - 1) tasks.push(task({ phase: "bound", origin: suffixOrigin }, keyAt(total - 1)));
+				else tasks.push(task({ phase: "held", reason: "queued" }, keyAt(index)));
+			}
+			return { jobs: [], tasks, taskErrors: [], ...(end < total ? { nextTaskId: keyAt(end - 1) } : {}) };
+		});
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async (id: string, options?: { force?: boolean }) => {
+					expect(options?.force).toBe(true);
+					fetches.push(id);
+					return thread({ id, messages: { fetch: async () => [] } });
+				},
+			},
+		};
+		const gw = new ReconnectingGateway(
+			"unused",
+			discord,
+			{
+				tokenFile: join(home, "token"),
+				token: "test-token",
+				configPath: join(home, "adapter-discord.json"),
+				channels: {},
+			},
+			undefined,
+			undefined,
+			join(home, "cursor.json"),
+			() => me,
+			client as never,
+			async () => {},
+		);
+		const pass = async () => {
+			await gw.recoverMissedMessages();
+			fetchPasses.push(fetches.splice(0));
+		};
+
+		// Pass 1 stops at the 100-page/2000-key bound: unfinished, armed for retry,
+		// and never logged as a discovery error.
+		await pass();
+		expect(discovery).toHaveLength(100);
+		expect(fetchPasses[0]).toEqual([
+			prefixOrigin.conversationId,
+			staleOrigin.conversationId,
+			prefixOrigin.conversationId,
+			staleOrigin.conversationId,
+		]);
+		expect(gw.recoveryRetryPending).toBe(true);
+		expect(discoveryErrors.filter((line) => line.includes("Discord task discovery"))).toEqual([]);
+
+		// Pass 2 resumes at the continuation instead of rescanning the prefix, finds
+		// the suffix beyond the bound, and its clean EOF quiesces the owner: no third
+		// fresh sweep is armed.
+		await pass();
+		expect(discovery).toHaveLength(101);
+		expect(discovery[100]).toEqual({ afterTaskId: keyAt(1999) });
+		expect(fetchPasses[1]).toEqual([
+			suffixOrigin.conversationId,
+			prefixOrigin.conversationId,
+			staleOrigin.conversationId,
+			suffixOrigin.conversationId,
+		]);
+		expect(gw.recoveryRetryPending).toBe(false);
+
+		// Sweep 2: the stale binding is gone. Mid-sweep the known map still retains
+		// it (retention is not proof of current usability), and the budgeted pass
+		// again restarts from a fresh sweep retry.
+		staleBound = false;
+		await pass();
+		expect(discovery).toHaveLength(201);
+		expect(discovery[101]).toBeUndefined();
+		expect(fetchPasses[2]).toEqual([
+			prefixOrigin.conversationId,
+			prefixOrigin.conversationId,
+			staleOrigin.conversationId,
+			suffixOrigin.conversationId,
+		]);
+		expect(gw.recoveryRetryPending).toBe(true);
+
+		// Only the fully clean EOF may prune: prefix (carried from the sweep's own
+		// cumulative origins, never rescanned) and suffix remain, stale disappears,
+		// and no further pass is armed for the stable inventory.
+		await pass();
+		expect(discovery).toHaveLength(202);
+		expect(discovery[201]).toEqual({ afterTaskId: keyAt(1999) });
+		expect(fetchPasses[3]).toEqual([
+			suffixOrigin.conversationId,
+			prefixOrigin.conversationId,
+			suffixOrigin.conversationId,
+		]);
+		expect(gw.recoveryRetryPending).toBe(false);
+		// Discovery only ever verifies mapped surfaces: no claim, bind, or creation.
+		expect(mutations).toEqual([]);
+		expect(discoveryErrors.filter((line) => line.includes("Discord task discovery"))).toEqual([]);
+		await gw.cursorsFlushed;
+	} finally {
+		errorSpy.mockRestore();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("discovery errors stick across passes: only a fresh clean sweep quiesces", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-task-errors-"));
+	const prefixOrigin = { ...origin, conversationId: "1556589606403842130" };
+	const suffixOrigin = { ...origin, conversationId: "1556589606403842131" };
+	const total = 2020;
+	let tombstone = true;
+	const discovery: unknown[] = [];
+	const fetches: string[] = [];
+	const fetchPasses: string[][] = [];
+	const discoveryErrors: string[] = [];
+	const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+		discoveryErrors.push(args.map(String).join(" "));
+	});
+	try {
+		const client = gateway((verb, params) => {
+			expect(verb).toBe("work.jobs");
+			discovery.push(params);
+			const start = params === undefined ? 0 : keyIndex((params as { afterTaskId: string }).afterTaskId) + 1;
+			const end = Math.min(start + 20, total);
+			const tasks: WorkTaskProjection[] = [];
+			const taskErrors: { taskId: string; reason: string }[] = [];
+			for (let index = start; index < end; index++) {
+				if (tombstone && index === 19) taskErrors.push({ taskId: keyAt(index), reason: "corrupt task record" });
+				else if (index === 0) tasks.push(task({ phase: "bound", origin: prefixOrigin }, keyAt(0)));
+				else if (index === total - 1) tasks.push(task({ phase: "bound", origin: suffixOrigin }, keyAt(total - 1)));
+				else tasks.push(task({ phase: "held", reason: "queued" }, keyAt(index)));
+			}
+			return { jobs: [], tasks, taskErrors, ...(end < total ? { nextTaskId: keyAt(end - 1) } : {}) };
+		});
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async (id: string, options?: { force?: boolean }) => {
+					expect(options?.force).toBe(true);
+					fetches.push(id);
+					return thread({ id, messages: { fetch: async () => [] } });
+				},
+			},
+		};
+		const gw = new ReconnectingGateway(
+			"unused",
+			discord,
+			{
+				tokenFile: join(home, "token"),
+				token: "test-token",
+				configPath: join(home, "adapter-discord.json"),
+				channels: {},
+			},
+			undefined,
+			undefined,
+			join(home, "cursor.json"),
+			() => me,
+			client as never,
+			async () => {},
+		);
+		const pass = async () => {
+			await gw.recoverMissedMessages();
+			fetchPasses.push(fetches.splice(0));
+		};
+
+		// Pass 1 observes a real projection tombstone before the budget bound: the
+		// genuine error is logged once and arms a retry.
+		await pass();
+		expect(discovery).toHaveLength(100);
+		expect(gw.recoveryRetryPending).toBe(true);
+		expect(discoveryErrors.filter((line) => line.includes("projection unavailable"))).toHaveLength(1);
+
+		// The resumed suffix page is itself clean, but the sweep's earlier error is
+		// sticky: the EOF stays unclean, known mappings are kept (prefix retained),
+		// and a fresh sweep is armed instead of quiescing.
+		await pass();
+		expect(discovery).toHaveLength(101);
+		expect(discovery[100]).toEqual({ afterTaskId: keyAt(1999) });
+		expect(fetchPasses[1]).toEqual([
+			suffixOrigin.conversationId,
+			prefixOrigin.conversationId,
+			suffixOrigin.conversationId,
+		]);
+		expect(gw.recoveryRetryPending).toBe(true);
+
+		// The retry restarts the sweep from scratch and reaches a clean EOF.
+		tombstone = false;
+		await pass();
+		expect(discovery).toHaveLength(201);
+		expect(discovery[101]).toBeUndefined();
+		await pass();
+		expect(discovery).toHaveLength(202);
+		expect(discovery[201]).toEqual({ afterTaskId: keyAt(1999) });
+		expect(fetchPasses[3]).toEqual([
+			suffixOrigin.conversationId,
+			prefixOrigin.conversationId,
+			suffixOrigin.conversationId,
+		]);
+		expect(gw.recoveryRetryPending).toBe(false);
+		// The observed error stayed observable exactly once: later passes of the
+		// sweep do not re-log it, and the fresh sweep is not charged with it.
+		expect(discoveryErrors.filter((line) => line.includes("projection unavailable"))).toHaveLength(1);
+		await gw.cursorsFlushed;
+	} finally {
+		errorSpy.mockRestore();
+		await rm(home, { recursive: true, force: true });
+	}
+});
+
+test("the real slash handler relays the gateway's permanent refusal without a reconnect", async () => {
+	const home = await mkdtemp(join(tmpdir(), "discord-task-slash-"));
+	try {
+		const verbs: string[] = [];
+		const client = gateway((verb, params) => {
+			verbs.push(verb);
+			// Nothing adapter-local knows about the mapping: the refusal comes back
+			// from the gateway as its exact invalid_params reasonCode.
+			if (verb === "chat.send") {
+				const sendOrigin = (params as { origin: { conversationId: string } }).origin;
+				if (sendOrigin.conversationId === origin.conversationId)
+					throw new ProtocolError("invalid_params", "Slash commands are not supported in mapped task threads", {
+						reasonCode: "mapped_slash_unsupported",
+					});
+				return { engaged: true };
+			}
+			if (verb === "session.modelChoices") return { choices: [] };
+			throw new Error(`unexpected ${verb}`);
+		});
+		const discord: DiscordClientLike = {
+			channels: {
+				fetch: async () => {
+					throw new Error("cold slash must not touch Discord");
+				},
+			},
+		};
+		const gw = new ReconnectingGateway(
+			"unused",
+			discord,
+			{
+				tokenFile: join(home, "token"),
+				token: "test-token",
+				configPath: join(home, "adapter-discord.json"),
+				channels: {},
+			},
+			undefined,
+			undefined,
+			join(home, "cursor.json"),
+			() => me,
+			client as never,
+			async () => {},
+		);
+		// Cold start: no discovery pass has run, so the adapter holds no local map.
+		const replies: string[] = [];
+		const errors: string[] = [];
+		const invoke = (channel: { id: string; type: number; parentId?: string; guildId?: string }, id: string) =>
+			handleSlashCommand(
+				{
+					isChatInputCommand: () => true,
+					commandName: "reset",
+					id,
+					user: { id: "owner-1", username: "bellman" },
+					channel,
+					reply: async (options) => {
+						replies.push(options.content);
+					},
+				},
+				gw,
+				{ error: (line: string) => errors.push(line) },
+			);
+		await invoke(
+			{ id: origin.conversationId, type: 11, parentId: origin.parentId, guildId: origin.boundaryId },
+			"itx-mapped",
+		);
+		expect(replies).toHaveLength(1);
+		expect(replies[0]).toContain("not supported in mapped task threads");
+		expect(replies[0]).toContain("No task or session change was made.");
+		expect(replies[0]).not.toContain("not authorized");
+		expect(replies[0]).not.toContain("session reset");
+		// The attempt reached the gateway (no local-map short-circuit) and the
+		// refusal is not logged as a handler failure.
+		expect(verbs).toEqual(["chat.send"]);
+		expect(errors).toEqual([]);
+		// No reconnect: no recovery retry is armed and the link still answers.
+		expect(gw.recoveryRetryPending).toBe(false);
+		expect(await gw.modelChoices()).toEqual([]);
+		// Ordinary conversations keep the existing slash behavior through the same path.
+		await invoke({ id: "channel-9", type: 0 }, "itx-normal");
+		expect(replies[1]).toContain("session reset");
+		expect(verbs).toEqual(["chat.send", "session.modelChoices", "chat.send"]);
+		await gw.cursorsFlushed;
 	} finally {
 		await rm(home, { recursive: true, force: true });
 	}

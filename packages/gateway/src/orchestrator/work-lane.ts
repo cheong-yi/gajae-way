@@ -58,6 +58,7 @@ import {
 	type WorkTaskEvidence,
 	type WorkTaskQualifiedAdmissionScope,
 	type WorkTaskSourceInput,
+	localSettledTerminalStatus,
 	workAttemptDeliveryId,
 	workAttemptReportId,
 	workTaskDispositionId,
@@ -556,7 +557,9 @@ export class WorkLaneManager {
 		const proof = JSON.parse(source.body) as ReturnType<typeof admitDedicatedWorktree>;
 		if (JSON.stringify(this.#worktreeProof(task)) !== JSON.stringify(proof))
 			throw new Error("dedicated_worktree_changed");
-		revalidateDedicatedWorktree(proof);
+		// The fresh admission above already re-read Git registration and realpaths
+		// against the stored proof; an immediate revalidation repeats identical
+		// inspection at one boundary. Transport paths re-check before sending.
 		return proof;
 	}
 	taskProjection(taskId: string): WorkTaskProjection {
@@ -1516,23 +1519,45 @@ export class WorkLaneManager {
 				reportId: current.terminalReportId,
 				execution: "none" as const,
 			};
+			const held = (reason: string) => ({
+				...base,
+				disposition: "held" as const,
+				completeness: "unavailable" as const,
+				reason,
+			});
 			if (current.obligationState === "final_admitted")
-				return { ...base, disposition: "unchanged", completeness: "complete" };
+				return { ...base, disposition: "unchanged" as const, completeness: "complete" as const };
 			const runtime = this.#originalTaskRuntime(current);
-			if (!runtime || runtime.terminal?.kind !== "broker" || runtime.settledAt === null)
-				return {
-					...base,
-					disposition: "held",
-					completeness: "unavailable",
-					reason: "original_terminal_evidence_unavailable",
-				};
+			if (!runtime || !runtime.terminal || runtime.settledAt === null)
+				return held("original_terminal_evidence_unavailable");
+			// A local settlement carries no status: re-observe the exact original
+			// operation's status under the lane lock before reading its output.
+			// Broker settlements keep matching their immutable recorded status.
+			let status: PromptStatusBody;
+			if (runtime.terminal.kind === "local") {
+				let observed: PromptStatusBody | undefined;
+				try {
+					observed = await this.#query(runtime);
+				} catch {
+					observed = undefined;
+				}
+				if (
+					this.#db.workTaskGet(taskId)?.version !== current.version ||
+					this.#originalTaskRuntime(current)?.version !== runtime.version
+				)
+					return held("original_identity_changed");
+				if (!localSettledTerminalStatus(runtime, observed, this.#now()))
+					return held("original_terminal_evidence_unavailable");
+				status = observed;
+			} else if (runtime.terminal.status) status = runtime.terminal.status;
+			else return held("original_terminal_evidence_unavailable");
 			const output = await this.#port
 				.fetchWorkerOutput({
 					sessionId: runtime.sessionId,
 					repo: runtime.cwd,
 					opRef: runtime.opRef,
-					notBeforeMs: Math.max(Date.parse(runtime.startedAt), runtime.terminal.status?.startedAt ?? 0),
-					terminalIdentity: runtime.terminal.status,
+					notBeforeMs: Math.max(Date.parse(runtime.startedAt), status.startedAt ?? 0),
+					terminalIdentity: status,
 					isCurrent: () =>
 						this.#db.workTaskGet(taskId)?.version === current.version &&
 						this.#originalTaskRuntime(current)?.version === runtime.version,
@@ -1542,7 +1567,7 @@ export class WorkLaneManager {
 				this.#db.workTaskGet(taskId)?.version !== current.version ||
 				this.#originalTaskRuntime(current)?.version !== runtime.version
 			)
-				return { ...base, disposition: "held", completeness: "unavailable", reason: "original_identity_changed" };
+				return held("original_identity_changed");
 			if (
 				output?.status !== "proven" ||
 				output.provenance.source !== "turn.result" ||
@@ -1553,43 +1578,51 @@ export class WorkLaneManager {
 				output.provenance.clientRef !== current.opRef ||
 				output.provenance.repo !== current.request.cwd ||
 				!Number.isFinite(output.provenance.terminalAt) ||
-				output.provenance.terminalAt !== runtime.terminal.status?.terminalAt ||
-				output.provenance.commandId !== runtime.terminal.status?.commandId ||
-				output.provenance.turnId !== runtime.terminal.status?.turnId ||
+				output.provenance.terminalAt !== status.terminalAt ||
+				output.provenance.commandId !== status.commandId ||
+				output.provenance.turnId !== status.turnId ||
 				output.provenance.byteLength !== Buffer.byteLength(output.text, "utf8") ||
 				output.provenance.byteLength > 16 * 1024 ||
 				!output.text.trim() ||
 				isSilentOutput(output.text)
 			)
-				return {
-					...base,
-					disposition: "held",
-					completeness: "unavailable",
-					reason: output?.status === "proven" ? "late_report_reconciliation_required" : "original_output_incomplete",
-				};
+				return held(output?.status === "proven" ? "late_report_reconciliation_required" : "original_output_incomplete");
 			this.#assertTaskSurface(current);
 			const deliveryId = workTaskSourceDeliveryId(taskId, `supplement-${taskId}-original`, current.thread!);
 			const payload = buildDeliveryPayload(current.opRef, current.thread!, output.text, deliveryId, undefined, true);
 			if (!payload) throw new Error("task_payload_unavailable");
-			this.#db.withTransaction(() => {
-				if (
-					!this.#db.workTaskSupplementInTransaction(
-						taskId,
-						current.version,
-						{
-							identity: { opRef: runtime.opRef, sessionId: runtime.sessionId, epoch: runtime.epoch },
-							text: output.text,
-							proof: output.provenance,
-							at: this.#at(),
-						},
-						{
-							...payload,
-							workTask: { taskId, opRef: current.opRef, sourceId: `supplement-${taskId}-original`, mappedOnly: true },
-						},
+			try {
+				this.#db.withTransaction(() => {
+					if (
+						!this.#db.workTaskSupplementInTransaction(
+							taskId,
+							current.version,
+							{
+								identity: { opRef: runtime.opRef, sessionId: runtime.sessionId, epoch: runtime.epoch },
+								text: output.text,
+								status,
+								proof: output.provenance,
+								at: this.#at(),
+							},
+							{
+								...payload,
+								workTask: {
+									taskId,
+									opRef: current.opRef,
+									sourceId: `supplement-${taskId}-original`,
+									mappedOnly: true,
+								},
+							},
+						)
 					)
-				)
-					throw new Error("task_supplement_raced");
-			});
+						throw new Error("task_supplement_raced");
+				});
+			} catch (error) {
+				// A concurrent version change stays a hold; only unexpected failures surface.
+				if (error instanceof Error && error.message === "task_supplement_raced")
+					return held("original_identity_changed");
+				throw error;
+			}
 			const after = this.#task(taskId);
 			return {
 				...base,
@@ -2181,7 +2214,6 @@ export class WorkLaneManager {
 				this.#assertTaskSurface(current);
 				const scope = input.kind ?? current.request.kind;
 				const proof = scope === "code_mutating" ? this.#originalWorktreeProof(current) : undefined;
-				if (proof) revalidateDedicatedWorktree(proof);
 				const control = this.#db.withTransaction(() => {
 					const sourceId = `explicit-${createHash("sha256")
 						.update(JSON.stringify([current.taskId, context.evidence.origin, input.eventId, context.evidence.editId]))

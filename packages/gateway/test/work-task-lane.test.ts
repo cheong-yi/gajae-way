@@ -783,6 +783,262 @@ test("unavailable original result can later supplement once without rewriting se
 	expect(f.port.sends).toHaveLength(1);
 	expect(f.port.resumes).toHaveLength(0);
 });
+
+/** Outage kills the session host; a restart settles local uncertainty before the broker result returns. */
+async function outageSettledFixture() {
+	const f = await fixture();
+	await f.admit();
+	await f.bind();
+	const task = f.db.workTaskGet(taskId)!;
+	f.port.setSessionState(task.sessionId!, { live: false });
+	await f.restart();
+	await until(() => f.db.workAttemptGet(task.opRef)?.settledAt !== null);
+	const settled = f.db.workAttemptGet(task.opRef)!;
+	expect(settled.terminal).toMatchObject({ kind: "local", reasonCode: "session_dead" });
+	expect(settled.output).toMatchObject({ disposition: "unavailable" });
+	expect(f.db.workTaskGet(taskId)).toMatchObject({ obligationState: "held" });
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	// The settled local history survives another restart under the outage.
+	await f.restart();
+	const restore = (text: string) => {
+		f.port.setSessionState(task.sessionId!, { live: true });
+		f.port.complete(task.opRef, text);
+	};
+	return { f, task, restore };
+}
+
+test("locally settled outage admits one original supplement without execution or release", async () => {
+	const { f, task, restore } = await outageSettledFixture();
+	// The original result is still absent: no output read, no supplement, capacity held.
+	const readsBefore = f.port.workerOutputReads.length;
+	expect(await f.manager.recoverTaskReport(taskId)).toMatchObject({
+		disposition: "held",
+		completeness: "unavailable",
+		reason: "original_terminal_evidence_unavailable",
+	});
+	expect(f.port.workerOutputReads).toHaveLength(readsBefore);
+	expect(f.db.workTaskSourceGet(`supplement-${taskId}-original`)).toBeUndefined();
+	expect(f.manager.assessTaskRelease(name).kind).toBe("hold");
+	expect(f.manager.taskDebt(name)).toMatchObject({ exactTerminal: false, safeToReleaseExecution: false });
+
+	restore("Recovered original answer after outage");
+	const raw = new Database(join(f.directory, "gateway.db"));
+	cleanup.push(async () => raw.close());
+	const report = () =>
+		raw.query("SELECT * FROM inbound_messages WHERE message_id = ?").get(f.db.workAttemptGet(task.opRef)!.reportId);
+	const snapshot = () => ({
+		runtime: f.db.workAttemptGet(task.opRef),
+		job: f.db.laneJobJson(task.jobId),
+		report: report(),
+		task: f.db.workTaskGet(taskId),
+		sources: f.db.workTaskSources(taskId),
+		controls: f.db.workControlList(taskId),
+		deliveries: (f.db.workTaskSources(taskId)?.sources ?? [])
+			.filter((source) => source.deliveryId !== null)
+			.map((source) => f.db.deliveryGet(source.deliveryId!)),
+	});
+	const before = snapshot();
+	const first = await f.manager.recoverTaskReport(taskId);
+	expect(first).toMatchObject({ disposition: "reconciled", completeness: "complete" });
+	expect(first.supplementalDeliveryId).toBeDefined();
+	const afterFirst = snapshot();
+	const second = await f.manager.recoverTaskReport(taskId);
+	expect(second).toMatchObject({ disposition: "unchanged", completeness: "complete" });
+	expect(snapshot()).toEqual(afterFirst);
+	expect(afterFirst.runtime).toEqual(before.runtime);
+	expect(afterFirst.job).toBe(before.job);
+	expect(afterFirst.report).toEqual(before.report);
+	expect(afterFirst.controls).toEqual(before.controls);
+	expect(f.db.workTaskGet(taskId)).toMatchObject({ obligationState: "final_admitted", holdReason: null });
+	expect(f.db.workTaskSourceGet(`supplement-${taskId}-original`)?.body).toBe("Recovered original answer after outage");
+	const proofSource = JSON.parse(f.db.workTaskSourceGet(`supplement-proof-${taskId}-original`)!.body);
+	expect(proofSource.status).toMatchObject({
+		status: "terminal_ok",
+		receiptState: "present",
+		clientRef: task.opRef,
+	});
+	expect(proofSource.identity).toEqual({ opRef: task.opRef, sessionId: task.sessionId, epoch: task.epoch });
+	// Result admission never releases capacity settled as local uncertainty.
+	expect(f.manager.assessTaskRelease(name).kind).toBe("hold");
+	expect(f.manager.taskDebt(name)).toMatchObject({ exactTerminal: false, safeToReleaseExecution: false });
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.steers).toHaveLength(0);
+	expect(f.port.resumes).toHaveLength(0);
+	expect(f.port.workerOutputReads.length).toBeGreaterThan(readsBefore);
+});
+
+test("local recovery holds on missing, mismatched or raced original evidence", async () => {
+	const { f, task, restore } = await outageSettledFixture();
+	const runtime = f.db.workAttemptGet(task.opRef)!;
+	type ReportedStatus = Awaited<ReturnType<TaskPort["status"]>>["status"];
+	const status: ReportedStatus = {
+		status: "terminal_ok",
+		receiptState: "present",
+		clientRef: task.opRef,
+		commandId: "command-original",
+		turnId: "turn-original",
+		startedAt: Date.parse(runtime.startedAt),
+		terminalAt: Date.now(),
+	};
+	const statusProbe = (body: ReportedStatus) =>
+		spyOn(f.port, "status").mockResolvedValue({
+			operationRef: task.opRef,
+			status: body,
+			summaryCompleted: true,
+		});
+	const expectHeld = async (reason: string) => {
+		expect(await f.manager.recoverTaskReport(taskId)).toMatchObject({ disposition: "held", reason });
+		expect(f.db.workTaskSourceGet(`supplement-${taskId}-original`)).toBeUndefined();
+	};
+	const readsBefore = f.port.workerOutputReads.length;
+
+	// The original turn is still running: nonterminal status never becomes evidence.
+	await expectHeld("original_terminal_evidence_unavailable");
+	restore("Recovered original answer after outage");
+
+	const offline = spyOn(f.port, "status").mockRejectedValue(new Error("broker offline"));
+	await expectHeld("original_terminal_evidence_unavailable");
+	offline.mockRestore();
+	const probes: Array<ReportedStatus> = [
+		// wrong identity: #query refuses a foreign clientRef
+		{ ...status, clientRef: "gw-foreign-op" },
+		// receipt never proven present
+		{ ...status, receiptState: "missing" },
+		// terminal older than the attempt start
+		{ ...status, terminalAt: Date.parse(runtime.startedAt) - 1 },
+		// terminal beyond the observation time
+		{ ...status, terminalAt: Date.now() + 60_000 },
+	];
+	for (const body of probes) {
+		const probe = statusProbe(body);
+		await expectHeld("original_terminal_evidence_unavailable");
+		probe.mockRestore();
+	}
+	const inflight = statusProbe({
+		status: "in_flight",
+		clientRef: task.opRef,
+		commandId: status.commandId,
+		turnId: status.turnId,
+	});
+	await expectHeld("original_terminal_evidence_unavailable");
+	inflight.mockRestore();
+	const anonymous = statusProbe({
+		status: "terminal_ok",
+		receiptState: "present",
+		clientRef: task.opRef,
+		startedAt: status.startedAt,
+		terminalAt: status.terminalAt,
+	});
+	await expectHeld("original_terminal_evidence_unavailable");
+	anonymous.mockRestore();
+	// Status-level refusal happens before any output read.
+	expect(f.port.workerOutputReads).toHaveLength(readsBefore);
+
+	const realOutput = await f.port.fetchWorkerOutput({
+		sessionId: task.sessionId!,
+		repo: runtime.cwd,
+		opRef: task.opRef,
+		notBeforeMs: Date.parse(runtime.startedAt),
+		isCurrent: () => true,
+	});
+	if (realOutput.status !== "proven") throw new Error("fixture must retain the original result");
+	const wrongOutput = spyOn(f.port, "fetchWorkerOutput").mockResolvedValue({
+		...realOutput,
+		provenance: { ...realOutput.provenance, sessionId: "wrong-session" },
+	});
+	await expectHeld("late_report_reconciliation_required");
+	wrongOutput.mockRestore();
+
+	const realFetch = f.port.fetchWorkerOutput.bind(f.port);
+	const raced = spyOn(f.port, "fetchWorkerOutput").mockImplementation(async (input) => {
+		const live = f.db.workTaskGet(taskId)!;
+		f.db.withTransaction(() =>
+			f.db.workTaskObligationInTransaction(taskId, live.version, {
+				identity: { opRef: live.opRef, sessionId: live.sessionId!, epoch: live.epoch! },
+				state: "held",
+				reason: "concurrent_writer",
+				at: new Date().toISOString(),
+			}),
+		);
+		return realFetch(input);
+	});
+	await expectHeld("original_identity_changed");
+	raced.mockRestore();
+
+	// The intact original then admits exactly once.
+	const first = await f.manager.recoverTaskReport(taskId);
+	expect(first).toMatchObject({ disposition: "reconciled" });
+	const second = await f.manager.recoverTaskReport(taskId);
+	expect(second).toMatchObject({ disposition: "unchanged" });
+	expect(f.db.workTaskSourceGet(`supplement-${taskId}-original`)?.body).toBe("Recovered original answer after outage");
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.steers).toHaveLength(0);
+	expect(f.port.resumes).toHaveLength(0);
+});
+
+test("broker release then restart admits one late original without reopening the released lane", async () => {
+	const f = await releaseFixture(false, "ordinary");
+	await f.finish();
+	expect(f.manager.assessTaskRelease(name)).toMatchObject({ kind: "eligible", opRef: f.task.opRef });
+	expect(await f.lanes.retire(name, "operator")).toMatchObject({
+		retired: true,
+		closed: true,
+		sessionId: f.task.sessionId,
+	});
+	const releasedBinding = { sessionId: "", epoch: f.task.epoch! + 1 };
+	expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(releasedBinding);
+	expect(f.lanes.activeLanes()).toHaveLength(0);
+	// Closing and releasing capacity does not manufacture unavailable output.
+	expect(await f.manager.recoverTaskReport(taskId)).toMatchObject({
+		disposition: "held",
+		reason: "original_output_incomplete",
+	});
+	expect(f.db.workTaskSourceGet(`supplement-${taskId}-original`)).toBeUndefined();
+	await f.restart();
+	expect(await f.manager.recoverTaskReport(taskId)).toMatchObject({
+		disposition: "held",
+		reason: "original_output_incomplete",
+	});
+	expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(releasedBinding);
+	f.restoreOutput();
+
+	const raw = new Database(join(f.directory, "gateway.db"));
+	cleanup.push(async () => raw.close());
+	const report = () =>
+		raw.query("SELECT * FROM inbound_messages WHERE message_id = ?").get(f.db.workAttemptGet(f.task.opRef)!.reportId);
+	const runtimeBefore = f.db.workAttemptGet(f.task.opRef);
+	const jobBefore = f.db.laneJobJson(f.task.jobId);
+	const reportBefore = report();
+
+	const first = await f.manager.recoverTaskReport(taskId);
+	expect(first).toMatchObject({ disposition: "reconciled", completeness: "complete" });
+	const runtimeAfter = f.db.workAttemptGet(f.task.opRef);
+	const jobAfter = f.db.laneJobJson(f.task.jobId);
+	const reportAfter = report();
+	const second = await f.manager.recoverTaskReport(taskId);
+	expect(second).toMatchObject({ disposition: "unchanged", completeness: "complete" });
+	expect(runtimeAfter).toEqual(runtimeBefore);
+	expect(jobAfter).toBe(jobBefore);
+	expect(reportAfter).toEqual(reportBefore);
+	expect(f.db.workAttemptGet(f.task.opRef)).toEqual(runtimeAfter);
+	expect(f.db.laneJobJson(f.task.jobId)).toBe(jobAfter);
+	expect(report()).toEqual(reportAfter);
+	expect(f.db.workTaskSourceGet(`supplement-${taskId}-original`)?.body).toBe(
+		"Original result unavailable to the gateway",
+	);
+	expect(f.db.workTaskGet(taskId)).toMatchObject({ obligationState: "final_admitted" });
+	expect(f.db.getSessionRecord(workSessionKey(name))).toEqual(releasedBinding);
+	expect(f.lanes.activeLanes()).toHaveLength(0);
+	expect(f.port.closes).toEqual([{ sessionId: f.task.sessionId!, repo: f.worker }]);
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.steers).toHaveLength(0);
+	expect(f.port.resumes).toHaveLength(0);
+});
+
 async function until(predicate: () => boolean): Promise<void> {
 	for (let i = 0; i < 300 && !predicate(); i++) await Bun.sleep(5);
 	expect(predicate()).toBe(true);
@@ -1588,6 +1844,10 @@ async function releaseFixture(remote = false, scope: "dedicated" | "shared" | "o
 	});
 	return {
 		...f,
+		// A restart replaces the fixture's manager; read it live through the getter.
+		get manager() {
+			return f.manager;
+		},
 		worker,
 		primary,
 		task,
@@ -1598,6 +1858,7 @@ async function releaseFixture(remote = false, scope: "dedicated" | "shared" | "o
 			f.port.complete(task.opRef, "Original result unavailable to the gateway");
 			await until(() => f.db.workAttemptGet(task.opRef)?.settledAt != null);
 		},
+		restoreOutput: () => missing.mockRestore(),
 	};
 }
 

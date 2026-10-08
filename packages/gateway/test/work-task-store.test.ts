@@ -10,8 +10,10 @@ import {
 	type OriginRef,
 	originKey,
 	type WorkTaskDispositionParams,
+	type WorkTaskReviewParams,
 } from "@gajae-gateway/protocol";
-import { appendAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
+import { appendAttempt, closeAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
+import { buildDeliveryPayload } from "../src/delivery/delivery";
 import {
 	BrokerAuthorityError,
 	GatewayDatabase,
@@ -685,10 +687,194 @@ async function heldDispositionFixture(retainRoute = false, settledPredecessors =
 	return { ...f, task, control, params };
 }
 
+async function reviewFixture() {
+	const f = await fixture();
+	const bound = f.bind(f.create().record);
+	const { runtime, record } = f.prepare(bound);
+	f.database.workAttemptPrepare(runtime, record);
+	const body = "Complete original answer requiring an owner choice.";
+	const report = buildDeliveryPayload(runtime.opRef, LOOPBACK_ORIGIN, body, runtime.deliveryId)!;
+	f.database.workAttemptSettle(
+		runtime.opRef,
+		0,
+		closeAttempt({ record, opRef: runtime.opRef, endState: "completed", endedAt: LATER }),
+		{
+			terminal: {
+				kind: "broker",
+				observedAt: LATER,
+				reasonCode: "end_turn",
+				status: {
+					status: "terminal_ok",
+					receiptState: "present",
+					outcome: { reason: "end_turn" },
+					terminalAt: Date.parse(LATER),
+				},
+			},
+			output: {
+				...runtime.output,
+				disposition: "available",
+				excerpt: body,
+				proof: {
+					opRef: runtime.opRef,
+					sessionId: runtime.sessionId,
+					epoch: runtime.epoch,
+					observedAtMs: Date.parse(LATER),
+					source: "turn.result",
+					attribution: "operation_ref",
+					fullness: "original",
+					clientRef: runtime.opRef,
+					repo: runtime.cwd,
+					terminalAt: Date.parse(LATER),
+					contentVersion: 1,
+					byteLength: Buffer.byteLength(body),
+				},
+			},
+			decision: "report",
+			settledAt: LATER,
+		},
+		{
+			kind: "persona",
+			row: {
+				messageId: runtime.reportId,
+				originKey: originKey(LOOPBACK_ORIGIN),
+				originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+				body,
+				receivedAt: LATER,
+			},
+			fallbackPayload: report,
+		},
+	);
+	const task = f.database.workTaskGet(TASK)!;
+	f.database.withTransaction(() => {
+		f.database.workTaskSourceAppendInTransaction({
+			...source(`final-${TASK}-original`),
+			kind: "observation",
+			body,
+			evidence: { ...evidence, eventId: runtime.opRef },
+			reportId: runtime.reportId,
+		});
+		f.database.workTaskObligationInTransaction(TASK, task.version, {
+			identity,
+			state: "final_admitted",
+			reason: null,
+			at: LATER,
+		});
+	});
+	const original = f.database.workTaskOriginalSource(TASK)!;
+	const review: WorkTaskReviewParams = {
+		taskId: TASK,
+		expectedOpRef: runtime.opRef,
+		reportId: runtime.reportId,
+		sourceId: original.sourceId,
+		contentHash: original.contentHash,
+		reviewId: "ed2f2494-2584-4d13-b7b6-c6ac24a1087f",
+		expectedReviewId: null,
+		callerSessionId: "persona-reviewer",
+		callerEpoch: 0,
+		fullRead: true,
+		disposition: "owner_question",
+		rationale: "The retained answer leaves an owner choice.",
+		question: "Choose red or blue?",
+	};
+	return { ...f, review };
+}
+
+describe("dedicated review append boundary", () => {
+	test("generic append rejects review metadata and reserved identities without admitting review state", async () => {
+		const f = await reviewFixture();
+		const before = f.database.workTaskReviewLocator(TASK);
+		const deliveries = f.database.deliveryRows();
+		// No live reviewer is registered: the generic path must not admit this otherwise well-shaped review.
+		const forged: WorkTaskSourceInput = {
+			...source(`review-${f.review.reviewId}`),
+			reportId: f.review.reportId,
+			evidence: {
+				...evidence,
+				principalId: `coordinator:${f.review.callerSessionId}`,
+				origin: LOOPBACK_ORIGIN,
+				eventId: f.review.reviewId,
+			},
+			review: f.review,
+		};
+		const { review: _review, ...reserved } = forged;
+		for (const input of [forged, reserved, { ...forged, sourceId: "ordinary-review-metadata" }]) {
+			expect(() => f.database.withTransaction(() => f.database.workTaskSourceAppendInTransaction(input))).toThrow(
+				WorkTaskStateError,
+			);
+			expect(f.database.workTaskSourceGet(input.sourceId)).toBeUndefined();
+			expect(f.database.workTaskReviewLocator(TASK)).toEqual(before);
+			expect(f.database.deliveryRows()).toEqual(deliveries);
+		}
+		expect(before?.pending).toBe(true);
+	});
+
+	test("dedicated owner-question review rolls back atomically then succeeds once across retry", async () => {
+		const f = await reviewFixture();
+		f.database.recordOwnedBinding({
+			authority: f.authority,
+			sessionId: f.review.callerSessionId,
+			originKey: originKey(LOOPBACK_ORIGIN),
+			epoch: 0,
+			repo: request.cwd,
+		});
+		f.database.updateActivity(originKey(LOOPBACK_ORIGIN), JSON.stringify(LOOPBACK_ORIGIN));
+		const task = f.database.workTaskGet(TASK);
+		const runtime = f.database.workAttemptGet(task!.opRef);
+		const before = f.database.workTaskReviewLocator(TASK);
+		const deliveries = f.database.deliveryRows();
+		expect(() => f.database.workTaskReview({ ...f.review, callerEpoch: 1 }, LATER)).toThrow("identity");
+		const write = spyOn(f.database, "deliveryCreateInTransaction").mockImplementation(() => {
+			throw new Error("review delivery fault");
+		});
+		try {
+			expect(() => f.database.workTaskReview(f.review, LATER)).toThrow("review delivery fault");
+			expect(f.database.workTaskSourceGet(`review-${f.review.reviewId}`)).toBeUndefined();
+			expect(f.database.workTaskReviewLocator(TASK)).toEqual(before);
+			expect(f.database.deliveryRows()).toEqual(deliveries);
+		} finally {
+			write.mockRestore();
+		}
+		const admitted = f.database.workTaskReview(f.review, LATER);
+		expect(admitted.disposition).toBe("recorded");
+		expect(f.database.workTaskReview(f.review, LATER)).toEqual({ ...admitted, disposition: "duplicate" });
+		expect(() => f.database.workTaskReview({ ...f.review, question: "Changed?" }, LATER)).toThrow("conflict");
+		expect(() => f.database.workTaskReview({ ...f.review, reviewId: OTHER }, LATER)).toThrow("order");
+		expect(f.database.deliveryRows()).toHaveLength(deliveries.length + 1);
+		const delivery = f.database.deliveryGet(admitted.deliveryId!)!;
+		expect(delivery.origin_key).toBe(originKey(LOOPBACK_ORIGIN));
+		expect(JSON.parse(delivery.payload_json).text).toContain(f.review.question);
+		expect(f.database.workTaskSourceGet(admitted.sourceId)?.review).toEqual(f.review);
+		expect(f.database.workTaskReviewLocator(TASK)).toMatchObject({
+			pending: false,
+			ownerQuestions: [{ reviewId: f.review.reviewId, question: f.review.question, deliveryId: admitted.deliveryId }],
+		});
+		expect(f.database.workTaskGet(TASK)).toEqual(task);
+		expect(f.database.workAttemptGet(task!.opRef)).toEqual(runtime);
+	});
+});
+
 describe("owner administrative hold disposition transaction", () => {
-	for (const corrupt of [false, true])
-		test(`held targets after settled predecessors remain discoverable (${corrupt ? "corrupt" : "healthy"} runtime)`, async () => {
-			const f = await heldDispositionFixture(true, 21);
+	for (const delta of [{ sessionId: "wrong-session" }, { epoch: 1 }])
+		test(`healthy direct held discovery rejects mismatched ${"sessionId" in delta ? "session" : "epoch"}`, async () => {
+			const f = await heldDispositionFixture();
+			const changed = { ...f.control, ...delta };
+			f.raw
+				.query("UPDATE work_controls SET record_json = ? WHERE control_id = ?")
+				.run(JSON.stringify(changed), f.control.controlId);
+			expect(f.database.workControlGet(f.control.controlId)).toEqual(changed);
+			const basis = f.database.workTaskDispositionBasis(TASK);
+			expect(basis.kind).toBe("original");
+			expect(basis.basis?.controls).toEqual([]);
+			expect(basis.basis?.controlsCompleteness).toBe("partial");
+		});
+
+	for (const [corrupt, retainRoute] of [
+		[false, false],
+		[false, true],
+		[true, true],
+	] as const)
+		test(`held targets after settled predecessors remain discoverable (${corrupt ? "corrupt" : "healthy"} runtime, ${retainRoute ? "retained route" : "direct"})`, async () => {
+			const f = await heldDispositionFixture(retainRoute, 21);
 			const successor = f.database.withTransaction(() =>
 				f.database.workControlAdmitInTransaction(controlRequest("successor")),
 			).record;
@@ -745,6 +931,43 @@ describe("owner administrative hold disposition transaction", () => {
 				),
 			).toThrow(corrupt ? WorkAttemptStateError : WorkTaskStateError);
 			expect(f.database.workControlGet(successor.controlId)?.phase).toBe("pending");
+		});
+
+	for (const retainRoute of [false, true])
+		test(`corrupt runtime rejects held controls without independent ${retainRoute ? "instruction" : "route"} proof`, async () => {
+			const f = await heldDispositionFixture(retainRoute, 21);
+			const marker = {
+				...source(`activation-${TASK}`),
+				kind: "observation" as const,
+				body: `Assignment ${TASK}\n${f.task.request.text}\nScope: ${f.task.request.kind}; repository admission is not an OS sandbox.`,
+				evidence: { ...evidence, principalId: "gateway" },
+			};
+			f.database.withTransaction(() =>
+				f.database.workTaskSourceAppendInTransaction(marker, {
+					...payload(f.task, marker.sourceId, marker.body),
+					final: false,
+				}),
+			);
+			if (retainRoute)
+				f.raw.query("UPDATE work_task_sources SET record_json = '{}' WHERE source_id = ?").run("original-instruction");
+			f.raw.query("UPDATE work_attempt_runtime SET record_json = '{bad' WHERE op_ref = ?").run(f.task.opRef);
+			f.database.withTransaction(() =>
+				f.database.workTaskRecordLinkedUnavailableInTransaction(TASK, LATER, () => true),
+			);
+			const before = f.raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(f.task.opRef);
+			const basis = f.database.workTaskDispositionBasis(TASK);
+			expect(basis.kind).toBe("validation_unavailable");
+			expect(basis.basis?.controls).toEqual([]);
+			expect(basis.basis?.controlsCompleteness).toBe("partial");
+			if (basis.kind !== "validation_unavailable") throw new Error("expected qualified negative basis");
+			const params = { ...f.params, validationUnavailable: basis.qualification };
+			expect(() =>
+				f.database.withTransaction(() =>
+					f.database.workTaskNegativeDispositionInTransaction(params, dispositionEvidence(params), () => true),
+				),
+			).toThrow(WorkTaskStateError);
+			expect(f.database.workControlGet(f.control.controlId)).toEqual(f.control);
+			expect(f.raw.query("SELECT * FROM work_attempt_runtime WHERE op_ref = ?").get(f.task.opRef)).toEqual(before);
 		});
 
 	test("local trusted attribution, immutable audit and mapped intent retain uncertain steer ordering", async () => {
@@ -2187,43 +2410,206 @@ describe("Firstmate durable task and control store", () => {
 		expect(f.raw.query<{ count: number }, []>("SELECT COUNT(*) AS count FROM work_task_sources").get()?.count).toBe(23);
 	});
 
-	test("notification references require a committed matching coordinator intent and join rollback", async () => {
+	test("local terminal supplement admits only the exact re-observed original status", async () => {
 		const f = await fixture();
-		const task = f.bind(f.create().record);
-		const control = f.database.withTransaction(() =>
-			f.database.workControlAdmitInTransaction(controlRequest("notice")),
-		).record;
-		expect(() =>
-			f.database.withTransaction(() =>
-				f.database.workControlNotificationInTransaction(control.controlId, 0, {
-					kind: "inbound",
-					id: control.notificationId,
-				}),
-			),
-		).toThrow(WorkTaskStateError);
-		f.raw.exec(
-			"CREATE TRIGGER fail_control BEFORE UPDATE ON work_controls BEGIN SELECT RAISE(ABORT, 'control fault'); END",
+		const bound = f.bind(f.create().record);
+		const { runtime, record } = f.prepare(bound);
+		f.database.workAttemptPrepare(runtime, record);
+		const reportBody = "Host lost before the gateway could read the result.";
+		const report = buildDeliveryPayload(runtime.opRef, LOOPBACK_ORIGIN, reportBody, runtime.deliveryId)!;
+		f.database.workAttemptSettle(
+			runtime.opRef,
+			0,
+			closeAttempt({ record, opRef: runtime.opRef, endState: "terminal_uncertain", endedAt: LATER }),
+			{
+				terminal: { kind: "local", observedAt: LATER, reasonCode: "session_dead" },
+				output: { ...runtime.output, disposition: "unavailable" },
+				decision: "report",
+				settledAt: LATER,
+			},
+			{
+				kind: "persona",
+				row: {
+					messageId: runtime.reportId,
+					originKey: originKey(LOOPBACK_ORIGIN),
+					originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+					body: reportBody,
+					receivedAt: LATER,
+				},
+				fallbackPayload: report,
+			},
 		);
-		expect(() =>
-			f.database.withTransaction(() => {
-				f.database.deliveryCreateInTransaction({
-					id: control.notificationId,
-					turnId: task.opRef,
-					originKey: originKey(request.coordinator),
-					payloadJson: JSON.stringify({
-						...payload(task, "unused"),
-						deliveryId: control.notificationId,
-						origin: request.coordinator,
-					}),
-				});
-				f.database.workControlNotificationInTransaction(control.controlId, 0, {
-					kind: "delivery",
-					id: control.notificationId,
-				});
-			}),
-		).toThrow();
-		expect(f.database.deliveryRows()).toHaveLength(0);
-		expect(f.database.workControlGet(control.controlId)?.notificationDisposition).toBeNull();
+		const settled = f.database.workAttemptGet(runtime.opRef)!;
+		expect(settled.terminal).toMatchObject({ kind: "local", reasonCode: "session_dead" });
+		const task = f.database.workTaskGet(TASK)!;
+		const jobBefore = f.database.laneJobJson(task.jobId);
+		const reportBefore = f.raw.query("SELECT * FROM inbound_messages WHERE message_id = ?").get(runtime.reportId);
+		const text = "Late original result admitted once.";
+		type SupplementInput = Parameters<GatewayDatabase["workTaskSupplementInTransaction"]>[2];
+		const proof: SupplementInput["proof"] = {
+			source: "turn.result",
+			fullness: "original",
+			sessionId: SESSION,
+			repo: request.cwd,
+			opRef: runtime.opRef,
+			clientRef: runtime.opRef,
+			commandId: "command-1",
+			turnId: "turn-1",
+			terminalAt: Date.parse(LATER),
+			contentVersion: 1,
+			byteLength: Buffer.byteLength(text),
+		};
+		const status: SupplementInput["status"] = {
+			status: "terminal_ok",
+			receiptState: "present",
+			clientRef: runtime.opRef,
+			commandId: "command-1",
+			turnId: "turn-1",
+			startedAt: Date.parse(START),
+			terminalAt: Date.parse(LATER),
+		};
+		const supplement = (
+			presented: SupplementInput["status"] = status,
+			proofInput: SupplementInput["proof"] = proof,
+			version: number = task.version,
+		) =>
+			f.database.withTransaction(() =>
+				f.database.workTaskSupplementInTransaction(
+					TASK,
+					version,
+					{ identity, text, at: LATER, status: presented, proof: proofInput },
+					payload(bound, `supplement-${TASK}-original`, text),
+				),
+			);
+		const invalidStatuses: Array<SupplementInput["status"]> = [
+			{ ...status, clientRef: undefined },
+			{ ...status, status: "in_flight" },
+			{ ...status, receiptState: "missing" },
+			{ ...status, terminalAt: Date.parse(START) - 1 },
+			{ ...status, terminalAt: Date.parse(LATER) + 60_000 },
+			{ ...status, commandId: undefined },
+			{ ...status, turnId: undefined },
+		];
+		for (const presented of invalidStatuses) expect(() => supplement(presented)).toThrow(WorkTaskStateError);
+		expect(() => supplement(status, { ...proof, turnId: "turn-2" })).toThrow(WorkTaskStateError);
+		expect(f.database.workTaskSourceGet(`supplement-${TASK}-original`)).toBeUndefined();
+		expect(f.database.workTaskSourceGet(`supplement-proof-${TASK}-original`)).toBeUndefined();
+		expect(f.database.workTaskGet(TASK)).toEqual(task);
+		expect(f.database.workAttemptGet(runtime.opRef)).toEqual(settled);
+		expect(f.database.laneJobJson(task.jobId)).toBe(jobBefore);
+
+		const admitted = supplement();
+		expect(admitted).toMatchObject({ obligationState: "final_admitted", holdReason: null });
+		expect(f.database.workAttemptGet(runtime.opRef)).toEqual(settled);
+		expect(f.database.laneJobJson(task.jobId)).toBe(jobBefore);
+		expect(f.raw.query("SELECT * FROM inbound_messages WHERE message_id = ?").get(runtime.reportId)).toEqual(
+			reportBefore,
+		);
+		const stored = JSON.parse(f.database.workTaskSourceGet(`supplement-proof-${TASK}-original`)!.body);
+		expect(stored.status).toEqual(status);
+		expect(stored.identity).toEqual(identity);
+		expect(stored.proof).toEqual(proof);
+		expect(f.database.workTaskSourceGet(`supplement-${TASK}-original`)?.body).toBe(text);
+		// One stable supplement: the consumed version is refused, a fresh one cannot repeat it.
+		expect(supplement()).toBeUndefined();
+		expect(() => supplement(status, proof, f.database.workTaskGet(TASK)!.version)).toThrow(WorkTaskStateError);
+		expect(f.database.workTaskSourceGet(`supplement-${TASK}-original`)?.body).toBe(text);
+	});
+
+	test("broker terminal supplement keeps exact historical status matching", async () => {
+		const f = await fixture();
+		const bound = f.bind(f.create().record);
+		const { runtime, record } = f.prepare(bound);
+		f.database.workAttemptPrepare(runtime, record);
+		const text = "Original retained answer.";
+		const report = buildDeliveryPayload(runtime.opRef, LOOPBACK_ORIGIN, text, runtime.deliveryId)!;
+		f.database.workAttemptSettle(
+			runtime.opRef,
+			0,
+			closeAttempt({ record, opRef: runtime.opRef, endState: "completed", endedAt: LATER }),
+			{
+				terminal: {
+					kind: "broker",
+					observedAt: LATER,
+					reasonCode: "end_turn",
+					status: {
+						status: "terminal_ok",
+						receiptState: "present",
+						outcome: { reason: "end_turn" },
+						terminalAt: Date.parse(LATER),
+					},
+				},
+				output: {
+					...runtime.output,
+					disposition: "available",
+					excerpt: text,
+					proof: {
+						opRef: runtime.opRef,
+						sessionId: runtime.sessionId,
+						epoch: runtime.epoch,
+						observedAtMs: Date.parse(LATER),
+						source: "turn.result",
+						attribution: "operation_ref",
+						fullness: "original",
+						clientRef: runtime.opRef,
+						repo: runtime.cwd,
+						terminalAt: Date.parse(LATER),
+						contentVersion: 1,
+						byteLength: Buffer.byteLength(text),
+					},
+				},
+				decision: "report",
+				settledAt: LATER,
+			},
+			{
+				kind: "persona",
+				row: {
+					messageId: runtime.reportId,
+					originKey: originKey(LOOPBACK_ORIGIN),
+					originRefJson: JSON.stringify(LOOPBACK_ORIGIN),
+					body: text,
+					receivedAt: LATER,
+				},
+				fallbackPayload: report,
+			},
+		);
+		const settled = f.database.workAttemptGet(runtime.opRef)!;
+		const recorded = settled.terminal!.status!;
+		const task = f.database.workTaskGet(TASK)!;
+		type SupplementInput = Parameters<GatewayDatabase["workTaskSupplementInTransaction"]>[2];
+		const proof: SupplementInput["proof"] = {
+			source: "turn.result",
+			fullness: "original",
+			sessionId: SESSION,
+			repo: request.cwd,
+			opRef: runtime.opRef,
+			clientRef: runtime.opRef,
+			terminalAt: Date.parse(LATER),
+			contentVersion: 1,
+			byteLength: Buffer.byteLength(text),
+		};
+		const supplement = (presented: SupplementInput["status"], version: number = task.version) =>
+			f.database.withTransaction(() =>
+				f.database.workTaskSupplementInTransaction(
+					TASK,
+					version,
+					{ identity, text, at: LATER, status: presented, proof },
+					payload(bound, `supplement-${TASK}-original`, text),
+				),
+			);
+		// A fresher observation never replaces the immutable recorded broker status.
+		expect(() => supplement({ ...recorded, clientRef: runtime.opRef })).toThrow(WorkTaskStateError);
+		expect(() => supplement({ ...recorded, terminalAt: Date.parse(LATER) + 1 })).toThrow(WorkTaskStateError);
+		expect(f.database.workTaskSourceGet(`supplement-proof-${TASK}-original`)).toBeUndefined();
+		expect(f.database.workTaskGet(TASK)).toEqual(task);
+		const admitted = supplement(recorded);
+		expect(admitted).toMatchObject({ obligationState: "final_admitted", holdReason: null });
+		expect(f.database.workAttemptGet(runtime.opRef)).toEqual(settled);
+		const stored = JSON.parse(f.database.workTaskSourceGet(`supplement-proof-${TASK}-original`)!.body);
+		expect(stored.status).toEqual(recorded);
+		expect(stored.proof).toEqual(proof);
+		expect(supplement(recorded)).toBeUndefined();
+		expect(f.database.workTaskSourceGet(`supplement-${TASK}-original`)?.body).toBe(text);
 	});
 
 	test("pending task without lane history is counted, snapshotted and quarantined through its reserved job", async () => {

@@ -1895,6 +1895,13 @@ async function routeMappedTaskEvent(
 	if (origin.platform !== "discord") return false;
 	const locator = options.database.workTaskDiscordLocator(origin.conversationId);
 	if (!locator) return false;
+	// The permanent mapping, not adapter discovery progress, owns this refusal.
+	// Slash interactions do not carry supported message provenance. No control,
+	// persona mutation or task-state interpretation is permitted on this path.
+	if (typeof params.messageId === "string" && params.messageId.startsWith("slash-"))
+		throw new ProtocolError("invalid_params", "Slash commands are not supported in mapped task threads", {
+			reasonCode: "mapped_slash_unsupported",
+		});
 	const owner = runtime.config.ownerTarget?.origin;
 	const author = params.engagement as { authorId?: unknown; authorIsBot?: unknown } | undefined;
 	if (

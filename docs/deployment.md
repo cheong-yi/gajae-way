@@ -49,7 +49,7 @@ Review the actual DB migration together with durable task/control/report history
 
 Qualification must demonstrate atomic source-transition/delivery-intent recovery, same-obligation late finals, scope/worktree fences, exact steering receipts, safe retirement on every path, and corrupt-lane/healthy-lane survival during observation and restart. Preserve visible limits: original-result retrieval is currently bounded to 16 KiB without a full-result archive; coordinator reports are 2048-byte UTF-8 excerpts; task-thread delivery needs separately retained complete attributable payloads. Chunk retries may duplicate physical posts. Startup automatic continuation and post-retirement result availability remain unproven, and unavailable output stays held rather than being regenerated.
 
-Selective gajaestack adoption is proposed guidance only, not a runtime dependency or already-enforced TypeScript machinery. Owner-led adoption work is separate; no speculative configuration or config-lint policy is required by Part 1.
+Gajaestack is a pinned development dependency for standalone consumer-rooted TypeScript checks; see the [local check commands](../README.md#local-typescript-checks). It is not a production runtime dependency, automatic preload or CI binding. Selective agent-guidance loading remains unverified and is not migration acceptance; no speculative configuration or config-lint policy is required by Part 1.
 
 ## Home and configuration
 

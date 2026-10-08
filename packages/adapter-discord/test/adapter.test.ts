@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChatMessagePayload, ChatProgressPayload } from "@gajae-gateway/protocol";
-import { PRESENCE_MIN_SWAP_MS } from "@gajae-gateway/protocol";
+import { PRESENCE_MIN_SWAP_MS, ProtocolError } from "@gajae-gateway/protocol";
 import { DiscordAdapterStartupError, loadDiscordAdapterConfig } from "../src/config";
 import {
 	chunkDiscordMessage,
@@ -44,7 +44,8 @@ test("channel auto-threading retains guild identity and never redirects an exist
 	};
 	const engagement = { group: true, mentioned: true, authorId: author.id };
 	const channel = { platform: "discord", kind: "channel", conversationId: "456", boundaryId: "999" } as const;
-	const thread = await maybeCreateThreadOnMention(message, engagement, channel);
+	const unnamedThreads = new UnnamedThreads();
+	const thread = await maybeCreateThreadOnMention(message, engagement, channel, undefined, unnamedThreads);
 	expect(thread).toEqual({
 		platform: "discord",
 		kind: "thread",
@@ -52,7 +53,7 @@ test("channel auto-threading retains guild identity and never redirects an exist
 		parentId: "456",
 		boundaryId: "999",
 	});
-	expect(await maybeCreateThreadOnMention(message, engagement, thread)).toBe(thread);
+	expect(await maybeCreateThreadOnMention(message, engagement, thread, undefined, unnamedThreads)).toBe(thread);
 	expect(creates).toBe(1);
 });
 
@@ -806,7 +807,9 @@ test("/model autocomplete filters gateway choices and fails soft to an empty lis
 });
 
 test("a declined slash command answers not-authorized instead of claiming a reset", async () => {
-	const gateway = { requestInbound: async () => ({ engaged: false }) };
+	const gateway = {
+		requestInbound: async () => ({ engaged: false }),
+	};
 	let replied = "";
 	await handleSlashCommand(
 		{
@@ -823,6 +826,56 @@ test("a declined slash command answers not-authorized instead of claiming a rese
 		{ error: () => {} },
 	);
 	expect(replied).toContain("not authorized");
+});
+
+test("a mapped task thread relays the gateway's permanent slash refusal truthfully", async () => {
+	const sent: string[] = [];
+	const errors: string[] = [];
+	// The permanent mapping lives in the gateway store: the slash send reaches the
+	// gateway and comes back as its exact invalid_params reasonCode, which the
+	// handler answers as a truthful unsupported refusal, never as a false
+	// authorization failure or a claim that anything changed.
+	const gateway = {
+		requestInbound: async (_messageId: string, origin: { conversationId?: string }, text: string) => {
+			sent.push(text);
+			if (origin.conversationId === "mapped-thread-1")
+				throw new ProtocolError("invalid_params", "Slash commands are not supported in mapped task threads", {
+					reasonCode: "mapped_slash_unsupported",
+				});
+			return { engaged: true };
+		},
+	};
+	const replies: Array<{ content: string; ephemeral?: boolean }> = [];
+	const invoke = (channel: { id: string; type: number; parentId?: string; guildId?: string }) =>
+		handleSlashCommand(
+			{
+				isChatInputCommand: () => true,
+				commandName: "reset",
+				id: `itx-${channel.id}`,
+				user: { id: "owner-1", username: "bellman" },
+				channel,
+				reply: async (options: { content: string; ephemeral?: boolean }) => {
+					replies.push(options);
+				},
+			} as never,
+			gateway as never,
+			{ error: (line: string) => errors.push(line) },
+		);
+	await invoke({ id: "mapped-thread-1", type: 11, parentId: "parent-1", guildId: "guild-1" });
+	// The attempt is made and refused by the gateway; nothing adapter-local
+	// short-circuits it and the refusal is not logged as a handler failure.
+	expect(sent).toEqual(["/reset"]);
+	expect(replies).toHaveLength(1);
+	expect(replies[0]?.ephemeral).toBe(true);
+	expect(replies[0]?.content).toContain("not supported in mapped task threads");
+	expect(replies[0]?.content).toContain("No task or session change was made.");
+	expect(replies[0]?.content).not.toContain("not authorized");
+	expect(replies[0]?.content).not.toContain("session reset");
+	expect(errors).toEqual([]);
+	// Ordinary conversations keep the existing slash behavior.
+	await invoke({ id: "channel-9", type: 0 });
+	expect(sent).toEqual(["/reset", "/reset"]);
+	expect(replies[1]?.content).toContain("session reset");
 });
 
 test("presence eligibility includes accepted thread follow-ups but excludes overheard channels", () => {
