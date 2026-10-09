@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
@@ -74,9 +76,21 @@ import {
 	workSessionKey,
 } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
-import { isSessionUnavailable, type SessionPort } from "./session-port";
+import {
+	isSessionUnavailable,
+	SESSION_CREATE_READINESS_MS,
+	sessionCreateRef,
+	type SessionBinding,
+	type SessionManagedBindIdentity,
+	type SessionManagedCreateTarget,
+	type SessionPort,
+} from "./session-port";
 import type { TailHandle } from "./tail-runner";
-import { admitDedicatedWorktree, revalidateDedicatedWorktree } from "./worktree-admission";
+import {
+	admitDedicatedWorktree,
+	assertManagedWorktreeIgnored,
+	revalidateDedicatedWorktree,
+} from "./worktree-admission";
 
 const owners = new WeakSet<GatewayDatabase>();
 /** Consecutive failed reconciliations between authority re-checks through recovery. */
@@ -155,6 +169,16 @@ interface Observer {
 interface Waiter {
 	readonly owner: object;
 	readonly finish: (error?: Error) => void;
+}
+/** Source repository identity retained in immutable task storage before any native effect. */
+interface NativeSourceIdentity {
+	readonly root: string;
+	readonly commonDir: string;
+	readonly gitDir: string;
+	/** Primary checkout HEAD: GJC creates linked checkouts at this base. */
+	readonly base: string;
+	/** Source checkout HEAD at authorization time. */
+	readonly head: string;
 }
 export interface WorkLaneManagerOptions {
 	readonly database: GatewayDatabase;
@@ -581,7 +605,125 @@ export class WorkLaneManager {
 		if (!coordinator) throw new ProtocolError("invalid_params", "coordinator execution area unavailable");
 		return admitDedicatedWorktree(task.request.cwd, coordinator);
 	}
+	/** Managed execution cwd only; a native request without a valid result is held, never the source. */
+	#taskExecutionCwd(task: Pick<WorkTaskQualifiedAdmissionScope, "taskId" | "request">): string {
+		return this.#db.workTaskExecutionCwd(task);
+	}
+	/** The exact SDK create target persisted before any effect; input cwd is provisioning input only. */
+	#nativeCreateTarget(cwd: string, model: GjcModelSelection | undefined): SessionManagedCreateTarget {
+		return {
+			cwd,
+			worktree: { enabled: true },
+			...(model ? (typeof model === "string" ? { modelId: model } : { modelPreset: model.preset }) : {}),
+			readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+		};
+	}
+	/**
+	 * Original managed create authorization: the persisted idempotency key and
+	 * exact SDK create target, written before any effect and never regenerated.
+	 */
+	#nativeAllocationRequest(task: Pick<WorkTask, "taskId" | "request">): {
+		idempotencyKey: string;
+		createTarget: SessionManagedCreateTarget;
+		source: NativeSourceIdentity;
+		epoch: number;
+	} {
+		const source = this.#db.workTaskSourceGet(`native-allocation-request-${task.taskId}`);
+		if (
+			!source ||
+			source.taskId !== task.taskId ||
+			source.kind !== "decision" ||
+			source.completeness !== "complete" ||
+			JSON.stringify(source.evidence) !== JSON.stringify(task.request.evidence)
+		)
+			throw new Error("native_allocation_authorization_unavailable");
+		let stored: { requestKey?: unknown; target?: unknown; source?: unknown; epoch?: unknown };
+		try {
+			stored = JSON.parse(source.body);
+			if (!stored || typeof stored !== "object" || Array.isArray(stored))
+				throw new Error("invalid native authorization record");
+		} catch {
+			throw new Error("native_allocation_authorization_changed");
+		}
+		const identity = stored.source as Partial<NativeSourceIdentity> | undefined;
+		if (
+			stored.requestKey !==
+				sessionCreateRef(
+					this.#db.instanceId,
+					workSessionKey(`fm-${task.taskId}`),
+					stored.epoch as number,
+					task.request.cwd,
+				) ||
+			JSON.stringify(stored.target) !==
+				JSON.stringify(this.#nativeCreateTarget(task.request.cwd, task.request.model)) ||
+			typeof stored.epoch !== "number" ||
+			!Number.isSafeInteger(stored.epoch) ||
+			stored.epoch < 0 ||
+			typeof identity?.root !== "string" ||
+			typeof identity.commonDir !== "string" ||
+			typeof identity.gitDir !== "string" ||
+			typeof identity.base !== "string" ||
+			!/^[0-9a-f]{40}$/.test(identity.base) ||
+			typeof identity.head !== "string" ||
+			!/^[0-9a-f]{40}$/.test(identity.head)
+		)
+			throw new Error("native_allocation_authorization_changed");
+		return {
+			idempotencyKey: stored.requestKey as string,
+			createTarget: stored.target as SessionManagedCreateTarget,
+			source: {
+				root: identity.root,
+				commonDir: identity.commonDir,
+				gitDir: identity.gitDir,
+				base: identity.base,
+				head: identity.head,
+			},
+			epoch: stored.epoch as number,
+		};
+	}
+	/**
+	 * Code tasks hold the persisted SDK-returned execution proof; read-only tasks
+	 * retain the optional original admission proof of the immutable source cwd.
+	 */
 	#originalWorktreeProof(task: Pick<WorkTaskQualifiedAdmissionScope, "taskId" | "request">) {
+		if (task.request.kind === "code_mutating") {
+			const source = this.#db.workTaskSourceGet(`native-allocation-result-${task.taskId}`);
+			if (!source || source.taskId !== task.taskId || source.kind !== "decision" || source.completeness !== "complete")
+				throw new Error("original_worktree_proof_unavailable");
+			let record: { executionCwd?: unknown; gitProof?: unknown };
+			try {
+				record = JSON.parse(source.body);
+			} catch {
+				throw new Error("original_worktree_proof_unavailable");
+			}
+			if (
+				typeof record.executionCwd !== "string" ||
+				!record.executionCwd ||
+				typeof record.gitProof !== "string" ||
+				record.executionCwd !== this.#taskExecutionCwd(task)
+			)
+				throw new Error("original_worktree_proof_unavailable");
+			let stored: { requestedCwd?: unknown; requestedCoordinator?: unknown };
+			try {
+				stored = JSON.parse(record.gitProof);
+			} catch {
+				throw new Error("original_worktree_proof_unavailable");
+			}
+			const coordinator = this.#options.coordinatorCwd?.(task.request.coordinator);
+			if (
+				typeof stored.requestedCwd !== "string" ||
+				typeof stored.requestedCoordinator !== "string" ||
+				!coordinator ||
+				stored.requestedCoordinator !== coordinator
+			)
+				throw new Error("dedicated_worktree_changed");
+			// Fresh admission re-reads Git registration and realpaths against the
+			// persisted allocation proof; transport paths re-check before sending.
+			const proof = admitDedicatedWorktree(stored.requestedCwd, coordinator);
+			if (JSON.stringify(proof) !== record.gitProof) throw new Error("dedicated_worktree_changed");
+			assertManagedWorktreeIgnored(proof);
+			return proof;
+		}
 		const source = this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`);
 		if (!source || source.taskId !== task.taskId || source.kind !== "decision" || source.completeness !== "complete")
 			throw new Error("original_worktree_proof_unavailable");
@@ -592,6 +734,24 @@ export class WorkLaneManager {
 		// against the stored proof; an immediate revalidation repeats identical
 		// inspection at one boundary. Transport paths re-check before sending.
 		return proof;
+	}
+	/** A code task's proof fence applies only once a native execution allocation exists. */
+	#dispositionProofRequired(task: Pick<WorkTaskQualifiedAdmissionScope, "taskId" | "request">): boolean {
+		return task.request.kind === "code_mutating"
+			? this.#db.workTaskSourceGet(`native-allocation-result-${task.taskId}`) !== undefined
+			: this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`) !== undefined;
+	}
+	#nativeAllocationPending(task: WorkTask): boolean {
+		return (
+			task.request.kind === "code_mutating" &&
+			task.dispatchPhase === "pending" &&
+			Boolean(
+				this.#db.workTaskSourceGet(`native-allocation-claimed-${task.taskId}`) ||
+					this.#db.workTaskSourceGet(`native-allocation-result-${task.taskId}`) ||
+					this.#db.getSessionRecord(workSessionKey(task.laneName))?.sessionId ||
+					this.#db.workAttemptGet(task.opRef),
+			)
+		);
 	}
 	taskProjection(taskId: string): WorkTaskProjection {
 		const task = this.#task(taskId);
@@ -640,7 +800,12 @@ export class WorkLaneManager {
 			epoch: task.epoch,
 			surface,
 			obligation: task.obligationState,
-			...(task.holdReason ? { holdReason: task.holdReason } : {}),
+			codingCompletion: this.#db.workTaskCodingCompletion(taskId),
+			...(task.holdReason
+				? { holdReason: task.holdReason }
+				: this.#nativeAllocationPending(task)
+					? { holdReason: "native_allocation_unresolved" }
+					: {}),
 			finalReport: {
 				reportId: task.terminalReportId,
 				completeness: task.obligationState === "final_admitted" ? "complete" : "unavailable",
@@ -704,6 +869,11 @@ export class WorkLaneManager {
 		return this.#port.runExclusive(workSessionKey(input.name), async () => {
 			const existing = this.#db.workTaskGet(spec.taskId);
 			if (!existing && this.#job(input.name)) throw new ProtocolError("invalid_params", "task name has lane history");
+			// Retain the source repository identity before any effect: GJC creates
+			// linked checkouts at the primary HEAD, and only this captured base is
+			// ever authoritative for the managed allocation.
+			const allocationSource =
+				!existing && spec.kind === "code_mutating" ? this.#sourceRepoIdentity(input.cwd) : undefined;
 			const admitted = this.#db.withTransaction(() => {
 				const result = this.#db.workTaskCreateInTransaction({
 					taskId: spec.taskId,
@@ -723,24 +893,45 @@ export class WorkLaneManager {
 				});
 				if (result.disposition === "conflict") throw new ProtocolError("invalid_params", "task assignment conflict");
 				if (result.disposition === "created") {
-					let proof: ReturnType<typeof admitDedicatedWorktree> | undefined;
-					try {
-						proof = this.#worktreeProof(result.record);
-					} catch (error) {
-						if (spec.kind === "code_mutating") throw error;
-					}
-					if (proof)
+					if (spec.kind === "code_mutating") {
+						// Persist the original create key and exact SDK target before any native effect.
+						const epoch = this.#db.getSessionRecord(workSessionKey(input.name))?.epoch ?? 0;
 						this.#db.workTaskSourceAppendInTransaction({
-							sourceId: `worktree-admission-${spec.taskId}`,
+							sourceId: `native-allocation-request-${spec.taskId}`,
 							taskId: spec.taskId,
 							kind: "decision",
-							body: JSON.stringify(proof),
+							body: JSON.stringify({
+								requestKey: sessionCreateRef(this.#db.instanceId, workSessionKey(input.name), epoch, input.cwd),
+								target: this.#nativeCreateTarget(input.cwd, input.model),
+								source: allocationSource,
+								epoch,
+							}),
 							evidence: context.evidence,
 							supersedes: null,
 							completeness: "complete",
 							controlId: null,
 							reportId: null,
 						});
+					} else {
+						let proof: ReturnType<typeof admitDedicatedWorktree> | undefined;
+						try {
+							proof = this.#worktreeProof(result.record);
+						} catch {
+							/* Read-only admission never gates on Git facts. */
+						}
+						if (proof)
+							this.#db.workTaskSourceAppendInTransaction({
+								sourceId: `worktree-admission-${spec.taskId}`,
+								taskId: spec.taskId,
+								kind: "decision",
+								body: JSON.stringify(proof),
+								evidence: context.evidence,
+								supersedes: null,
+								completeness: "complete",
+								controlId: null,
+								reportId: null,
+							});
+					}
 				}
 				return result.record;
 			});
@@ -775,7 +966,17 @@ export class WorkLaneManager {
 					reason: "original_dispatch_uncertain",
 				};
 			}
-			if (admitted.request.kind === "code_mutating") this.#originalWorktreeProof(admitted);
+			if (admitted.request.kind === "code_mutating") this.#nativeAllocationRequest(admitted);
+			if (this.#nativeAllocationPending(admitted))
+				return {
+					started: false,
+					held: true,
+					taskId: admitted.taskId,
+					jobId: admitted.jobId,
+					opRef: admitted.opRef,
+					state: "held",
+					reason: "native_allocation_unresolved",
+				};
 			return {
 				started: false,
 				accepted: "durable",
@@ -800,7 +1001,7 @@ export class WorkLaneManager {
 						disposition: current.surfacePhase === "held" ? "held" : "duplicate",
 						surface: this.taskProjection(input.taskId).surface,
 					};
-				if (current.request.kind === "code_mutating") this.#originalWorktreeProof(current);
+				if (current.request.kind === "code_mutating") this.#nativeAllocationRequest(current);
 				const claimed = this.#db.workTaskSurfaceInTransaction(input.taskId, current.version, {
 					phase: "claimed",
 					claimId: input.claimId,
@@ -900,6 +1101,7 @@ export class WorkLaneManager {
 				]
 					.filter(Boolean)
 					.join("\n\n"),
+				// Provisioning input only; #startLocked derives any managed execution cwd.
 				cwd: task.request.cwd,
 				resume: false,
 				model: task.request.model,
@@ -910,6 +1112,208 @@ export class WorkLaneManager {
 				parent: { kind: "persona", origin: task.request.coordinator, originKey: originKey(task.request.coordinator) },
 			},
 		);
+	}
+	/**
+	 * Native managed allocation: the persisted first-create authorization is
+	 * durably claimed before the single create; every later dispatch recovers
+	 * the original binding lookup-only and never replays, replaces, or rotates.
+	 */
+	async #allocateTaskSession(task: WorkTask, sessionKey: string): Promise<SessionBinding> {
+		return await this.#port.runExclusive("work/admission", async () => {
+			this.#live();
+			this.#options.lanes.assertAdmission(task.laneName);
+			this.#assertTaskSurface(this.#task(task.taskId));
+			const request = this.#nativeAllocationRequest(task);
+			const claimedId = `native-allocation-claimed-${task.taskId}`;
+			const claimed = this.#db.workTaskSourceGet(claimedId);
+			const persisted = this.#db.getSessionRecord(sessionKey);
+			if (persisted && persisted.epoch !== request.epoch)
+				throw this.#allocationHeld(task, "original_allocation_epoch_changed");
+			if (
+				!claimed &&
+				(persisted?.sessionId ||
+					this.#db.workTaskSourceGet(`native-allocation-result-${task.taskId}`) ||
+					this.#db.workAttemptGet(task.opRef) ||
+					task.dispatchPhase !== "pending")
+			)
+				throw this.#allocationHeld(task, "original_allocation_claim_missing");
+			if (
+				claimed &&
+				(claimed.taskId !== task.taskId ||
+					claimed.kind !== "decision" ||
+					claimed.completeness !== "complete" ||
+					claimed.body !== JSON.stringify({ requestKey: request.idempotencyKey, opRef: task.opRef }) ||
+					claimed.evidence.principalId !== "gateway" ||
+					claimed.evidence.eventId !== task.opRef ||
+					originKey(claimed.evidence.origin) !== originKey(task.request.coordinator))
+			)
+				throw this.#allocationHeld(task, "native_allocation_claim_unavailable");
+			if (!claimed) {
+				// Known-unsent validation failures do not consume create permission.
+				const current = this.#sourceRepoIdentity(task.request.cwd);
+				if (JSON.stringify(current) !== JSON.stringify(request.source) || current.head !== request.source.base)
+					throw this.#allocationHeld(task, "source_repository_changed_or_divergent");
+			}
+			// The first dispatch durably claims the first-create permission itself; a
+			// pre-existing or raced claim means the create may already have happened
+			// and only a correlated lookup may ever recover it, never a resend.
+			let claimedHere = false;
+			if (!claimed)
+				try {
+					this.#db.withTransaction(() => {
+						if (this.#db.workTaskSourceGet(claimedId)) throw new Error("allocation claim raced");
+						this.#db.workTaskSourceAppendInTransaction({
+							sourceId: claimedId,
+							taskId: task.taskId,
+							kind: "decision",
+							body: JSON.stringify({ requestKey: request.idempotencyKey, opRef: task.opRef }),
+							evidence: {
+								principalId: "gateway",
+								origin: task.request.coordinator,
+								eventId: task.opRef,
+								editId: null,
+								evidenceAt: this.#at(),
+								observedAt: this.#at(),
+							},
+							supersedes: null,
+							completeness: "complete",
+							controlId: null,
+							reportId: null,
+						});
+						claimedHere = true;
+					});
+				} catch {
+					claimedHere = false;
+				}
+			if (!claimed && !claimedHere && !this.#db.workTaskSourceGet(claimedId))
+				throw this.#allocationHeld(task, "native_allocation_claim_unavailable");
+			const lookupOnly = !claimedHere;
+			// Original authorization epoch recovered verbatim, never a re-read current epoch.
+			const epoch = request.epoch;
+			let binding: SessionBinding;
+			try {
+				binding = await this.#port.bind({
+					originKey: sessionKey,
+					epoch,
+					// Provisioning input for the managed create target only; the
+					// execution cwd is whatever the SDK returns, never this source.
+					repo: task.request.cwd,
+					codingRegister: true,
+					...(task.request.model ? { model: task.request.model } : {}),
+					managedWorktree: {
+						idempotencyKey: request.idempotencyKey,
+						createTarget: request.createTarget,
+						lookupOnly,
+						// Admission gate: validate and durably persist this exact
+						// identity before the port records any owned binding.
+						validateResult: (identity) => {
+							const proof = this.#validateManagedAllocation(task, identity, request.source);
+							this.#db.withTransaction(() =>
+								this.#db.workTaskNativeAllocateInTransaction({
+									taskId: task.taskId,
+									sessionId: identity.sessionId,
+									epoch,
+									executionCwd: proof.cwd,
+									...(identity.endpointGeneration !== undefined
+										? { endpointGeneration: identity.endpointGeneration }
+										: {}),
+									...(identity.endpointIncarnation !== undefined
+										? { endpointIncarnation: identity.endpointIncarnation }
+										: {}),
+									gitProof: JSON.stringify(proof),
+									at: this.#at(),
+								}),
+							);
+						},
+					},
+				});
+			} catch (error) {
+				if (error instanceof ProtocolError) throw error;
+				// Uncertain create/lookup outcomes stay held: the original key is the
+				// only authority, and recovery remains lookup-only, never a resend.
+				throw this.#allocationHeld(task, "native_allocation_unresolved");
+			}
+			this.#live();
+			// Defensive: the callback persisted the allocation; a port that skipped it
+			// must not hand an unpersisted binding to the dispatch path.
+			if (!this.#db.workTaskSourceGet(`native-allocation-result-${task.taskId}`))
+				throw this.#allocationHeld(task, "allocation_not_persisted");
+			return binding;
+		});
+	}
+	#allocationHeld(task: WorkTask, reason: string): ProtocolError {
+		return new ProtocolError("verb_failed", `native managed allocation held: ${reason}`, {
+			reasonCode: "native_allocation_held",
+			name: task.laneName,
+		});
+	}
+	/**
+	 * Admission gate for the SDK-returned identity: validated against the
+	 * retained source identity and base. Fresh reads fence identity drift only;
+	 * they never replace the original authorization or become execution cwd.
+	 */
+	#validateManagedAllocation(task: WorkTask, identity: SessionManagedBindIdentity, retained: NativeSourceIdentity) {
+		if (!identity.cwd) throw this.#allocationHeld(task, "missing_validated_execution_cwd");
+		const source = this.#sourceRepoIdentity(task.request.cwd);
+		if (source.root !== retained.root || source.commonDir !== retained.commonDir || source.gitDir !== retained.gitDir)
+			throw this.#allocationHeld(task, "source_checkout_identity_changed");
+		const coordinator = this.#options.coordinatorCwd?.(task.request.coordinator);
+		if (!coordinator) throw new ProtocolError("invalid_params", "coordinator execution area unavailable");
+		const proof = admitDedicatedWorktree(identity.cwd, coordinator);
+		assertManagedWorktreeIgnored(proof);
+		// The ownership record stores this exact string, so it must already be the
+		// canonical checkout path the dispatch runtime will use.
+		if (identity.cwd !== proof.cwd) throw this.#allocationHeld(task, "execution_cwd_not_canonical");
+		// The execution checkout must belong to the retained source repository and
+		// be a distinct registered checkout of it (admission already excludes the
+		// primary root and any coordinator identity inside the worker).
+		if (proof.commonDir !== retained.commonDir)
+			throw this.#allocationHeld(task, "checkout_foreign_to_source_repository");
+		if (proof.cwd === retained.root) throw this.#allocationHeld(task, "checkout_is_the_source");
+		// GJC creates linked checkouts at the retained primary base; anything else
+		// would silently continue from the wrong branch base.
+		if (this.#gitRevision(proof.cwd) !== retained.base) throw this.#allocationHeld(task, "checkout_base_diverged");
+		return proof;
+	}
+	/** Current HEAD of a checkout; empty when Git cannot prove one. */
+	#gitRevision(dir: string): string {
+		const result = Bun.spawnSync(["git", "-C", dir, "rev-parse", "HEAD"], {
+			stdout: "pipe",
+			stderr: "pipe",
+			env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+		});
+		const revision = result.exitCode === 0 ? result.stdout.toString().trim() : "";
+		return /^[0-9a-f]{40}$/.test(revision) ? revision : "";
+	}
+	/**
+	 * Canonical source repository identity captured before any effect; Git facts,
+	 * never pathname guesses. The primary HEAD is the base GJC will check out.
+	 */
+	#sourceRepoIdentity(cwd: string): NativeSourceIdentity {
+		const git = (dir: string, ...args: string[]): string => {
+			const result = Bun.spawnSync(["git", "-C", dir, ...args], {
+				stdout: "pipe",
+				stderr: "pipe",
+				env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+			});
+			if (result.exitCode !== 0) throw new Error();
+			return result.stdout.toString().trim();
+		};
+		try {
+			const root = realpathSync(git(realpathSync(cwd), "rev-parse", "--show-toplevel"));
+			const commonDir = realpathSync(resolve(root, git(root, "rev-parse", "--git-common-dir")));
+			const gitDir = realpathSync(resolve(root, git(root, "rev-parse", "--git-dir")));
+			const primary = git(root, "worktree", "list", "--porcelain", "-z")
+				.split("\0")
+				.find((line) => line.startsWith("worktree "));
+			if (!primary) throw new Error();
+			const base = this.#gitRevision(realpathSync(primary.slice(9)));
+			const head = this.#gitRevision(root);
+			if (!base || !head) throw new Error();
+			return { root, commonDir, gitDir, base, head };
+		} catch {
+			throw new Error("native_allocation_source_repository_unavailable");
+		}
 	}
 	#source(task: WorkTask, input: WorkTaskSourceInput): void {
 		this.#assertTaskSurface(task);
@@ -1002,18 +1406,29 @@ export class WorkLaneManager {
 			task.opRef !== original.opRef ||
 			task.jobId !== original.jobId ||
 			task.sessionId !== original.sessionId ||
-			task.epoch !== original.epoch ||
-			task.request.cwd !== original.cwd
+			task.epoch !== original.epoch
 		)
 			return;
-		const admission = this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`);
-		if (admission) {
-			try {
-				if (admission.body !== JSON.stringify(this.#worktreeProof(task))) return;
-			} catch {
-				return;
+		// A managed code task without a well-formed persisted execution checkout
+		// can never attribute facts; the source cwd is never a fallback.
+		let executionCwd: string;
+		try {
+			executionCwd = this.#taskExecutionCwd(task);
+			if (task.request.kind === "code_mutating") this.#originalWorktreeProof(task);
+		} catch {
+			return;
+		}
+		if (executionCwd !== original.cwd) return;
+		if (task.request.kind !== "code_mutating") {
+			const admission = this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`);
+			if (admission) {
+				try {
+					if (admission.body !== JSON.stringify(this.#worktreeProof(task))) return;
+				} catch {
+					return;
+				}
 			}
-		} else if (task.request.kind === "code_mutating") return;
+		}
 		const current = this.#db.workAttemptGet(original.opRef);
 		if (
 			!current ||
@@ -1194,7 +1609,7 @@ export class WorkLaneManager {
 						? {
 								taskId: task.taskId,
 								opRef: task.opRef,
-								cwd: task.request.cwd,
+								cwd: this.#taskExecutionCwd(task),
 								kind: "code_mutating",
 								eventId: event.eventId,
 								sourceId,
@@ -1323,7 +1738,7 @@ export class WorkLaneManager {
 			runtime.sessionId === task.sessionId &&
 			runtime.epoch === task.epoch &&
 			runtime.jobId === task.jobId &&
-			runtime.cwd === task.request.cwd &&
+			runtime.cwd === this.#taskExecutionCwd(task) &&
 			runtime.sessionKey === workSessionKey(task.laneName)
 			? runtime
 			: undefined;
@@ -1454,7 +1869,7 @@ export class WorkLaneManager {
 			throw new Error("dedicated_worktree_proof_unavailable");
 		const proof = JSON.parse(source.body) as ReturnType<typeof admitDedicatedWorktree>;
 		if (
-			proof.requestedCwd !== task.request.cwd ||
+			proof.cwd !== this.#taskExecutionCwd(task) ||
 			proof.requestedCoordinator !== this.#options.coordinatorCwd?.(task.request.coordinator)
 		)
 			throw new Error("dedicated_worktree_changed");
@@ -1607,7 +2022,7 @@ export class WorkLaneManager {
 				output.provenance.sessionId !== current.sessionId ||
 				output.provenance.opRef !== current.opRef ||
 				output.provenance.clientRef !== current.opRef ||
-				output.provenance.repo !== current.request.cwd ||
+				output.provenance.repo !== this.#taskExecutionCwd(current) ||
 				!Number.isFinite(output.provenance.terminalAt) ||
 				output.provenance.terminalAt !== status.terminalAt ||
 				output.provenance.commandId !== status.commandId ||
@@ -1686,7 +2101,7 @@ export class WorkLaneManager {
 				last.opRef !== task.opRef ||
 				last.sessionId !== task.sessionId ||
 				last.endedAt === undefined ||
-				job.lane.worktreePath !== task.request.cwd ||
+				job.lane.worktreePath !== this.#taskExecutionCwd(task) ||
 				job.attempts.some((attempt) => attempt.endedAt === undefined)
 			)
 				return hold("task_original_terminal_proof_unavailable");
@@ -1812,12 +2227,13 @@ export class WorkLaneManager {
 		const task = this.#db.workTaskByLane(input.name);
 		if (task && (context.opRef !== task.opRef || task.dispatchPhase !== "pending" || task.surfacePhase !== "bound"))
 			throw new ProtocolError("invalid_params", "original task cannot be resumed or retasked");
-		const proof = task?.request.kind === "code_mutating" ? this.#originalWorktreeProof(task) : undefined;
 		if (task) this.#assertTaskSurface(task);
 		const sessionKey = workSessionKey(input.name);
 		let job = this.#job(input.name);
 		const { jobId } = laneJobIdentity(input.name);
-		if (job && job.lane.worktreePath !== input.cwd)
+		// A pre-existing lane job implies a persisted managed allocation; before
+		// allocation the assignment source is provisioning input, never execution.
+		if (job && job.lane.worktreePath !== (task ? this.#taskExecutionCwd(task) : input.cwd))
 			throw new ProtocolError("invalid_params", "work lane cwd mismatch", {
 				reasonCode: "lane_cwd_mismatch",
 				name: input.name,
@@ -1841,33 +2257,46 @@ export class WorkLaneManager {
 				};
 			job = acknowledgeHold({ record: job, note: "operator resumed the work lane", at: this.#at() });
 		}
+		let managedBinding: SessionBinding | undefined;
+		if (task?.request.kind === "code_mutating") {
+			// Allocate (or recover, lookup-only) the managed execution checkout
+			// before the lane baseline, the ownership binding, or any prompt.
+			managedBinding = await this.#allocateTaskSession(task, sessionKey);
+			this.#live();
+			this.#assertTaskSurface(this.#task(task.taskId));
+		}
+		const laneCwd = task ? this.#taskExecutionCwd(this.#task(task.taskId)) : input.cwd;
+		const proof =
+			task?.request.kind === "code_mutating" ? this.#originalWorktreeProof(this.#task(task.taskId)) : undefined;
 		if (!job) {
-			const facts = await collectRepoFacts(input.cwd);
+			const facts = await collectRepoFacts(laneCwd);
 			job = createLaneJobRecord({
 				jobId,
 				branch: facts?.branch ?? `work/${input.name.toLowerCase()}`,
-				worktreePath: input.cwd,
+				worktreePath: laneCwd,
 				baselineSha: facts?.headSha,
 			});
 		}
-		const binding = await this.#port.runExclusive("work/admission", async () => {
-			this.#live();
-			this.#options.lanes.assertAdmission(input.name);
-			try {
-				return await this.#port.bind({
-					originKey: sessionKey,
-					epoch: this.#db.getSessionRecord(sessionKey)?.epoch ?? 0,
-					repo: input.cwd,
-					codingRegister: true,
-					...(input.model ? { model: input.model } : {}),
-				});
-			} catch {
-				throw new ProtocolError("verb_failed", "work lane bind failed", {
-					reasonCode: "bind_failed",
-					name: input.name,
-				});
-			}
-		});
+		const binding =
+			managedBinding ??
+			(await this.#port.runExclusive("work/admission", async () => {
+				this.#live();
+				this.#options.lanes.assertAdmission(input.name);
+				try {
+					return await this.#port.bind({
+						originKey: sessionKey,
+						epoch: this.#db.getSessionRecord(sessionKey)?.epoch ?? 0,
+						repo: input.cwd,
+						codingRegister: true,
+						...(input.model ? { model: input.model } : {}),
+					});
+				} catch {
+					throw new ProtocolError("verb_failed", "work lane bind failed", {
+						reasonCode: "bind_failed",
+						name: input.name,
+					});
+				}
+			}));
 		this.#live();
 		const opRef = context.opRef ?? newOpRef(`work-${input.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`);
 		const notice = mode === "start" ? this.#laneNotice(input.name, context.parent, binding.epoch) : undefined;
@@ -1876,7 +2305,7 @@ export class WorkLaneManager {
 			input.name,
 			binding.sessionId,
 			binding.epoch,
-			input.cwd,
+			laneCwd,
 			this.#at(),
 			opRef,
 			mode,
@@ -1894,10 +2323,15 @@ export class WorkLaneManager {
 		if (proof) revalidateDedicatedWorktree(proof);
 		if (task) {
 			this.#assertTaskSurface(this.#task(task.taskId));
-			if (
-				!this.#writeCurrent(observer) ||
-				(proof && JSON.stringify(this.#worktreeProof(task)) !== JSON.stringify(proof))
-			)
+			let proofMatches = true;
+			if (proof) {
+				try {
+					proofMatches = JSON.stringify(this.#originalWorktreeProof(this.#task(task.taskId))) === JSON.stringify(proof);
+				} catch {
+					proofMatches = false;
+				}
+			}
+			if (!this.#writeCurrent(observer) || !proofMatches)
 				throw workError("task dispatch identity changed before transport", "task_dispatch_fenced", runtime);
 		}
 		let accepted = false;
@@ -2001,7 +2435,9 @@ export class WorkLaneManager {
 					state:
 						attempt && job
 							? job.state
-							: current.surfacePhase === "held" || current.obligationState === "held"
+							: current.surfacePhase === "held" ||
+									current.obligationState === "held" ||
+									this.#nativeAllocationPending(current)
 								? "held"
 								: current.dispatchPhase,
 					sessionId: current.sessionId ?? "",
@@ -2093,8 +2529,7 @@ export class WorkLaneManager {
 	}
 	#negativeDispositionScope(taskId: string) {
 		const scope = this.#db.workTaskQualifiedAdmissionScopeInTransaction(taskId);
-		if (scope.request.kind === "code_mutating" || this.#db.workTaskSourceGet(`worktree-admission-${taskId}`))
-			this.#originalWorktreeProof(scope);
+		if (this.#dispositionProofRequired(scope)) this.#originalWorktreeProof(scope);
 		return scope;
 	}
 	async dispositionBasis(params: unknown, context?: WorkTaskAdmissionContext): Promise<WorkTaskDispositionBasisResult> {
@@ -2111,8 +2546,7 @@ export class WorkLaneManager {
 					this.#negativeDispositionScope(input.taskId);
 				} else {
 					const task = this.#task(input.taskId);
-					if (task.request.kind === "code_mutating" || this.#db.workTaskSourceGet(`worktree-admission-${task.taskId}`))
-						this.#originalWorktreeProof(task);
+					if (this.#dispositionProofRequired(task)) this.#originalWorktreeProof(task);
 				}
 				// Qualification time belongs to the retained fact, never this read's ingress context.
 				return selected;
@@ -2182,11 +2616,7 @@ export class WorkLaneManager {
 				)
 					throw new ProtocolError("unauthorized", "mapped caller cannot dispose tasks");
 				// Revalidate the original declared scope, never a replacement checkout.
-				if (
-					current.request.kind === "code_mutating" ||
-					this.#db.workTaskSourceGet(`worktree-admission-${current.taskId}`)
-				)
-					this.#originalWorktreeProof(current);
+				if (this.#dispositionProofRequired(current)) this.#originalWorktreeProof(current);
 				if (input.target.kind === "control") {
 					const control = this.#db.workControlGet(input.target.controlId);
 					if (control?.request.taskId === current.taskId && control.request.scope === "code_mutating")
@@ -2277,7 +2707,7 @@ export class WorkLaneManager {
 							? {
 									taskId: current.taskId,
 									opRef: current.opRef,
-									cwd: current.request.cwd,
+									cwd: this.#taskExecutionCwd(current),
 									kind: "code_mutating",
 									eventId: input.eventId!,
 									sourceId,

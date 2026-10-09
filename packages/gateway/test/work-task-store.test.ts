@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,11 +9,15 @@ import {
 	LOOPBACK_ORIGIN,
 	type OriginRef,
 	originKey,
+	type WorkTaskCloseoutEvidence,
 	type WorkTaskDispositionParams,
+	type WorkTaskOwnerApproval,
 	type WorkTaskReviewParams,
 } from "@gajae-gateway/protocol";
 import { appendAttempt, closeAttempt, createLaneJobRecord } from "@gajae-gateway/subsession";
 import { buildDeliveryPayload } from "../src/delivery/delivery";
+import { SESSION_CREATE_READINESS_MS, sessionCreateRef } from "../src/orchestrator/session-port";
+import { admitDedicatedWorktree } from "../src/orchestrator/worktree-admission";
 import {
 	BrokerAuthorityError,
 	GatewayDatabase,
@@ -95,14 +99,15 @@ async function fixture() {
 					at: START,
 				})!,
 		);
-	const prepare = (task: WorkTask) => {
+	const prepare = (task: WorkTask, branch = "main") => {
 		const sessionKey = `work/task/${task.laneName}`;
-		database.recordOwnedBinding({ authority, sessionId: SESSION, originKey: sessionKey, epoch: 0, repo: request.cwd });
+		const cwd = database.workTaskExecutionCwd(task);
+		database.recordOwnedBinding({ authority, sessionId: SESSION, originKey: sessionKey, epoch: 0, repo: cwd });
 		const record = appendAttempt(
 			createLaneJobRecord({
 				jobId: task.jobId,
-				branch: "main",
-				worktreePath: request.cwd,
+				branch,
+				worktreePath: cwd,
 				sessionId: SESSION,
 				now: () => new Date(START),
 			}),
@@ -115,7 +120,7 @@ async function fixture() {
 			sessionKey,
 			sessionId: SESSION,
 			epoch: 0,
-			cwd: request.cwd,
+			cwd,
 			startedAt: START,
 			mode: "start",
 			sendPhase: "prepared",
@@ -687,11 +692,95 @@ async function heldDispositionFixture(retainRoute = false, settledPredecessors =
 	return { ...f, task, control, params };
 }
 
-async function reviewFixture() {
+function reviewGit(cwd: string, ...args: string[]): string {
+	const result = Bun.spawnSync(
+		["git", "-C", cwd, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", ...args],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+		},
+	);
+	if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+	return result.stdout.toString();
+}
+
+async function reviewFixture(code = false) {
 	const f = await fixture();
-	const bound = f.bind(f.create().record);
-	const { runtime, record } = f.prepare(bound);
+	const primary = join(f.directory, "primary");
+	const worker = join(primary, ".worktrees", "worker");
+	let base = "";
+	if (code) {
+		await mkdir(primary);
+		reviewGit(primary, "init", "--initial-branch=main");
+		await writeFile(join(primary, ".gitignore"), "/.worktrees\n");
+		reviewGit(primary, "add", ".gitignore");
+		reviewGit(primary, "commit", "-m", "base");
+		base = reviewGit(primary, "rev-parse", "HEAD").trim();
+		reviewGit(primary, "worktree", "add", "-b", "worker", worker);
+	}
+	const taskRequest = code ? { ...request, kind: "code_mutating" as const, cwd: primary } : request;
+	const admitted = f.create(TASK, identity.opRef, taskRequest).record;
+	if (code) {
+		const proof = admitDedicatedWorktree(worker, primary);
+		const key = sessionCreateRef(f.database.instanceId, `work/task/${admitted.laneName}`, 0, primary);
+		f.database.withTransaction(() => {
+			f.database.workTaskSourceAppendInTransaction({
+				...source(`native-allocation-request-${TASK}`),
+				evidence: admitted.request.evidence,
+				body: JSON.stringify({
+					requestKey: key,
+					epoch: 0,
+					target: { cwd: primary, worktree: { enabled: true }, readinessTimeoutMs: SESSION_CREATE_READINESS_MS },
+					source: { root: primary, commonDir: proof.commonDir, gitDir: proof.commonDir, base, head: base },
+				}),
+			});
+			f.database.workTaskSourceAppendInTransaction({
+				...source(`native-allocation-claimed-${TASK}`),
+				body: JSON.stringify({ requestKey: key, opRef: admitted.opRef }),
+				evidence: {
+					...admitted.request.evidence,
+					principalId: "gateway",
+					origin: admitted.request.coordinator,
+					eventId: admitted.opRef,
+				},
+			});
+			f.database.workTaskNativeAllocateInTransaction({
+				taskId: TASK,
+				sessionId: SESSION,
+				epoch: 0,
+				executionCwd: worker,
+				gitProof: JSON.stringify(proof),
+				at: START,
+			});
+		});
+	}
+	const bound = f.bind(admitted);
+	const { runtime, record } = f.prepare(bound, code ? "worker" : "main");
 	f.database.workAttemptPrepare(runtime, record);
+	let git:
+		| {
+				primary: string;
+				worker: string;
+				commonDir: string;
+				base: string;
+				commit: string;
+				integrated: string;
+				diffHash: string;
+		  }
+		| undefined;
+	if (code) {
+		await writeFile(join(worker, "result.txt"), "reviewed result\n");
+		reviewGit(worker, "add", "result.txt");
+		reviewGit(worker, "commit", "-m", "worker result");
+		const commit = reviewGit(worker, "rev-parse", "HEAD").trim();
+		const diffHash = createHash("sha256")
+			.update(reviewGit(worker, "diff", base, commit))
+			.digest("hex");
+		reviewGit(primary, "merge", "--no-ff", "worker", "-m", "integrated result");
+		const integrated = reviewGit(primary, "rev-parse", "HEAD").trim();
+		reviewGit(primary, "diff", "--exit-code", commit, integrated);
+		git = { primary, worker, commonDir: join(primary, ".git"), base, commit, integrated, diffHash };
+	}
 	const body = "Complete original answer requiring an owner choice.";
 	const report = buildDeliveryPayload(runtime.opRef, LOOPBACK_ORIGIN, body, runtime.deliveryId)!;
 	f.database.workAttemptSettle(
@@ -706,6 +795,9 @@ async function reviewFixture() {
 				status: {
 					status: "terminal_ok",
 					receiptState: "present",
+					clientRef: runtime.opRef,
+					commandId: "original-command",
+					turnId: "original-turn",
 					outcome: { reason: "end_turn" },
 					terminalAt: Date.parse(LATER),
 				},
@@ -723,6 +815,8 @@ async function reviewFixture() {
 					attribution: "operation_ref",
 					fullness: "original",
 					clientRef: runtime.opRef,
+					commandId: "original-command",
+					turnId: "original-turn",
 					repo: runtime.cwd,
 					terminalAt: Date.parse(LATER),
 					contentVersion: 1,
@@ -776,7 +870,7 @@ async function reviewFixture() {
 		rationale: "The retained answer leaves an owner choice.",
 		question: "Choose red or blue?",
 	};
-	return { ...f, review };
+	return { ...f, review, git };
 }
 
 describe("dedicated review append boundary", () => {
@@ -1626,7 +1720,12 @@ describe("Firstmate durable task and control store", () => {
 	test("typed scope proof admits a deferred bound original and retains one immutable grant across retry", async () => {
 		const f = await fixture();
 		const task = f.bind(f.create().record);
-		const instruction = { ...controlRequest("mutation"), scope: "code_mutating" as const };
+		const original = controlRequest("mutation");
+		const instruction = {
+			...original,
+			scope: "code_mutating" as const,
+			evidence: { ...original.evidence, evidenceAt: START },
+		};
 		const proof: WorkControlScopeAdmission = {
 			taskId: TASK,
 			opRef: task.opRef,
@@ -1641,7 +1740,7 @@ describe("Firstmate durable task and control store", () => {
 				...source(proof.sourceId),
 				kind: "instruction",
 				body: instruction.body,
-				evidence: instruction.evidence,
+				evidence: { ...instruction.evidence, observedAt: START },
 			});
 			return f.database.workControlAdmitInTransaction(instruction, proof);
 		});
@@ -1655,6 +1754,7 @@ describe("Firstmate durable task and control store", () => {
 			controlId: admitted.record.controlId,
 		});
 		expect(JSON.parse(grant.body).scopeAdmission).toEqual(proof);
+		expect(f.database.workTaskCodingCompletion(TASK).state).toBe("pending");
 		expect(
 			f.database.withTransaction(() =>
 				f.database.workControlAdmitInTransaction(
@@ -2658,5 +2758,633 @@ describe("Firstmate durable task and control store", () => {
 		expect(upgraded.instanceId).toBe(instance);
 		expect(upgraded.workTaskCreate({ taskId: TASK, opRef: identity.opRef, request }).disposition).toBe("created");
 		expect(upgraded.workTaskSources(TASK)?.sources[0]?.body).toBe(request.text);
+	});
+});
+
+describe("native managed allocation identity", () => {
+	const codeRequest: WorkTaskRequest = { ...request, kind: "code_mutating" };
+	const executionCwd = "/exec/native";
+	const proofFor = (cwd: string) =>
+		JSON.stringify({
+			cwd,
+			requestedCwd: cwd,
+			requestedCoordinator: "/coordinator",
+			coordinator: "/coordinator",
+			primary: "/primary",
+			commonDir: "/primary/.git",
+			gitDir: `/primary/.git/worktrees/${cwd.split("/").pop()}`,
+		});
+	const gitProof = proofFor(executionCwd);
+	type AllocateInput = Parameters<GatewayDatabase["workTaskNativeAllocateInTransaction"]>[0];
+	function authorize(
+		database: GatewayDatabase,
+		taskId: string,
+		identityPatch: Readonly<Record<string, unknown>> = {},
+	): void {
+		const task = database.workTaskGet(taskId)!;
+		const requestKey = `native-test-${taskId}`;
+		database.withTransaction(() => {
+			database.workTaskSourceAppendInTransaction({
+				...source(`native-allocation-request-${taskId}`),
+				taskId,
+				evidence: task.request.evidence,
+				body: JSON.stringify({
+					requestKey,
+					epoch: 0,
+					target: { cwd: task.request.cwd, worktree: { enabled: true } },
+					source: {
+						root: task.request.cwd,
+						commonDir: "/primary/.git",
+						gitDir: `/primary/.git/worktrees/source-${taskId}`,
+						base: "a".repeat(40),
+						head: "a".repeat(40),
+						...identityPatch,
+					},
+				}),
+			});
+			database.workTaskSourceAppendInTransaction({
+				...source(`native-allocation-claimed-${taskId}`),
+				taskId,
+				body: JSON.stringify({ requestKey, opRef: task.opRef }),
+				evidence: {
+					...task.request.evidence,
+					principalId: "gateway",
+					origin: task.request.coordinator,
+					eventId: task.opRef,
+				},
+			});
+		});
+	}
+	function allocate(database: GatewayDatabase, input: AllocateInput): void {
+		database.withTransaction(() => database.workTaskNativeAllocateInTransaction(input));
+	}
+
+	for (const [label, patch] of [
+		["missing source root", { root: null }],
+		["source checkout reused as execution", { root: executionCwd }],
+		["source Git directory reused as execution", { gitDir: JSON.parse(gitProof).gitDir }],
+		["invalid retained base", { base: "not-a-commit" }],
+		["divergent retained source head", { head: "b".repeat(40) }],
+	] as const)
+		test(`native persistence rejects ${label}`, async () => {
+			const f = await fixture();
+			f.create(TASK, identity.opRef, codeRequest);
+			authorize(f.database, TASK, patch);
+			expect(() =>
+				allocate(f.database, {
+					taskId: TASK,
+					sessionId: SESSION,
+					epoch: 0,
+					executionCwd,
+					gitProof,
+					at: LATER,
+				}),
+			).toThrow("work task: identity");
+			expect(f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)).toBeUndefined();
+		});
+
+	for (const [label, patch] of [
+		["non-linked checkout", { gitDir: "/primary/.git" }],
+		["foreign repository", { commonDir: "/foreign/.git" }],
+		["wrong Git administrative directory", { gitDir: "/primary/.git/not-worktrees/native" }],
+		["mismatched returned checkout", { requestedCwd: "/another/checkout" }],
+	] as const)
+		test(`native persistence rejects ${label} proof`, async () => {
+			const f = await fixture();
+			f.create(TASK, identity.opRef, codeRequest);
+			authorize(f.database, TASK);
+			expect(() =>
+				allocate(f.database, {
+					taskId: TASK,
+					sessionId: SESSION,
+					epoch: 0,
+					executionCwd,
+					gitProof: JSON.stringify({ ...JSON.parse(gitProof), ...patch }),
+					at: LATER,
+				}),
+			).toThrow("work task: identity");
+			expect(f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)).toBeUndefined();
+		});
+
+	test("native allocation persists once with exclusive checkout ownership and an immutable identity", async () => {
+		const f = await fixture();
+		f.create(TASK, "gw-firstmate-original", codeRequest);
+		const base: AllocateInput = { taskId: TASK, sessionId: SESSION, epoch: 0, executionCwd, gitProof, at: LATER };
+		// A result without the retained authorization and claim was never a managed allocation.
+		expect(() => allocate(f.database, base)).toThrow("work task: identity");
+		expect(f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)).toBeUndefined();
+		authorize(f.database, TASK);
+		// Another task's retained native allocation and dedicated admission own their checkouts exclusively.
+		f.create(OTHER, "gw-other", { ...request, cwd: "/elsewhere" });
+		f.database.withTransaction(() =>
+			f.database.workTaskSourceAppendInTransaction({
+				...source(`native-allocation-result-${OTHER}`),
+				taskId: OTHER,
+				body: JSON.stringify({
+					sessionId: "other-native-session",
+					epoch: 0,
+					executionCwd: "/exec/claimed-by-other",
+					gitProof: proofFor("/exec/claimed-by-other"),
+				}),
+			}),
+		);
+		f.database.withTransaction(() =>
+			f.database.workTaskSourceAppendInTransaction({
+				...source(`worktree-admission-${OTHER}`),
+				taskId: OTHER,
+				body: JSON.stringify({ ...JSON.parse(proofFor("/exec/admitted-by-other")), requestedCwd: "/alias-of-other" }),
+			}),
+		);
+		expect(() =>
+			allocate(f.database, {
+				...base,
+				executionCwd: "/exec/claimed-by-other",
+				gitProof: proofFor("/exec/claimed-by-other"),
+			}),
+		).toThrow("work task: conflict");
+		expect(() =>
+			allocate(f.database, {
+				...base,
+				executionCwd: "/exec/admitted-by-other",
+				gitProof: proofFor("/exec/admitted-by-other"),
+			}),
+		).toThrow("work task: conflict");
+		expect(() =>
+			allocate(f.database, {
+				...base,
+				gitProof: JSON.stringify({
+					...JSON.parse(gitProof),
+					gitDir: JSON.parse(proofFor("/exec/claimed-by-other")).gitDir,
+				}),
+			}),
+		).toThrow("work task: conflict");
+		expect(f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)).toBeUndefined();
+		// The original allocation persists once with its endpoint identity.
+		const original: AllocateInput = {
+			...base,
+			endpointGeneration: 2,
+			endpointIncarnation: "ab".repeat(32),
+		};
+		allocate(f.database, original);
+		const stored = f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)!;
+		expect(stored).toMatchObject({ taskId: TASK, kind: "decision", completeness: "complete" });
+		expect(stored.evidence.principalId).toBe("gateway");
+		expect(JSON.parse(stored.body)).toEqual({
+			sessionId: SESSION,
+			epoch: 0,
+			executionCwd,
+			endpointGeneration: 2,
+			endpointIncarnation: "ab".repeat(32),
+			gitProof,
+		});
+		// Crash-recovery repeats byte-for-byte; a replacement identity is a conflict.
+		allocate(f.database, original);
+		expect(f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)).toEqual(stored);
+		expect(() => allocate(f.database, { ...original, sessionId: "replacement-session" })).toThrow(
+			"work task: conflict",
+		);
+		expect(f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)).toEqual(stored);
+	});
+
+	test("an open attempt runtime owns its cwd against any other task's native allocation", async () => {
+		const f = await fixture();
+		const task = f.create(TASK, "gw-firstmate-original").record;
+		const bound = f.bind(task);
+		const { runtime, record } = f.prepare(bound);
+		f.database.workAttemptPrepare(runtime, record);
+		expect(runtime.cwd).toBe(request.cwd);
+		const other = f.create(OTHER, "gw-other", { ...codeRequest, cwd: "/elsewhere" }).record;
+		expect(other.request.cwd).toBe("/elsewhere");
+		authorize(f.database, OTHER);
+		expect(() =>
+			allocate(f.database, {
+				taskId: OTHER,
+				sessionId: "other-native-runtime",
+				epoch: 0,
+				executionCwd: request.cwd,
+				gitProof: proofFor(request.cwd),
+				at: LATER,
+			}),
+		).toThrow("work task: conflict");
+		expect(() =>
+			allocate(f.database, {
+				taskId: OTHER,
+				sessionId: SESSION,
+				epoch: 0,
+				executionCwd,
+				gitProof: proofFor(executionCwd),
+				at: LATER,
+			}),
+		).toThrow("work task: conflict");
+		expect(f.database.workTaskSourceGet(`native-allocation-result-${OTHER}`)).toBeUndefined();
+	});
+
+	test("a task without a native result and a read-only task never fall back to the assignment cwd", async () => {
+		const f = await fixture();
+		const code = f.create(TASK, "gw-firstmate-original", codeRequest).record;
+		const readOnly = f.create(OTHER, "gw-other").record;
+		expect(() => f.database.workTaskExecutionCwd(code)).toThrow("work task: unavailable");
+		expect(f.database.workTaskExecutionCwd(readOnly)).toBe(request.cwd);
+		authorize(f.database, TASK);
+		expect(() =>
+			allocate(f.database, { taskId: OTHER, sessionId: SESSION, epoch: 0, executionCwd, gitProof, at: LATER }),
+		).toThrow("work task: identity");
+		expect(f.database.workTaskSourceGet(`native-allocation-result-${TASK}`)).toBeUndefined();
+		expect(f.database.workTaskExecutionCwd(readOnly)).toBe(request.cwd);
+	});
+
+	const malformedResults = [
+		{ label: "unparseable body", input: (id: string): WorkTaskSourceInput => ({ ...source(id), body: "not json" }) },
+		{
+			label: "non-string execution cwd",
+			input: (id: string): WorkTaskSourceInput => ({ ...source(id), body: JSON.stringify({ executionCwd: 42 }) }),
+		},
+		{
+			label: "empty execution cwd",
+			input: (id: string): WorkTaskSourceInput => ({ ...source(id), body: JSON.stringify({ executionCwd: "" }) }),
+		},
+		{
+			label: "incomplete record",
+			input: (id: string): WorkTaskSourceInput => ({
+				...source(id),
+				completeness: "incomplete",
+				body: JSON.stringify({ executionCwd: "/exec/native" }),
+			}),
+		},
+		{
+			label: "non-decision record",
+			input: (id: string): WorkTaskSourceInput => ({
+				...source(id),
+				kind: "observation",
+				body: JSON.stringify({ executionCwd: "/exec/native" }),
+			}),
+		},
+		{ label: "foreign task record", input: (id: string): WorkTaskSourceInput => ({ ...source(id), taskId: OTHER }) },
+	];
+	for (const malformed of malformedResults)
+		test(`a malformed native result fails closed without falling back to the source cwd (${malformed.label})`, async () => {
+			const f = await fixture();
+			const code = f.create(TASK, "gw-firstmate-original", codeRequest).record;
+			const readOnly = f.create(OTHER, "gw-other").record;
+			f.database.withTransaction(() =>
+				f.database.workTaskSourceAppendInTransaction(malformed.input(`native-allocation-result-${TASK}`)),
+			);
+			expect(() => f.database.workTaskExecutionCwd(code)).toThrow("work task: unavailable");
+			expect(f.database.workTaskExecutionCwd(readOnly)).toBe(request.cwd);
+		});
+});
+
+describe("durable coding closeout evidence", () => {
+	const owner = "123456789012345678";
+	let eventSequence = 0;
+	type ReviewFixture = Awaited<ReturnType<typeof reviewFixture>>;
+	function registerReviewer(f: ReviewFixture): void {
+		f.database.recordOwnedBinding({
+			authority: f.authority,
+			sessionId: f.review.callerSessionId,
+			originKey: originKey(LOOPBACK_ORIGIN),
+			epoch: 0,
+			repo: f.database.workTaskGet(TASK)!.request.cwd,
+		});
+		f.database.updateActivity(originKey(LOOPBACK_ORIGIN), JSON.stringify(LOOPBACK_ORIGIN));
+	}
+	function instruction(f: ReviewFixture, body: string, principalId = owner) {
+		const eventId = (((BigInt(Date.parse(LATER)) - 1420070400000n) << 22n) + BigInt(++eventSequence)).toString();
+		const input: WorkControlRequest = {
+			taskId: TASK,
+			expectedOpRef: f.review.expectedOpRef,
+			kind: "steer",
+			scope: "code_mutating",
+			body,
+			evidence: { ...evidence, principalId, origin: THREAD, eventId, evidenceAt: LATER, observedAt: LATER },
+		};
+		return f.database.withTransaction(() => {
+			const control = f.database.workControlAdmitInTransaction(input).record;
+			const retained = f.database.workTaskSourceAppendInTransaction({
+				...source(`instruction-${control.controlId}`),
+				kind: "instruction",
+				body,
+				evidence: input.evidence,
+				controlId: control.controlId,
+			});
+			return { control, source: retained };
+		});
+	}
+	function closeout(
+		f: ReviewFixture,
+		options: {
+			principal?: string;
+			verificationBody?: string;
+			reviewId?: string;
+			expectedReviewId?: string | null;
+			answers?: WorkTaskOwnerApproval["answers"];
+		} = {},
+	): WorkTaskReviewParams {
+		const git = f.git!;
+		const repository = { commonDir: git.commonDir };
+		const result = { baseCommit: git.base, commit: git.commit, diffHash: git.diffHash };
+		const target = { ref: "refs/heads/main", baseCommit: git.base, resultCommit: git.integrated };
+		const checks: WorkTaskCloseoutEvidence["verification"]["checks"] = [
+			{ name: `git diff --exit-code ${git.commit} ${git.integrated}`, outcome: "pass" },
+		];
+		const serial = instruction(
+			f,
+			JSON.stringify({
+				kind: "work_task_closeout_serialization",
+				taskId: TASK,
+				opRef: f.review.expectedOpRef,
+				repository,
+				target,
+				integrationOwner: owner,
+				order: { baseCommit: git.base, resultCommit: git.integrated },
+			}),
+		);
+		const verified = instruction(
+			f,
+			options.verificationBody ??
+				JSON.stringify({
+					kind: "work_task_closeout_verification",
+					taskId: TASK,
+					opRef: f.review.expectedOpRef,
+					repository,
+					target,
+					result,
+					resultingCommit: git.integrated,
+					checks,
+					conflicts: "none",
+				}),
+		);
+		const approval = instruction(
+			f,
+			JSON.stringify({
+				kind: "work_task_closeout_approval",
+				taskId: TASK,
+				opRef: f.review.expectedOpRef,
+				action: "integrate",
+				repository,
+				target,
+				result,
+				reviewed: { sourceId: f.review.sourceId, contentHash: f.review.contentHash, reportId: f.review.reportId },
+				verification: { sourceId: verified.source.sourceId, contentHash: verified.source.contentHash },
+				serialization: { sourceId: serial.source.sourceId, contentHash: serial.source.contentHash },
+				answers: options.answers ?? [],
+			}),
+			options.principal,
+		);
+		const { question: _question, ...review } = f.review;
+		return {
+			...review,
+			disposition: "no_exception",
+			rationale: "Read exact original and owner-attested reconciliation records.",
+			reviewId: options.reviewId ?? review.reviewId,
+			expectedReviewId: options.expectedReviewId ?? null,
+			closeout: {
+				repository,
+				result,
+				target,
+				action: "integrate",
+				serialization: {
+					sourceId: serial.source.sourceId,
+					contentHash: serial.source.contentHash,
+					controlId: serial.control.controlId,
+					sequence: serial.control.sequence,
+				},
+				verification: {
+					sourceId: verified.source.sourceId,
+					contentHash: verified.source.contentHash,
+					resultingCommit: git.integrated,
+					checks,
+					conflicts: "none",
+				},
+				ownerApproval: { sourceId: approval.source.sourceId, contentHash: approval.source.contentHash },
+			},
+		};
+	}
+
+	test("real retained hashes and owner controls admit evidence across restart without changing execution or Git", async () => {
+		const f = await reviewFixture(true);
+		registerReviewer(f);
+		const review = closeout(f);
+		expect(f.git!.commit).not.toBe(f.git!.integrated);
+		expect(f.database.workTaskCodingCompletion(TASK).state).toBe("pending");
+		const admitted = f.database.workTaskReview(review, LATER);
+		expect(admitted.disposition).toBe("recorded");
+		const ownerStatement = f.database.workTaskSourceGet(review.closeout!.ownerApproval.sourceId)!;
+		instruction(f, ownerStatement.body, "local-ipc:persona:forged-owner");
+		expect(f.database.workTaskCodingCompletion(TASK).state).toBe("evidence_admitted");
+		const snapshot = () =>
+			JSON.stringify({
+				task: f.database.workTaskGet(TASK),
+				runtime: f.database.workAttemptGet(review.expectedOpRef),
+				sources: f.raw.query("SELECT * FROM work_task_sources ORDER BY source_id").all(),
+				controls: f.raw.query("SELECT * FROM work_controls ORDER BY control_id").all(),
+				deliveries: f.database.deliveryRows(),
+			});
+		const before = snapshot();
+		const head = reviewGit(f.git!.primary, "rev-parse", "HEAD");
+		expect(f.database.workTaskCodingCompletion(TASK)).toEqual({ state: "evidence_admitted", pendingReasons: [] });
+		expect(f.database.workTaskReview(review, LATER)).toEqual({ ...admitted, disposition: "duplicate" });
+		expect(snapshot()).toBe(before);
+		expect(reviewGit(f.git!.primary, "rev-parse", "HEAD")).toBe(head);
+		expect(reviewGit(f.git!.worker, "rev-parse", "HEAD").trim()).toBe(f.git!.commit);
+		f.database.close();
+		handles.splice(handles.indexOf(f.database), 1);
+		const reopened = await GatewayDatabase.open(f.path);
+		handles.push(reopened);
+		expect(reopened.workTaskCodingCompletion(TASK)).toEqual({ state: "evidence_admitted", pendingReasons: [] });
+		expect(reopened.workTaskGet(TASK)).toMatchObject({
+			opRef: review.expectedOpRef,
+			sessionId: SESSION,
+			epoch: 0,
+			obligationState: "final_admitted",
+			terminalReportId: review.reportId,
+		});
+	});
+
+	for (const scenario of ["persona", "prose_verification", "wrong_hash"] as const)
+		test(`durable closeout stays pending for ${scenario}`, async () => {
+			const f = await reviewFixture(true);
+			registerReviewer(f);
+			const review = closeout(
+				f,
+				scenario === "persona"
+					? { principal: "local-ipc:persona:reviewer" }
+					: scenario === "prose_verification"
+						? { verificationBody: "All checks passed, trust me." }
+						: {},
+			);
+			const input =
+				scenario === "wrong_hash"
+					? {
+							...review,
+							closeout: {
+								...review.closeout!,
+								verification: { ...review.closeout!.verification, contentHash: "0".repeat(64) },
+							},
+						}
+					: review;
+			f.database.workTaskReview(input, LATER);
+			expect(f.database.workTaskCodingCompletion(TASK)).toMatchObject({
+				state: "pending",
+				pendingReasons: expect.arrayContaining([
+					scenario === "persona"
+						? "approval_provenance"
+						: scenario === "prose_verification"
+							? "verification_unstructured"
+							: "mismatch",
+				]),
+			});
+			expect(f.database.workTaskGet(TASK)?.obligationState).toBe("final_admitted");
+		});
+
+	for (const missing of [false, true])
+		test(`target authority cannot come from ${missing ? "a verification statement" : "an unapproved reviewer target"}`, async () => {
+			const f = await reviewFixture(true);
+			registerReviewer(f);
+			const review = closeout(f);
+			f.database.workTaskReview(
+				{
+					...review,
+					closeout: {
+						...review.closeout!,
+						...(missing
+							? {
+									ownerApproval: {
+										sourceId: review.closeout!.verification.sourceId,
+										contentHash: review.closeout!.verification.contentHash,
+									},
+								}
+							: { target: { ...review.closeout!.target, ref: "refs/heads/unapproved" } }),
+					},
+				},
+				LATER,
+			);
+			expect(f.database.workTaskCodingCompletion(TASK)).toMatchObject({
+				state: "pending",
+				pendingReasons: expect.arrayContaining([missing ? "approval_unstructured" : "approval_mismatch"]),
+			});
+		});
+
+	test("changing retained verification bytes without its durable hash cannot admit completion", async () => {
+		const f = await reviewFixture(true);
+		registerReviewer(f);
+		const review = closeout(f);
+		f.database.workTaskReview(review, LATER);
+		const retained = f.database.workTaskSourceGet(review.closeout!.verification.sourceId)!;
+		f.raw
+			.query("UPDATE work_task_sources SET record_json = ? WHERE source_id = ?")
+			.run(JSON.stringify({ ...retained, body: "tampered" }), retained.sourceId);
+		expect(() => f.database.workTaskSourceGet(retained.sourceId)).toThrow(WorkTaskStateError);
+		expect(() => f.database.workTaskCodingCompletion(TASK)).toThrow(WorkTaskStateError);
+	});
+
+	test("explicit pinned owner answers resolve coding questions while historical reviews remain intact", async () => {
+		const f = await reviewFixture(true);
+		registerReviewer(f);
+		const question = f.database.workTaskReview(f.review, LATER);
+		const retained = f.database.workTaskSourceGet(question.sourceId)!;
+		f.database.workTaskReview(closeout(f, { reviewId: OTHER, expectedReviewId: f.review.reviewId }), LATER);
+		expect(f.database.workTaskCodingCompletion(TASK).pendingReasons).toContain("owner_question");
+		const unresolvedId = crypto.randomUUID();
+		f.database.workTaskReview(
+			closeout(f, {
+				reviewId: unresolvedId,
+				expectedReviewId: OTHER,
+				answers: [
+					{
+						reviewId: f.review.reviewId,
+						sourceId: retained.sourceId,
+						contentHash: retained.contentHash,
+						answer: "I haven't decided.",
+						resolution: "unresolved",
+					},
+				],
+			}),
+			LATER,
+		);
+		expect(f.database.workTaskCodingCompletion(TASK).pendingReasons).toContain("owner_question");
+		const resolvedId = crypto.randomUUID();
+		const approved = f.database.workTaskReview(
+			closeout(f, {
+				reviewId: resolvedId,
+				expectedReviewId: unresolvedId,
+				answers: [
+					{
+						reviewId: f.review.reviewId,
+						sourceId: retained.sourceId,
+						contentHash: retained.contentHash,
+						answer: "Use the reviewed main target and the matching-tree check.",
+						resolution: "resolved",
+					},
+				],
+			}),
+			LATER,
+		);
+		expect(f.database.workTaskCodingCompletion(TASK).state).toBe("evidence_admitted");
+		const resolvedSource = f.database.workTaskSourceGet(approved.sourceId);
+		const withdrawal = closeout(f, {
+			reviewId: crypto.randomUUID(),
+			expectedReviewId: resolvedId,
+			answers: [
+				{
+					reviewId: f.review.reviewId,
+					sourceId: retained.sourceId,
+					contentHash: retained.contentHash,
+					answer: "I withdraw that decision; leave this unresolved.",
+					resolution: "unresolved",
+				},
+			],
+		});
+		// The owner's newer instruction invalidates the stale approval even
+		// before a coordinator records its updated review.
+		expect(f.database.workTaskCodingCompletion(TASK).pendingReasons).toContain("approval_mismatch");
+		f.database.workTaskReview(withdrawal, LATER);
+		expect(f.database.workTaskCodingCompletion(TASK)).toMatchObject({
+			state: "pending",
+			pendingReasons: expect.arrayContaining(["owner_question"]),
+		});
+		f.database.workTaskReview(
+			{
+				...resolvedSource!.review!,
+				reviewId: crypto.randomUUID(),
+				expectedReviewId: withdrawal.reviewId,
+			},
+			LATER,
+		);
+		expect(f.database.workTaskCodingCompletion(TASK)).toMatchObject({
+			state: "pending",
+			pendingReasons: expect.arrayContaining(["approval_mismatch", "owner_question"]),
+		});
+		expect(f.database.workTaskSourceGet(approved.sourceId)).toEqual(resolvedSource);
+		expect(f.database.workTaskSourceGet(retained.sourceId)).toEqual(retained);
+		expect(f.database.workTaskReviewLocator(TASK)?.ownerQuestions).toHaveLength(1);
+	});
+
+	test("final report admission cannot override an uncertain original terminal receipt", async () => {
+		const f = await reviewFixture(true);
+		registerReviewer(f);
+		f.database.workTaskReview(closeout(f), LATER);
+		const runtime = f.database.workAttemptGet(f.review.expectedOpRef)!;
+		f.raw.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?").run(
+			JSON.stringify({
+				...runtime,
+				terminal: { ...runtime.terminal!, status: { ...runtime.terminal!.status!, receiptState: "absent" } },
+			}),
+			runtime.opRef,
+		);
+		expect(f.database.workTaskCodingCompletion(TASK).pendingReasons).toContain("terminal_uncertain");
+		expect(f.database.workTaskGet(TASK)?.obligationState).toBe("final_admitted");
+	});
+
+	test("read-only completion ignores an unrelated scope-prefix source and never needs Git", async () => {
+		const f = await reviewFixture();
+		f.database.withTransaction(() =>
+			f.database.workTaskSourceAppendInTransaction({
+				...source("scope-control-unrelated"),
+				body: "{}",
+			}),
+		);
+		expect(f.database.workTaskCodingCompletion(TASK)).toEqual({ state: "not_applicable", pendingReasons: [] });
+		expect(f.database.workTaskGet(TASK)?.request.cwd).toBe("/work");
 	});
 });

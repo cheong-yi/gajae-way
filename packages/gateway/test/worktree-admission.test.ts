@@ -2,7 +2,11 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { admitDedicatedWorktree, revalidateDedicatedWorktree } from "../src/orchestrator/worktree-admission";
+import {
+	admitDedicatedWorktree,
+	assertManagedWorktreeIgnored,
+	revalidateDedicatedWorktree,
+} from "../src/orchestrator/worktree-admission";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -109,4 +113,65 @@ test("two registrations naming the selected root fail admission", async () => {
 	git(f.primary, "worktree", "add", "-b", "other", other);
 	await writeFile(join(f.primary, ".git", "worktrees", "other", "gitdir"), join(f.worker, ".git"));
 	expect(() => admitDedicatedWorktree(f.worker, f.primary)).toThrow();
+});
+
+test("native nested default placement admits a distinct registered linked checkout", async () => {
+	const f = await fixture();
+	const nested = join(f.primary, ".worktrees", "native");
+	git(f.primary, "worktree", "add", "-b", "native", nested);
+	const proof = admitDedicatedWorktree(nested, f.primary);
+	expect(proof.cwd).toBe(nested);
+	expect(proof.primary).toBe(f.primary);
+	expect(proof.commonDir).toBe(join(f.primary, ".git"));
+	expect(() => revalidateDedicatedWorktree(proof)).not.toThrow();
+	// A plain enclosing coordinator directory is accepted placement as well.
+	expect(admitDedicatedWorktree(nested, f.root).cwd).toBe(nested);
+});
+
+test("coordinator symlink alias and primary subdirectory cannot be admitted as worker", async () => {
+	const f = await fixture();
+	const alias = join(f.root, "coordinator-alias");
+	await symlink(f.worker, alias);
+	expect(() => admitDedicatedWorktree(f.worker, alias)).toThrow();
+	await mkdir(join(f.primary, "coordinator"));
+	expect(() => admitDedicatedWorktree(f.primary, join(f.primary, "coordinator"))).toThrow();
+});
+
+test("ordinary nested folder inside the source checkout fails admission", async () => {
+	const f = await fixture();
+	const plain = join(f.primary, ".worktrees", "plain");
+	await mkdir(plain, { recursive: true });
+	expect(() => admitDedicatedWorktree(plain, f.primary)).toThrow();
+	expect(() => admitDedicatedWorktree(plain, f.root)).toThrow();
+});
+
+test("nested distinct linked coordinator checkout admits its containing worker", async () => {
+	const f = await fixture();
+	const nestedCoordinator = join(f.worker, "coordinator-checkout");
+	git(f.primary, "worktree", "add", "-b", "coordinator", nestedCoordinator);
+	const proof = admitDedicatedWorktree(f.worker, nestedCoordinator);
+	expect(proof.cwd).toBe(f.worker);
+	expect(() => revalidateDedicatedWorktree(proof)).not.toThrow();
+});
+
+test("coordinator subdirectory of the same checkout fails admission", async () => {
+	const f = await fixture();
+	const subdirectory = join(f.worker, "coordinator", "runner");
+	await mkdir(subdirectory, { recursive: true });
+	expect(() => admitDedicatedWorktree(f.worker, subdirectory)).toThrow();
+});
+
+test("native nested ignore invariant detects drift without requiring a sibling placement policy", async () => {
+	const f = await fixture();
+	const nested = join(f.primary, ".worktrees", "native");
+	git(f.primary, "worktree", "add", "-b", "native", nested);
+	const proof = admitDedicatedWorktree(nested, f.primary);
+	expect(() => assertManagedWorktreeIgnored(proof)).toThrow("managed_worktree_bucket_not_ignored");
+	await writeFile(join(f.primary, ".gitignore"), "/.worktrees/native/\n");
+	expect(() => assertManagedWorktreeIgnored(proof)).toThrow("managed_worktree_bucket_not_ignored");
+	await writeFile(join(f.primary, ".gitignore"), "/.worktrees\n");
+	expect(() => assertManagedWorktreeIgnored(proof)).not.toThrow();
+	await writeFile(join(f.primary, ".gitignore"), "");
+	expect(() => assertManagedWorktreeIgnored(proof)).toThrow("managed_worktree_bucket_not_ignored");
+	expect(() => assertManagedWorktreeIgnored(admitDedicatedWorktree(f.worker, f.primary))).not.toThrow();
 });

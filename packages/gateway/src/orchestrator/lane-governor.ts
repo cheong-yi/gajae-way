@@ -516,7 +516,7 @@ export class LaneGovernor {
 					assessment.opRef !== task.opRef ||
 					assessment.sessionId !== task.sessionId ||
 					assessment.epoch !== task.epoch ||
-					assessment.cwd !== task.request.cwd)
+					assessment.cwd !== this.#database.workTaskExecutionCwd(task))
 			)
 				return { kind: "hold", reason: "task_release_identity_changed" };
 			return assessment;

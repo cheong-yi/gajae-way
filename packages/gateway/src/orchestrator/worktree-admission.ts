@@ -11,14 +11,18 @@ export interface DedicatedWorktreeProof {
 	readonly gitDir: string;
 }
 
-/** Git admission only: no provisioning, ownership transfer or filesystem sandbox. */
+/**
+ * Git admission only: no provisioning, ownership transfer or filesystem sandbox.
+ * Placement is not a fence: a distinct registered linked checkout may nest under
+ * the primary or the coordinator area (GJC default `<source>/.worktrees/<name>`).
+ */
 export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): DedicatedWorktreeProof {
 	try {
 		if (!isAbsolute(cwd) || !isAbsolute(coordinatorCwd)) throw new Error();
 		const target = realpathSync(cwd);
 		const coordinator = realpathSync(coordinatorCwd);
-		const git = (...args: string[]): string => {
-			const result = Bun.spawnSync(["git", "-C", target, ...args], {
+		const git = (dir: string, ...args: string[]): string => {
+			const result = Bun.spawnSync(["git", "-C", dir, ...args], {
 				stdout: "pipe",
 				stderr: "pipe",
 				// Repository-selection environment cannot override the inspected directory.
@@ -27,16 +31,16 @@ export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): Ded
 			if (result.exitCode !== 0) throw new Error();
 			return result.stdout.toString().trim();
 		};
-		if (realpathSync(git("rev-parse", "--show-toplevel")) !== target) throw new Error();
-		const commonDir = realpathSync(resolve(target, git("rev-parse", "--git-common-dir")));
-		const gitDir = realpathSync(resolve(target, git("rev-parse", "--git-dir")));
+		if (realpathSync(git(target, "rev-parse", "--show-toplevel")) !== target) throw new Error();
+		const commonDir = realpathSync(resolve(target, git(target, "rev-parse", "--git-common-dir")));
+		const gitDir = realpathSync(resolve(target, git(target, "rev-parse", "--git-dir")));
 		if (
 			commonDir === gitDir ||
 			dirname(dirname(gitDir)) !== commonDir ||
 			dirname(gitDir) !== resolve(commonDir, "worktrees")
 		)
 			throw new Error();
-		const records = git("worktree", "list", "--porcelain", "-z").split("\0\0").filter(Boolean);
+		const records = git(target, "worktree", "list", "--porcelain", "-z").split("\0\0").filter(Boolean);
 		// Unrelated registrations may be missing or prunable; only the selected record's integrity gates this target.
 		const registrations = records.map((record) => {
 			const fields = record.split("\0");
@@ -51,7 +55,19 @@ export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): Ded
 		const selected = registrations.filter((registration) => registration.root === target);
 		if (selected.length !== 1 || selected[0].prunable) throw new Error();
 		const primary = registrations[0]?.root;
-		if (!primary || target === primary || overlaps(target, coordinator) || overlaps(target, primary)) throw new Error();
+		// The primary checkout itself never admits as worker.
+		if (!primary || target === primary) throw new Error();
+		// Coordinator checkout identity: a Git coordinator is refused only when its
+		// canonical root IS this worker — root, subdirectory and symlink forms all
+		// resolve there — while a distinct nested checkout keeps its own identity.
+		// A coordinator outside every work tree falls back to realpath containment.
+		let coordinatorRoot: string | undefined;
+		try {
+			coordinatorRoot = realpathSync(git(coordinator, "rev-parse", "--show-toplevel"));
+		} catch {
+			coordinatorRoot = undefined;
+		}
+		if (coordinatorRoot === undefined ? contains(target, coordinator) : coordinatorRoot === target) throw new Error();
 		// The linked administrative directory must point back to this exact worktree.
 		if (realpathSync(readFileSync(resolve(gitDir, "gitdir"), "utf8").trim()) !== realpathSync(resolve(target, ".git")))
 			throw new Error();
@@ -69,12 +85,10 @@ export function admitDedicatedWorktree(cwd: string, coordinatorCwd: string): Ded
 	}
 }
 
-function overlaps(a: string, b: string): boolean {
-	const inside = (parent: string, child: string) => {
-		const path = relative(parent, child);
-		return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
-	};
-	return inside(a, b) || inside(b, a);
+/** True when child resolves to parent or sits beneath it. */
+function contains(parent: string, child: string): boolean {
+	const path = relative(parent, child);
+	return path === "" || (!path.startsWith(`..${sep}`) && path !== ".." && !isAbsolute(path));
 }
 
 /** Unresolvable registration paths (vanished directories) cannot name the selected root. */
@@ -90,4 +104,27 @@ function registeredRoot(registered: string): string | undefined {
 export function revalidateDedicatedWorktree(proof: DedicatedWorktreeProof): void {
 	const current = admitDedicatedWorktree(proof.requestedCwd, proof.requestedCoordinator);
 	if (JSON.stringify(current) !== JSON.stringify(proof)) throw new Error("dedicated_worktree_changed");
+}
+
+/** Revalidate the native nested-bucket ignore invariant without prescribing its placement. */
+export function assertManagedWorktreeIgnored(proof: DedicatedWorktreeProof): void {
+	if (!contains(proof.primary, proof.cwd)) return;
+	const result = Bun.spawnSync(
+		[
+			"git",
+			"-C",
+			proof.primary,
+			"check-ignore",
+			"--quiet",
+			"--no-index",
+			"--",
+			relative(proof.primary, dirname(proof.cwd)),
+		],
+		{
+			stdout: "pipe",
+			stderr: "pipe",
+			env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+		},
+	);
+	if (result.exitCode !== 0) throw new Error("managed_worktree_bucket_not_ignored");
 }

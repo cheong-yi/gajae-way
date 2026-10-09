@@ -2,7 +2,8 @@ import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
-import { dirname, isAbsolute, normalize } from "node:path";
+import { basename, dirname, isAbsolute, normalize } from "node:path";
+import { deriveWorkTaskCodingCompletion } from "../orchestrator/work-task-closeout";
 import {
 	type ChatMessagePayload,
 	isSilentOutput,
@@ -2321,6 +2322,283 @@ export class GatewayDatabase {
 			version: task.version + 1,
 		});
 	}
+	/**
+	 * Read-only tasks keep the immutable assignment cwd. A managed code task's
+	 * execution cwd exists only as a well-formed persisted native allocation
+	 * result: a native request without one is held, never the source cwd.
+	 */
+	workTaskExecutionCwd(task: {
+		readonly taskId: string;
+		readonly request: { readonly kind: WorkTaskKind; readonly cwd: string };
+	}): string {
+		if (task.request.kind !== "code_mutating") return task.request.cwd;
+		return this.#workTaskNativeResult(task.taskId).executionCwd;
+	}
+	#workTaskNativeResult(taskId: string): { executionCwd: string } {
+		const source = this.workTaskSourceGet(`native-allocation-result-${taskId}`);
+		if (!source || source.taskId !== taskId || source.kind !== "decision" || source.completeness !== "complete")
+			throw new WorkTaskStateError("unavailable");
+		let record: { executionCwd?: unknown; sessionId?: unknown; epoch?: unknown; gitProof?: unknown };
+		try {
+			record = JSON.parse(source.body);
+		} catch {
+			throw new WorkTaskStateError("unavailable");
+		}
+		if (
+			!record ||
+			typeof record !== "object" ||
+			Array.isArray(record) ||
+			typeof record.executionCwd !== "string" ||
+			!isAbsolute(record.executionCwd) ||
+			normalize(record.executionCwd) !== record.executionCwd ||
+			!workString(record.sessionId) ||
+			!Number.isSafeInteger(record.epoch) ||
+			(record.epoch as number) < 0 ||
+			typeof record.gitProof !== "string"
+		)
+			throw new WorkTaskStateError("unavailable");
+		return { executionCwd: record.executionCwd };
+	}
+
+	/**
+	 * Persists the SDK-returned managed allocation identity exactly once, after the
+	 * original authorization and its durable claim, and before any attempt runtime.
+	 * The result is immutable: a crash-recovery repeat must match it byte-for-byte.
+	 */
+	workTaskNativeAllocateInTransaction(input: {
+		readonly taskId: string;
+		readonly sessionId: string;
+		readonly epoch: number;
+		readonly executionCwd: string;
+		readonly endpointGeneration?: number;
+		readonly endpointIncarnation?: string;
+		readonly gitProof: string;
+		readonly at: string;
+	}): void {
+		this.requireTransaction();
+		const task = this.workTaskGet(input.taskId);
+		taskAssert(task, "unavailable");
+		this.#assertNotQuarantined("work", task.jobId);
+		taskAssert(
+			task.request.kind === "code_mutating" &&
+				task.dispatchPhase === "pending" &&
+				task.sessionId === null &&
+				task.epoch === null &&
+				workString(input.sessionId) &&
+				Number.isSafeInteger(input.epoch) &&
+				input.epoch >= 0 &&
+				workString(input.executionCwd, 4096) &&
+				isAbsolute(input.executionCwd) &&
+				normalize(input.executionCwd) === input.executionCwd &&
+				input.executionCwd !== task.request.cwd &&
+				taskText(input.gitProof, 64 * 1024) &&
+				workTime(input.at),
+			"identity",
+		);
+		taskAssert(
+			input.endpointGeneration === undefined ||
+				(Number.isSafeInteger(input.endpointGeneration) && input.endpointGeneration > 0),
+			"identity",
+		);
+		taskAssert(
+			input.endpointIncarnation === undefined ||
+				(typeof input.endpointIncarnation === "string" && /^[a-f0-9]{64}$/.test(input.endpointIncarnation)),
+			"identity",
+		);
+		// The original create authorization and its durable claim must already be
+		// retained; a result without them was never a managed allocation.
+		const authorization = this.workTaskSourceGet(`native-allocation-request-${task.taskId}`);
+		const claimed = this.workTaskSourceGet(`native-allocation-claimed-${task.taskId}`);
+		taskAssert(
+			authorization?.taskId === task.taskId &&
+				authorization.kind === "decision" &&
+				authorization.completeness === "complete" &&
+				claimed?.taskId === task.taskId &&
+				claimed.kind === "decision" &&
+				claimed.completeness === "complete",
+			"identity",
+		);
+		let request: {
+			requestKey?: unknown;
+			epoch?: unknown;
+			target?: { cwd?: unknown; worktree?: { enabled?: unknown } };
+			source?: { root?: unknown; commonDir?: unknown; gitDir?: unknown; base?: unknown; head?: unknown };
+		};
+		let proof: {
+			requestedCwd?: unknown;
+			requestedCoordinator?: unknown;
+			cwd?: unknown;
+			coordinator?: unknown;
+			primary?: unknown;
+			commonDir?: unknown;
+			gitDir?: unknown;
+		};
+		try {
+			request = JSON.parse(authorization.body);
+			proof = JSON.parse(input.gitProof);
+		} catch {
+			throw new WorkTaskStateError("identity");
+		}
+		taskAssert(
+			request !== null &&
+				typeof request === "object" &&
+				!Array.isArray(request) &&
+				proof !== null &&
+				typeof proof === "object" &&
+				!Array.isArray(proof),
+			"identity",
+		);
+		// Git/OS registration is checked by the manager's synchronous admission
+		// callback before this internal transaction. Persistence independently
+		// fences the complete retained identity tuple, not just its commonDir.
+		const canonicalPath = (value: unknown): value is string =>
+			workString(value, 4096) && isAbsolute(value) && normalize(value) === value;
+		const sourceIdentity = request.source;
+		taskAssert(
+			sourceIdentity &&
+				canonicalPath(sourceIdentity.root) &&
+				canonicalPath(sourceIdentity.commonDir) &&
+				canonicalPath(sourceIdentity.gitDir) &&
+				typeof sourceIdentity.base === "string" &&
+				/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sourceIdentity.base) &&
+				sourceIdentity.head === sourceIdentity.base &&
+				canonicalPath(proof.requestedCwd) &&
+				canonicalPath(proof.requestedCoordinator) &&
+				canonicalPath(proof.cwd) &&
+				canonicalPath(proof.coordinator) &&
+				canonicalPath(proof.primary) &&
+				canonicalPath(proof.commonDir) &&
+				canonicalPath(proof.gitDir) &&
+				proof.cwd === input.executionCwd &&
+				proof.requestedCwd === input.executionCwd &&
+				proof.cwd !== sourceIdentity.root &&
+				proof.cwd !== proof.primary &&
+				proof.cwd !== proof.coordinator &&
+				proof.gitDir !== sourceIdentity.gitDir &&
+				proof.gitDir !== proof.commonDir &&
+				proof.commonDir === sourceIdentity.commonDir &&
+				dirname(dirname(proof.gitDir)) === proof.commonDir &&
+				basename(dirname(proof.gitDir)) === "worktrees",
+			"identity",
+		);
+		taskAssert(
+			workString(request.requestKey) &&
+				request.epoch === input.epoch &&
+				request.target?.cwd === task.request.cwd &&
+				request.target.worktree?.enabled === true &&
+				taskJson(authorization.evidence) === taskJson(task.request.evidence) &&
+				claimed.body === JSON.stringify({ requestKey: request.requestKey, opRef: task.opRef }) &&
+				claimed.evidence.principalId === "gateway" &&
+				claimed.evidence.eventId === task.opRef &&
+				originKey(claimed.evidence.origin) === originKey(task.request.coordinator),
+			"identity",
+		);
+		// An execution checkout is exclusively task-owned: it can never be another
+		// task's retained dedicated admission, any task's attempt runtime cwd, or
+		// another task's native allocation — even after hosts are gone.
+		const sessionOwners = this.#database
+			.query<{ origin_key: string; epoch: number; repo: string }, [string]>(
+				"SELECT origin_key, epoch, repo FROM broker_owned_bindings WHERE session_id = ?",
+			)
+			.all(input.sessionId);
+		taskAssert(
+			sessionOwners.every(
+				(owner) =>
+					owner.origin_key === `work/task/${task.laneName}` &&
+					owner.epoch === input.epoch &&
+					owner.repo === input.executionCwd,
+			),
+			"conflict",
+		);
+		const owners = this.#database
+			.query<{ source_id: string; record_json: string }, [string]>(
+				"SELECT source_id, record_json FROM work_task_sources WHERE source_id LIKE 'native-allocation-result-%' AND task_id <> ?",
+			)
+			.all(task.taskId);
+		const admissions = this.#database
+			.query<{ source_id: string; record_json: string }, []>(
+				"SELECT source_id, record_json FROM work_task_sources WHERE source_id LIKE 'worktree-admission-%'",
+			)
+			.all();
+		const runtimes = this.#database
+			.query<{ record_json: string }, []>("SELECT record_json FROM work_attempt_runtime")
+			.all();
+		for (const row of [...owners, ...admissions]) {
+			let body: { executionCwd?: unknown; cwd?: unknown; sessionId?: unknown; gitDir?: unknown; gitProof?: unknown };
+			try {
+				body = JSON.parse((JSON.parse(row.record_json) as { body: string }).body);
+			} catch {
+				throw new WorkTaskStateError("unavailable");
+			}
+			taskAssert(body && typeof body === "object" && !Array.isArray(body), "unavailable");
+			const claimedCwd = row.source_id.startsWith("native-allocation-result-") ? body.executionCwd : body.cwd;
+			taskAssert(typeof claimedCwd === "string" && claimedCwd.length > 0, "unavailable");
+			let claimedGitDir = body.gitDir;
+			if (row.source_id.startsWith("native-allocation-result-")) {
+				taskAssert(typeof body.gitProof === "string", "unavailable");
+				try {
+					claimedGitDir = JSON.parse(body.gitProof).gitDir;
+				} catch {
+					throw new WorkTaskStateError("unavailable");
+				}
+			}
+			taskAssert(canonicalPath(claimedGitDir), "unavailable");
+			taskAssert(claimedGitDir !== proof.gitDir, "conflict");
+			taskAssert(claimedCwd !== input.executionCwd, "conflict");
+			taskAssert(body.sessionId !== input.sessionId, "conflict");
+		}
+		for (const row of runtimes) {
+			let runtime: { cwd?: unknown; sessionId?: unknown };
+			try {
+				runtime = JSON.parse(row.record_json);
+			} catch {
+				throw new WorkTaskStateError("unavailable");
+			}
+			taskAssert(typeof runtime.cwd === "string" && runtime.cwd.length > 0, "unavailable");
+			taskAssert(runtime.cwd !== input.executionCwd && runtime.sessionId !== input.sessionId, "conflict");
+		}
+		const sourceId = `native-allocation-result-${task.taskId}`;
+		const body = taskJson({
+			sessionId: input.sessionId,
+			epoch: input.epoch,
+			executionCwd: input.executionCwd,
+			...(input.endpointGeneration !== undefined ? { endpointGeneration: input.endpointGeneration } : {}),
+			...(input.endpointIncarnation !== undefined ? { endpointIncarnation: input.endpointIncarnation } : {}),
+			gitProof: input.gitProof,
+		});
+		const existing = this.workTaskSourceGet(sourceId);
+		if (existing) {
+			// Only the identical persisted result may repeat: no replacement session,
+			// cwd, or proof is ever accepted after the original allocation.
+			taskAssert(
+				existing.taskId === task.taskId &&
+					existing.kind === "decision" &&
+					existing.completeness === "complete" &&
+					existing.body === body &&
+					existing.evidence.principalId === "gateway",
+				"conflict",
+			);
+			return;
+		}
+		this.workTaskSourceAppendInTransaction({
+			sourceId,
+			taskId: task.taskId,
+			kind: "decision",
+			body,
+			evidence: {
+				principalId: "gateway",
+				origin: task.request.coordinator,
+				eventId: task.opRef,
+				editId: null,
+				evidenceAt: input.at,
+				observedAt: input.at,
+			},
+			supersedes: null,
+			completeness: "complete",
+			controlId: null,
+			reportId: null,
+		});
+	}
 
 	#workTaskRuntime(task: WorkTask, identity: WorkTaskAttemptIdentity): WorkAttemptRuntime {
 		taskAssert(
@@ -2337,7 +2615,7 @@ export class GatewayDatabase {
 				runtime.sessionId === task.sessionId &&
 				runtime.epoch === task.epoch &&
 				runtime.sessionKey === `work/task/${task.laneName}` &&
-				runtime.cwd === task.request.cwd &&
+				runtime.cwd === this.workTaskExecutionCwd(task) &&
 				runtime.parent?.kind === "persona" &&
 				runtime.parent.originKey === originKey(task.request.coordinator) &&
 				taskJson(runtime.parent.origin) === taskJson(task.request.coordinator),
@@ -2671,7 +2949,7 @@ export class GatewayDatabase {
 					scopeAdmission.kind === request.scope &&
 					scopeAdmission.taskId === task.taskId &&
 					scopeAdmission.opRef === task.opRef &&
-					scopeAdmission.cwd === task.request.cwd &&
+					scopeAdmission.cwd === this.workTaskExecutionCwd(task) &&
 					scopeAdmission.eventId === request.evidence.eventId &&
 					workTime(scopeAdmission.validatedAt) &&
 					task.surfacePhase === "bound" &&
@@ -3415,6 +3693,205 @@ export class GatewayDatabase {
 		return `review-question-${taskHash("work-task-review-delivery", sourceId)}`;
 	}
 
+	#workTaskHasMutationAdmission(task: WorkTask): boolean {
+		if (task.request.kind === "code_mutating") return true;
+		const rows = this.#database
+			.query<{ source_id: string }, [string]>(
+				"SELECT source_id FROM work_task_sources WHERE task_id = ? AND source_id LIKE 'scope-control-%'",
+			)
+			.all(task.taskId);
+		return rows.some((row) => {
+			const source = this.workTaskSourceGet(row.source_id);
+			const control = source?.controlId ? this.workControlGet(source.controlId) : undefined;
+			if (
+				!source ||
+				!control ||
+				source.sourceId !== `scope-${control.controlId}` ||
+				source.kind !== "decision" ||
+				source.completeness !== "complete" ||
+				control.request.taskId !== task.taskId ||
+				control.request.expectedOpRef !== task.opRef ||
+				control.request.kind !== "steer" ||
+				control.request.scope !== "code_mutating" ||
+				taskJson(source.evidence) !== taskJson(control.request.evidence)
+			)
+				return false;
+			try {
+				const retained = JSON.parse(source.body) as {
+					scopeAdmission?: Partial<WorkControlScopeAdmission>;
+					requestHash?: unknown;
+				};
+				const proof = retained.scopeAdmission;
+				const instruction = typeof proof?.sourceId === "string" ? this.workTaskSourceGet(proof.sourceId) : undefined;
+				return (
+					retained.requestHash === control.requestHash &&
+					proof?.kind === "code_mutating" &&
+					proof.taskId === task.taskId &&
+					proof.opRef === task.opRef &&
+					proof.cwd === task.request.cwd &&
+					proof.eventId === control.request.evidence.eventId &&
+					workTime(proof.validatedAt) &&
+					instruction?.kind === "instruction" &&
+					instruction.taskId === task.taskId &&
+					instruction.completeness === "complete" &&
+					instruction.body === control.request.body &&
+					instruction.evidence.principalId === control.request.evidence.principalId &&
+					instruction.evidence.eventId === control.request.evidence.eventId &&
+					instruction.evidence.editId === control.request.evidence.editId &&
+					taskJson(instruction.evidence.origin) === taskJson(control.request.evidence.origin)
+				);
+			} catch {
+				return false;
+			}
+		});
+	}
+
+	/** Read-only admission of retained reconciliation evidence; never an integration executor. */
+	workTaskCodingCompletion(taskId: string): ReturnType<typeof deriveWorkTaskCodingCompletion> {
+		const select = (): ReturnType<typeof deriveWorkTaskCodingCompletion> => {
+			const task = this.workTaskGet(taskId);
+			taskAssert(task, "unavailable");
+			if (!this.#workTaskHasMutationAdmission(task)) return { state: "not_applicable", pendingReasons: [] };
+			const original = this.workTaskOriginalSource(taskId);
+			const reviews = this.#workTaskReviews(taskId);
+			const latest = reviews.at(-1)?.review ?? null;
+			const closeout = latest?.closeout;
+			const ids = new Set([
+				original?.sourceId,
+				closeout?.verification.sourceId,
+				closeout?.serialization.sourceId,
+				closeout?.ownerApproval.sourceId,
+			]);
+			// A coordinator cannot resurrect an older approval after the owner
+			// records a later decision. Reuse the existing instruction/control
+			// order; ordinary prose is not interpreted as a closeout decision.
+			const instructions = this.#database
+				.query<{ source_id: string }, [string]>(
+					"SELECT source_id FROM work_task_sources WHERE task_id = ? AND source_id LIKE 'instruction-control-%'",
+				)
+				.all(taskId);
+			for (const row of instructions) {
+				const instruction = this.workTaskSourceGet(row.source_id);
+				taskAssert(instruction?.taskId === taskId, "unavailable");
+				if (instruction.kind !== "instruction" || !instruction.body.trimStart().startsWith("{")) continue;
+				try {
+					const statement = JSON.parse(instruction.body);
+					if (
+						statement?.kind === "work_task_closeout_approval" &&
+						statement.taskId === taskId &&
+						statement.opRef === task.opRef
+					)
+						ids.add(instruction.sourceId);
+				} catch {
+					// Unstructured conversation text carries no machine closeout authority.
+				}
+			}
+			const sources = [...ids].flatMap((id) => {
+				const source = id ? this.workTaskSourceGet(id) : undefined;
+				return source ? [source] : [];
+			});
+			const controls = [...new Set(sources.flatMap((source) => (source.controlId ? [source.controlId] : [])))].flatMap(
+				(id) => {
+					const control = this.workControlGet(id);
+					return control ? [control] : [];
+				},
+			);
+			// Numeric author IDs are authenticated at mapped Discord ingress. Only
+			// exact retained instruction/control pairs carry that provenance here;
+			// an arbitrary source principal or a persona-origin claim does not.
+			const humans = sources.flatMap((source) => {
+				const control = controls.find((entry) => entry.controlId === source.controlId);
+				if (
+					!task.thread ||
+					source.evidence.origin.platform !== "discord" ||
+					taskJson(source.evidence.origin) !== taskJson(task.thread) ||
+					source.sourceId !== `instruction-${control?.controlId}` ||
+					source.kind !== "instruction" ||
+					!/^[1-9][0-9]{0,19}$/.test(source.evidence.principalId) ||
+					!control ||
+					control.request.taskId !== taskId ||
+					control.request.expectedOpRef !== task.opRef ||
+					source.body !== control.request.body ||
+					source.evidence.principalId !== control.request.evidence.principalId ||
+					source.evidence.eventId !== control.request.evidence.eventId ||
+					source.evidence.editId !== control.request.evidence.editId ||
+					taskJson(source.evidence.origin) !== taskJson(control.request.evidence.origin)
+				)
+					return [];
+				return [source.evidence.principalId];
+			});
+			let commonDir: string | null = null;
+			try {
+				const allocation = this.workTaskSourceGet(`native-allocation-result-${taskId}`);
+				const proof = allocation
+					? JSON.parse(JSON.parse(allocation.body).gitProof)
+					: JSON.parse(this.workTaskSourceGet(`worktree-admission-${taskId}`)?.body ?? "null");
+				if (typeof proof?.commonDir === "string") commonDir = proof.commonDir;
+			} catch {
+				// Missing or malformed retained identity can never admit completion.
+			}
+			const runtime = this.workAttemptGet(task.opRef);
+			const terminal = runtime?.terminal;
+			const exactTerminal = Boolean(
+				runtime &&
+					runtime.sessionId === task.sessionId &&
+					runtime.epoch === task.epoch &&
+					runtime.jobId === task.jobId &&
+					runtime.reportId === task.terminalReportId &&
+					runtime.settledAt &&
+					terminal?.kind === "broker" &&
+					terminal.reasonCode === "end_turn" &&
+					localSettledTerminalStatus(runtime, terminal.status, Date.parse(terminal.observedAt)),
+			);
+			const administrative = this.#database
+				.query<{ present: number }, [string]>(
+					"SELECT 1 AS present FROM work_task_sources WHERE task_id = ? AND json_type(record_json, '$.administrative') = 'object' LIMIT 1",
+				)
+				.get(taskId);
+			return deriveWorkTaskCodingCompletion({
+				task: {
+					taskId,
+					opRef: task.opRef,
+					kind: "code_mutating",
+					obligation: task.obligationState,
+					terminalReportId: task.terminalReportId,
+					terminalSettled: exactTerminal,
+					repositoryCommonDir: commonDir,
+					ownerOriginKeys: [originKey(task.request.coordinator), ...(task.thread ? [originKey(task.thread)] : [])],
+					authenticatedHumanPrincipals: humans,
+					administrativeUnresolved: Boolean(administrative),
+					ownerQuestions: reviews
+						.filter((entry) => entry.review?.disposition === "owner_question")
+						.map((entry) => ({
+							reviewId: entry.review!.reviewId,
+							sourceId: entry.sourceId,
+							contentHash: entry.contentHash,
+						})),
+				},
+				review: latest,
+				sources: sources.map((source) => ({
+					...source,
+					principalId: source.evidence.principalId,
+					originKey: originKey(source.evidence.origin),
+					eventId: source.evidence.eventId,
+					editId: source.evidence.editId,
+				})),
+				controls: controls.map((control) => ({
+					controlId: control.controlId,
+					taskId: control.request.taskId,
+					opRef: control.request.expectedOpRef,
+					sequence: control.sequence,
+					principalId: control.request.evidence.principalId,
+					body: control.request.body,
+					originKey: originKey(control.request.evidence.origin),
+					eventId: control.request.evidence.eventId,
+					editId: control.request.evidence.editId,
+				})),
+			});
+		};
+		return this.#inTransaction ? select() : this.withTransaction(select);
+	}
+
 	workTaskReview(params: WorkTaskReviewParams, at = new Date().toISOString()): WorkTaskReviewResult {
 		const input = validateWorkTaskReviewParams(params);
 		return this.withTransaction((): WorkTaskReviewResult => {
@@ -4080,7 +4557,7 @@ export class GatewayDatabase {
 					task.jobId === runtime.jobId &&
 					runtime.sessionKey === `work/task/${task.laneName}` &&
 					runtime.mode === "start" &&
-					runtime.cwd === task.request.cwd &&
+					runtime.cwd === this.workTaskExecutionCwd(task) &&
 					record.attempts.length === 1 &&
 					runtime.parent?.kind === "persona" &&
 					runtime.parent.originKey === originKey(task.request.coordinator) &&

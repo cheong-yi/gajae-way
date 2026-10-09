@@ -10,6 +10,7 @@ import {
 	isSessionBusy,
 	ModelNotSelectedError,
 	PromptNotSubmittedError,
+	type SessionManagedCreateTarget,
 	SessionRequestTimeoutError,
 	type SessionSteerStatusResult,
 } from "../src/orchestrator/session-port";
@@ -2312,3 +2313,587 @@ for (const progressing of [true, false]) {
 		}
 	});
 }
+
+test("managed bind sends one create under the persisted key with the exact target and owns the returned execution cwd", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-create-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const sourceCwd = join(home, "source");
+	const executionCwd = join(home, "worktrees", "task-1");
+	const createTarget: SessionManagedCreateTarget = {
+		cwd: sourceCwd,
+		worktree: { enabled: true, name: "task-1" },
+		modelPreset: "default",
+		readiness: "deferred",
+		readinessTimeoutMs: 60_000,
+	};
+	const recorded: string[][] = [];
+	const run: CliRunner = async (args) => {
+		recorded.push([...args]);
+		if (args.includes("session.create"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					operation: "session.create",
+					result: {
+						sessionId: "managed-1",
+						cwd: executionCwd,
+						endpointGeneration: 3,
+						endpointIncarnation: "a".repeat(64),
+					},
+				}),
+				stderr: "",
+			};
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "managed-1", live: true } } }),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "instance-managed",
+		tailRunner: new TailRunner({ stream: noRelay, repo: executionCwd }),
+	});
+	const binding = await port.bind({
+		originKey: "task/one",
+		epoch: 0,
+		repo: sourceCwd,
+		managedWorktree: {
+			idempotencyKey: "task-one-original",
+			createTarget,
+			lookupOnly: false,
+			validateResult: (identity) => {
+				expect(identity).toEqual({
+					sessionId: "managed-1",
+					cwd: executionCwd,
+					endpointGeneration: 3,
+					endpointIncarnation: "a".repeat(64),
+				});
+				expect(database!.getSessionRecord("task/one")).toBeUndefined();
+				expect(recorded.some((args) => args.includes("inspect"))).toBe(false);
+			},
+		},
+	});
+	expect(binding).toMatchObject({
+		sessionId: "managed-1",
+		originKey: "task/one",
+		epoch: 0,
+		repo: executionCwd,
+		executionCwd,
+		startupModelApplied: true,
+		endpointGeneration: 3,
+		endpointIncarnation: "a".repeat(64),
+	});
+	expect(recorded.filter((args) => args.includes("session.create"))).toEqual([
+		[
+			"sdk",
+			"session",
+			"raw",
+			"global",
+			"--op",
+			"session.create",
+			"--idempotency-key",
+			"task-one-original",
+			"--json-input",
+			JSON.stringify(createTarget),
+		],
+	]);
+	const db = database;
+	expect(db.getSessionRecord("task/one")).toMatchObject({ sessionId: "managed-1", epoch: 0 });
+	expect(db.assertOwnedSession("managed-1", executionCwd, authority)).toMatchObject({ originKey: "task/one" });
+	// The assignment source never becomes the recorded runtime.
+	expect(() => db.assertOwnedSession("managed-1", sourceCwd, authority)).toThrow(BrokerAuthorityError);
+});
+
+test("a failed managed create stays held: one attempt, no retry, no epoch rotation, no replacement", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-fail-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const executionCwd = join(home, "worktrees", "task-2");
+	let creates = 0;
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			creates++;
+			// Terminal-uncertain is generic-retryable; managed policy must hold instead.
+			return {
+				exitCode: 1,
+				stdout: JSON.stringify({ ok: false, error: { code: "terminal_uncertain", message: "startup pending" } }),
+				stderr: "",
+			};
+		}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "instance-managed",
+		tailRunner: new TailRunner({ stream: noRelay, repo: executionCwd }),
+	});
+	await expect(
+		port.bind({
+			originKey: "task/two",
+			epoch: 0,
+			repo: join(home, "source"),
+			managedWorktree: {
+				idempotencyKey: "task-two-original",
+				createTarget: { cwd: join(home, "source"), worktree: { enabled: true } },
+				lookupOnly: false,
+				validateResult: () => {},
+			},
+		}),
+	).rejects.toThrow();
+	expect(creates).toBe(1);
+	expect(database.getSessionRecord("task/two")).toBeUndefined();
+	expect(database.metaGet("create_rotation:task/two")).toBeUndefined();
+});
+
+test("managed recovery finds the original binding through a correlated lookup without any create", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-recover-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const sourceCwd = join(home, "source");
+	const executionCwd = join(home, "worktrees", "task-3");
+	const createTarget: SessionManagedCreateTarget = {
+		cwd: sourceCwd,
+		worktree: { enabled: true, name: "task-3" },
+	};
+	const recorded: string[][] = [];
+	const run: CliRunner = async (args) => {
+		recorded.push([...args]);
+		if (args.includes("session.lookup"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					operation: "session.lookup",
+					status: "found",
+					request: { operation: "session.create", requestKey: "task-three-original" },
+					result: {
+						sessionId: "managed-3",
+						cwd: executionCwd,
+						endpointGeneration: 7,
+						endpointIncarnation: "b".repeat(64),
+					},
+				}),
+				stderr: "",
+			};
+		if (args.includes("inspect"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { session: { sessionId: "managed-3", live: true } } }),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "instance-managed",
+		tailRunner: new TailRunner({ stream: noRelay, repo: executionCwd }),
+	});
+	const binding = await port.bind({
+		originKey: "task/three",
+		epoch: 0,
+		repo: sourceCwd,
+		managedWorktree: {
+			idempotencyKey: "task-three-original",
+			createTarget,
+			lookupOnly: true,
+			validateResult: () => {},
+		},
+	});
+	expect(binding).toMatchObject({
+		sessionId: "managed-3",
+		repo: executionCwd,
+		executionCwd,
+		endpointGeneration: 7,
+		endpointIncarnation: "b".repeat(64),
+	});
+	expect(recorded.filter((args) => args.includes("session.lookup"))).toEqual([
+		[
+			"sdk",
+			"session",
+			"raw",
+			"global",
+			"--op",
+			"session.lookup",
+			"--idempotency-key",
+			"task-three-original",
+			"--json-input",
+			JSON.stringify(createTarget),
+		],
+	]);
+	expect(recorded.some((args) => args.includes("session.create"))).toBe(false);
+	expect(database.assertOwnedSession("managed-3", executionCwd, authority)).toMatchObject({
+		originKey: "task/three",
+	});
+});
+
+test("a managed create or lookup without a returned execution cwd fails held with no source fallback", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-nocwd-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const sourceCwd = join(home, "source");
+	const executionCwd = join(home, "worktrees", "task-4");
+	const createTarget: SessionManagedCreateTarget = { cwd: sourceCwd, worktree: { enabled: true } };
+	const recorded: string[][] = [];
+	const run: CliRunner = async (args) => {
+		recorded.push([...args]);
+		if (args.includes("session.create"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, operation: "session.create", result: { sessionId: "managed-4" } }),
+				stderr: "",
+			};
+		if (args.includes("session.lookup"))
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({
+					ok: true,
+					operation: "session.lookup",
+					status: "found",
+					request: { operation: "session.create", requestKey: "task-four-original" },
+					result: { sessionId: "managed-4" },
+				}),
+				stderr: "",
+			};
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		instanceId: "instance-managed",
+		tailRunner: new TailRunner({ stream: noRelay, repo: executionCwd }),
+	});
+	await expect(
+		port.bind({
+			originKey: "task/four",
+			epoch: 0,
+			repo: sourceCwd,
+			managedWorktree: {
+				idempotencyKey: "task-four-original",
+				createTarget,
+				lookupOnly: false,
+				validateResult: () => {},
+			},
+		}),
+	).rejects.toThrow("execution cwd");
+	await expect(
+		port.bind({
+			originKey: "task/four",
+			epoch: 0,
+			repo: sourceCwd,
+			managedWorktree: {
+				idempotencyKey: "task-four-original",
+				createTarget,
+				lookupOnly: true,
+				validateResult: () => {},
+			},
+		}),
+	).rejects.toThrow("execution cwd");
+	expect(recorded.filter((args) => args.includes("session.create"))).toHaveLength(1);
+	expect(recorded.filter((args) => args.includes("session.lookup"))).toHaveLength(1);
+	expect(database.getSessionRecord("task/four")).toBeUndefined();
+});
+
+test("managed recovery accepts only a correlated found outcome and never creates", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-uncertain-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const sourceCwd = join(home, "source");
+	const executionCwd = join(home, "worktrees", "task-5");
+	const createTarget: SessionManagedCreateTarget = { cwd: sourceCwd, worktree: { enabled: true } };
+	const cases: readonly { readonly name: string; readonly exitCode: number; readonly stdout: unknown }[] = [
+		{
+			name: "not_found",
+			exitCode: 1,
+			stdout: {
+				ok: false,
+				operation: "session.lookup",
+				status: "not_found",
+				request: { operation: "session.create", requestKey: "task-five-original" },
+				certainty: "terminal",
+				error: { code: "not_found", message: "no such request" },
+			},
+		},
+		{
+			name: "pending",
+			exitCode: 1,
+			stdout: {
+				ok: false,
+				operation: "session.lookup",
+				status: "pending",
+				request: { operation: "session.create", requestKey: "task-five-original" },
+				certainty: "uncertain",
+				error: { code: "pending", message: "create not settled" },
+			},
+		},
+		{
+			name: "uncertain",
+			exitCode: 1,
+			stdout: {
+				ok: false,
+				operation: "session.lookup",
+				status: "uncertain",
+				request: { operation: "session.create", requestKey: "task-five-original" },
+				certainty: "uncertain",
+				error: { code: "malformed_response", message: "unreadable lifecycle result" },
+			},
+		},
+		{
+			name: "key-mismatch",
+			exitCode: 0,
+			stdout: {
+				ok: true,
+				operation: "session.lookup",
+				status: "found",
+				request: { operation: "session.create", requestKey: "some-other-key" },
+				result: { sessionId: "managed-5", cwd: executionCwd },
+			},
+		},
+		{
+			name: "operation-mismatch",
+			exitCode: 0,
+			stdout: {
+				ok: true,
+				operation: "session.lookup",
+				status: "found",
+				request: { operation: "session.resume", requestKey: "task-five-original" },
+				result: { sessionId: "managed-5", cwd: executionCwd },
+			},
+		},
+		{
+			name: "malformed-found",
+			exitCode: 0,
+			stdout: { ok: true, operation: "session.lookup", status: "found" },
+		},
+	];
+	for (const [index, scenario] of cases.entries()) {
+		let creates = 0;
+		const run: CliRunner = async (args) => {
+			if (args.includes("session.create")) {
+				creates++;
+				throw new Error("managed recovery must never create");
+			}
+			if (args.includes("session.lookup"))
+				return { exitCode: scenario.exitCode, stdout: JSON.stringify(scenario.stdout), stderr: "" };
+			throw new Error(`unexpected command ${args.join(" ")}`);
+		};
+		const port = new BrokerSessionPort({
+			authority,
+			database,
+			cli: run,
+			instanceId: "instance-managed",
+			tailRunner: new TailRunner({ stream: noRelay, repo: executionCwd }),
+		});
+		const originKey = `task/five-${index}`;
+		await expect(
+			port.bind({
+				originKey,
+				epoch: 0,
+				repo: sourceCwd,
+				managedWorktree: {
+					idempotencyKey: "task-five-original",
+					createTarget,
+					lookupOnly: true,
+					validateResult: () => {},
+				},
+			}),
+		).rejects.toThrow();
+		expect(creates).toBe(0);
+		expect(database.getSessionRecord(originKey)).toBeUndefined();
+	}
+});
+
+test("the scripted fake honors the managed create and lookup-only contract", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-fake-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const agentDir = join(home, "agent");
+	const fake = new ScriptedSessionPort({
+		onBind: () => ({ sessionId: "managed-fake", executionCwd: join(home!, "worktrees", "task-fake") }),
+	});
+	const port = attachTestBrokerOwnership(database, fake, agentDir);
+	const sourceCwd = join(home, "source");
+	const executionCwd = join(home, "worktrees", "task-fake");
+	const createTarget: SessionManagedCreateTarget = {
+		cwd: sourceCwd,
+		worktree: { enabled: true, name: "task-fake" },
+	};
+	const created = await port.bind({
+		originKey: "task/fake",
+		epoch: 0,
+		repo: sourceCwd,
+		managedWorktree: {
+			idempotencyKey: "task-fake-original",
+			createTarget,
+			lookupOnly: false,
+			validateResult: () => {},
+		},
+	});
+	expect(created).toMatchObject({ repo: executionCwd, executionCwd });
+	const recovered = await port.bind({
+		originKey: "task/fake",
+		epoch: 0,
+		repo: sourceCwd,
+		managedWorktree: {
+			idempotencyKey: "task-fake-original",
+			createTarget,
+			lookupOnly: true,
+			validateResult: () => {},
+		},
+	});
+	expect(recovered.sessionId).toBe(created.sessionId);
+	expect(recovered.repo).toBe(executionCwd);
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	const db = database;
+	expect(db.assertOwnedSession(created.sessionId, executionCwd, authority)).toMatchObject({
+		originKey: "task/fake",
+	});
+	expect(() => db.assertOwnedSession(created.sessionId, sourceCwd, authority)).toThrow(BrokerAuthorityError);
+	await expect(
+		port.bind({
+			originKey: "task/fake-unknown",
+			epoch: 0,
+			repo: sourceCwd,
+			managedWorktree: {
+				idempotencyKey: "task-never-created",
+				createTarget,
+				lookupOnly: true,
+				validateResult: () => {},
+			},
+		}),
+	).rejects.toThrow("found no session");
+	expect(database.getSessionRecord("task/fake-unknown")).toBeUndefined();
+});
+
+test("managed identity validation failure leaves ownership untouched and recovers only the original allocation", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-validation-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const db = database;
+	const authority = initializeTestBrokerAuthority(db, join(home, "agent"));
+	const sourceCwd = join(home, "source");
+	const executionCwd = join(home, ".worktrees", "execution");
+	const result = { sessionId: "validation-original", cwd: executionCwd };
+	const operations: string[] = [];
+	const port = new BrokerSessionPort({
+		database: db,
+		authority,
+		instanceId: "validation",
+		tailRunner: new TailRunner({ stream: noRelay, repo: executionCwd }),
+		cli: async (args) => {
+			const operation = args.includes("session.create")
+				? "create"
+				: args.includes("session.lookup")
+					? "lookup"
+					: "inspect";
+			operations.push(operation);
+			return {
+				exitCode: 0,
+				stderr: "",
+				stdout: JSON.stringify(
+					operation === "lookup"
+						? {
+								ok: true,
+								operation: "session.lookup",
+								status: "found",
+								request: { operation: "session.create", requestKey: "validation-key" },
+								result,
+							}
+						: operation === "create"
+							? { ok: true, operation: "session.create", result }
+							: { ok: true, result: { session: { live: true } } },
+				),
+			};
+		},
+	});
+	const input = {
+		originKey: "task/validation",
+		epoch: 0,
+		repo: sourceCwd,
+		managedWorktree: {
+			idempotencyKey: "validation-key",
+			createTarget: { cwd: sourceCwd, worktree: { enabled: true as const } },
+			lookupOnly: false,
+			validateResult: () => {
+				throw new Error("foreign_checkout");
+			},
+		},
+	};
+	await expect(port.bind(input)).rejects.toThrow("foreign_checkout");
+	expect(operations).toEqual(["create"]);
+	expect(db.getSessionRecord(input.originKey)).toBeUndefined();
+	const recovered = await port.bind({
+		...input,
+		managedWorktree: {
+			...input.managedWorktree,
+			lookupOnly: true,
+			validateResult: (identity) => expect(identity).toEqual(result),
+		},
+	});
+	expect(recovered.sessionId).toBe(result.sessionId);
+	expect(operations).toEqual(["create", "lookup", "inspect"]);
+	await expect(port.bind(input)).rejects.toThrow("only original lookup");
+	expect(operations).toEqual(["create", "lookup", "inspect"]);
+});
+
+test("managed create refuses absent or mismatched operation and echoed request identity before ownership", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-managed-envelope-"));
+	database = await GatewayDatabase.open(join(home, "gateway.db"));
+	const db = database;
+	const authority = initializeTestBrokerAuthority(db, join(home, "agent"));
+	const repo = join(home, "source");
+	const createTarget = { cwd: repo, worktree: { enabled: true as const } };
+	const envelopes = [
+		{},
+		{ operation: "session.resume" },
+		{ operation: "session.create", request: { operation: "session.create", requestKey: "other" } },
+		{
+			operation: "session.create",
+			request: { operation: "session.create", requestKey: "original", target: { ...createTarget, cwd: "/other" } },
+		},
+	];
+	for (const [index, envelope] of envelopes.entries()) {
+		let validated = false;
+		const port = new BrokerSessionPort({
+			database: db,
+			authority,
+			instanceId: "envelope",
+			tailRunner: new TailRunner({ stream: noRelay, repo }),
+			cli: async () => ({
+				exitCode: 0,
+				stderr: "",
+				stdout: JSON.stringify({
+					ok: true,
+					...envelope,
+					result: { sessionId: `unrelated-${index}`, cwd: join(home!, "worker") },
+				}),
+			}),
+		});
+		await expect(
+			port.bind({
+				originKey: `envelope-${index}`,
+				epoch: 0,
+				repo,
+				managedWorktree: {
+					idempotencyKey: "original",
+					createTarget,
+					lookupOnly: false,
+					validateResult: () => {
+						validated = true;
+					},
+				},
+			}),
+		).rejects.toThrow("mismatched request evidence");
+		expect(validated).toBe(false);
+		expect(db.getSessionRecord(`envelope-${index}`)).toBeUndefined();
+	}
+});

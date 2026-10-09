@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -163,6 +164,59 @@ export interface SessionBindInput {
 	readonly codingRegister?: boolean;
 	/** Internal recursion fence: one poisoned create key may advance to one fresh epoch per bind call. */
 	readonly epochRecovery?: boolean;
+	/**
+	 * Explicit managed allocation policy for task-owned sessions. When present
+	 * the generic inspect/resume/replace, retry, and epoch-rotation paths are
+	 * skipped entirely: the first call attempts the original create once, and
+	 * recovery only ever looks that same key and target up. Ownership is
+	 * recorded under the SDK-validated execution cwd, never the input repo.
+	 */
+	readonly managedWorktree?: SessionManagedWorktree;
+}
+
+/**
+ * The exact SDK create target of a managed allocation. The caller persists it
+ * before any effect; create and every recovery lookup reuse it verbatim.
+ */
+export interface SessionManagedCreateTarget {
+	readonly cwd: string;
+	readonly worktree: { readonly enabled: true; readonly name?: string };
+	readonly modelId?: string;
+	readonly modelPreset?: string;
+	readonly readiness?: "immediate" | "deferred";
+	readonly readinessTimeoutMs?: number;
+}
+
+/**
+ * SDK-validated identity of a managed session: only correlated create or
+ * lookup evidence ever produces it, never the assignment source.
+ */
+export interface SessionManagedBindIdentity {
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly endpointGeneration?: number;
+	readonly endpointIncarnation?: string;
+}
+
+/**
+ * Managed allocation identity: one original create under a persisted
+ * idempotency key. The key and target are never regenerated, rotated, or
+ * replaced; a `lookupOnly` invocation must recover the original session
+ * through a correlated `session.lookup` or fail held without any create.
+ */
+export interface SessionManagedWorktree {
+	/** Persisted original idempotency key of this allocation. */
+	readonly idempotencyKey: string;
+	readonly createTarget: SessionManagedCreateTarget;
+	/** True once the original create may already exist: recovery is lookup-only. */
+	readonly lookupOnly: boolean;
+	/**
+	 * Required admission gate, invoked with the SDK-validated identity after a
+	 * correlated create or lookup and strictly before ownership is recorded.
+	 * The caller persists validated Git/source/task proof here; any throw holds
+	 * the bind with no ownership record.
+	 */
+	readonly validateResult: (identity: SessionManagedBindIdentity) => void;
 }
 
 export interface SessionBinding {
@@ -170,6 +224,11 @@ export interface SessionBinding {
 	readonly originKey: string;
 	readonly epoch: number;
 	readonly repo: string;
+	/** Managed bindings carry the SDK-validated execution cwd; it equals repo. */
+	readonly executionCwd?: string;
+	/** Original endpoint identity of the managed session, when the SDK returned it. */
+	readonly endpointGeneration?: number;
+	readonly endpointIncarnation?: string;
 	readonly startupModelApplied?: boolean;
 }
 
@@ -369,7 +428,7 @@ export interface BrokerSessionPortOptions {
 const DEFAULT_REQUEST_WAIT_MS = 30 * 60_000;
 const DEFAULT_STATUS_POLL_MS = 500;
 const SESSION_CREATE_ATTEMPTS = 5;
-const SESSION_CREATE_READINESS_MS = 60_000;
+export const SESSION_CREATE_READINESS_MS = 60_000;
 const SESSION_READY_TIMEOUT_MS = 60_000;
 const SESSION_READY_POLL_MS = 250;
 const SESSION_CREATE_RETRY_MS = 1_000;
@@ -440,6 +499,7 @@ export class BrokerSessionPort implements SessionPort {
 		this.#database.assertBrokerAuthority(this.#authority);
 		if (!Number.isSafeInteger(input.epoch) || input.epoch < 0)
 			throw new Error("session epoch must be a non-negative integer");
+		if (input.managedWorktree) return await this.#bindManaged({ ...input, managedWorktree: input.managedWorktree });
 		const existing = this.#database.getSessionRecord(input.originKey);
 		if (existing?.epoch === input.epoch && existing.sessionId) {
 			this.#assertOwned({ sessionId: existing.sessionId, repo: input.repo });
@@ -541,6 +601,159 @@ export class BrokerSessionPort implements SessionPort {
 			repo: input.repo,
 			...(input.model ? { startupModelApplied: true } : {}),
 		};
+	}
+
+	/**
+	 * Managed task allocation: one original create under the persisted
+	 * idempotency key, and recovery only ever a correlated lookup of that
+	 * same key and exact target. Uncertain outcomes stay held: no retry, no
+	 * epoch rotation, no replacement, and no source-cwd fallback ever runs.
+	 */
+	async #bindManaged(
+		input: SessionBindInput & { readonly managedWorktree: SessionManagedWorktree },
+	): Promise<SessionBinding> {
+		const managed = input.managedWorktree;
+		if (typeof managed.idempotencyKey !== "string" || managed.idempotencyKey.length === 0)
+			throw new Error("managed session bind requires a persisted idempotency key");
+		if (managed.createTarget.cwd !== input.repo || managed.createTarget.worktree?.enabled !== true)
+			throw new Error("managed session target must name the original source and enable native worktree allocation");
+		const previous = this.#database.getSessionRecord(input.originKey);
+		if (previous && (previous.epoch !== input.epoch || (previous.sessionId && !managed.lookupOnly)))
+			throw new Error("managed session binding already exists; only original lookup recovery is allowed");
+		const created = managed.lookupOnly ? await this.#lookupManaged(managed) : await this.#createManaged(managed);
+		const persisted = this.#database.getSessionRecord(input.originKey);
+		if (
+			persisted &&
+			(persisted.epoch !== input.epoch || (persisted.sessionId && persisted.sessionId !== created.sessionId))
+		)
+			throw new Error(
+				`managed session bind for ${input.originKey} epoch ${input.epoch} refuses to overwrite persisted binding session=${persisted.sessionId} epoch=${persisted.epoch}`,
+			);
+		// Admission gate: the caller validates and persists Git/source/task
+		// proof for this exact identity before any ownership record exists.
+		managed.validateResult(created);
+		// Ownership belongs to the validated execution cwd the SDK returned;
+		// the input repo is the immutable assignment source, never the runtime.
+		if (
+			!this.#database.recordOwnedBinding({
+				authority: this.#authority,
+				sessionId: created.sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: created.cwd,
+			})
+		) {
+			throw new Error(
+				`session bind for ${input.originKey} epoch ${input.epoch} lost to a concurrent durable epoch change`,
+			);
+		}
+		await this.#awaitIndexed(created.sessionId, created.cwd);
+		return {
+			sessionId: created.sessionId,
+			originKey: input.originKey,
+			epoch: input.epoch,
+			repo: created.cwd,
+			executionCwd: created.cwd,
+			...(managed.createTarget.modelId || managed.createTarget.modelPreset ? { startupModelApplied: true } : {}),
+			...(created.endpointGeneration !== undefined ? { endpointGeneration: created.endpointGeneration } : {}),
+			...(created.endpointIncarnation !== undefined ? { endpointIncarnation: created.endpointIncarnation } : {}),
+		};
+	}
+
+	/** The single managed create attempt; the persisted target is forwarded verbatim. */
+	async #createManaged(managed: SessionManagedWorktree): Promise<SessionManagedBindIdentity> {
+		let result: CliResult;
+		try {
+			result = await this.#createManagedSession(managed.idempotencyKey, managed.createTarget);
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			throw sanitizeSdkFailure(error);
+		}
+		const identity = parseEnvelope<Record<string, unknown>>(result, "session.create");
+		const envelope = recordOf(JSON.parse(result.stdout));
+		const request = envelope ? recordOf(envelope.request) : undefined;
+		// The public .18.8 create receipt echoes the operation, not a request
+		// key. Validate any supplied correlation metadata without inventing it.
+		if (
+			envelope?.operation !== "session.create" ||
+			(envelope.request !== undefined &&
+				(request?.operation !== "session.create" ||
+					request.requestKey !== managed.idempotencyKey ||
+					(request.target !== undefined && JSON.stringify(request.target) !== JSON.stringify(managed.createTarget))))
+		)
+			throw new Error("managed session.create returned mismatched request evidence");
+		return managedSessionIdentity(identity, "session.create");
+	}
+
+	/** Managed cold creates stay serialized per agent dir, but only ever one attempt under the original key. */
+	#createManagedSession(idempotencyKey: string, target: SessionManagedCreateTarget): Promise<CliResult> {
+		const run = this.#createChain.then(
+			async () =>
+				await this.#cli([
+					"sdk",
+					"session",
+					"raw",
+					"global",
+					"--op",
+					"session.create",
+					"--idempotency-key",
+					idempotencyKey,
+					"--json-input",
+					JSON.stringify(target),
+				]),
+		);
+		this.#createChain = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
+	/**
+	 * Recovery of the original managed create: same key, same target bytes.
+	 * Only a `found` outcome whose echoed request correlates to this exact
+	 * key and operation recovers the binding; pending, not_found, conflict,
+	 * uncertain, terminal, unavailable, and any correlation mismatch remain
+	 * held without a create.
+	 */
+	async #lookupManaged(managed: SessionManagedWorktree): Promise<SessionManagedBindIdentity> {
+		let result: CliResult;
+		try {
+			result = await this.#cli([
+				"sdk",
+				"session",
+				"raw",
+				"global",
+				"--op",
+				"session.lookup",
+				"--idempotency-key",
+				managed.idempotencyKey,
+				"--json-input",
+				JSON.stringify(managed.createTarget),
+			]);
+		} catch (error) {
+			if (error instanceof BrokerAuthorityError) throw error;
+			throw sanitizeSdkFailure(error);
+		}
+		let outcome: unknown;
+		try {
+			outcome = JSON.parse(result.stdout);
+		} catch {
+			throw new Error(`managed session.lookup for ${managed.idempotencyKey} did not print a JSON outcome`);
+		}
+		const lookup = recordOf(outcome);
+		const request = lookup ? recordOf(lookup.request) : undefined;
+		const session = lookup?.ok === true ? recordOf(lookup.result) : undefined;
+		if (
+			result.exitCode !== 0 ||
+			lookup?.operation !== "session.lookup" ||
+			lookup.status !== "found" ||
+			request?.operation !== "session.create" ||
+			request.requestKey !== managed.idempotencyKey ||
+			!session
+		)
+			throw new Error(`managed session.lookup for ${managed.idempotencyKey} did not recover a correlated session`);
+		return managedSessionIdentity(session, "session.lookup");
 	}
 
 	#createRotations(originKey: string): number {
@@ -2065,6 +2278,44 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 }
 
 /**
+ * A managed binding exists only as SDK-returned identity: the validated
+ * execution cwd and original endpoint identity come from the correlated
+ * create/lookup result, never from the assignment source or a local guess.
+ * A missing id or cwd is an uncertain outcome, held without a binding.
+ */
+function managedSessionIdentity(
+	value: Record<string, unknown>,
+	origin: "session.create" | "session.lookup",
+): SessionManagedBindIdentity {
+	const sessionId = value.sessionId;
+	const cwd = value.cwd;
+	if (
+		typeof sessionId !== "string" ||
+		sessionId.length === 0 ||
+		typeof cwd !== "string" ||
+		cwd.length === 0 ||
+		!isAbsolute(cwd)
+	)
+		throw new Error(`${origin} succeeded without a validated session id and execution cwd`);
+	const endpointGeneration =
+		typeof value.endpointGeneration === "number" &&
+		Number.isSafeInteger(value.endpointGeneration) &&
+		value.endpointGeneration > 0
+			? value.endpointGeneration
+			: undefined;
+	const endpointIncarnation =
+		typeof value.endpointIncarnation === "string" && /^[a-f0-9]{64}$/u.test(value.endpointIncarnation)
+			? value.endpointIncarnation
+			: undefined;
+	return {
+		sessionId,
+		cwd,
+		...(endpointGeneration !== undefined ? { endpointGeneration } : {}),
+		...(endpointIncarnation !== undefined ? { endpointIncarnation } : {}),
+	};
+}
+
+/**
  * Create failures that are safe to retry under the SAME idempotency key: the
  * runtime either has not created the session (spawn_failed) or cannot yet
  * prove what it created (terminal_uncertain, uncertain_after_send). The key
@@ -2078,6 +2329,6 @@ function isTransientCreateFailure(error: unknown): boolean {
 	return code === "terminal_uncertain" || code === "uncertain_after_send" || code === "spawn_failed";
 }
 
-function sessionCreateRef(instanceId: string, originKey: string, epoch: number, repo: string): string {
+export function sessionCreateRef(instanceId: string, originKey: string, epoch: number, repo: string): string {
 	return `gw-bind-${createHash("sha256").update(`${instanceId}|${originKey}|${epoch}|${repo}`).digest("hex").slice(0, 32)}`;
 }

@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rename, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -85,8 +85,32 @@ async function fixture() {
 	};
 	const db = await GatewayDatabase.open(config.dbPath);
 	let onSteer: ScriptedSessionPort["onSteer"];
+	const nativeBindings = new Map<string, { sessionId: string; executionCwd: string }>();
 	const port = new ScriptedSessionPort({
 		sessionIdForBind: () => crypto.randomUUID(),
+		onBind: async (input) => {
+			const managed = input.managedWorktree;
+			if (!managed) return crypto.randomUUID();
+			const existing = nativeBindings.get(managed.idempotencyKey);
+			if (existing) return existing;
+			if (managed.lookupOnly) throw new Error("original native allocation unavailable");
+			const primary = join(directory, "workspace");
+			await writeFile(join(primary, ".gitignore"), "/.worktrees\n");
+			const binding = {
+				sessionId: crypto.randomUUID(),
+				executionCwd: join(primary, ".worktrees", managed.idempotencyKey),
+			};
+			const result = Bun.spawnSync(
+				["git", "-C", primary, "worktree", "add", "--detach", binding.executionCwd, "HEAD"],
+				{
+					stdout: "pipe",
+					stderr: "pipe",
+				},
+			);
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			nativeBindings.set(managed.idempotencyKey, binding);
+			return binding;
+		},
 		onSteer: (input, port) => onSteer?.(input, port),
 	});
 	attachTestBrokerOwnership(db, port, join(directory, "agent"));
@@ -853,6 +877,7 @@ for (const change of ["coordinator_config", "worktree"] as const)
 		await f.bind();
 		await f.confirm();
 		const original = f.db.workTaskGet(taskId)!;
+		const executionCwd = f.db.workAttemptGet(original.opRef)!.cwd;
 		const selected = await corruptAndRecover(f, original.opRef);
 		const request = {
 			...publicDisposition(selected.basis, "report", `cli:negative-${change}`),
@@ -873,8 +898,8 @@ for (const change of ["coordinator_config", "worktree"] as const)
 					async <T>(key: string, work: () => Promise<T>): Promise<T> => {
 						if (!drifted && key === `work/task/${original.laneName}`) {
 							drifted = true;
-							await rename(worker, join(f.directory, "moved-negative-worker"));
-							await mkdir(worker);
+							await rename(executionCwd, join(f.directory, "moved-negative-worker"));
+							await mkdir(executionCwd);
 						}
 						return exclusive(key, work);
 					},
@@ -1497,7 +1522,8 @@ test("actual CLI disposition revalidates original mutation worktree inside lane 
 		clientRef: control.clientRef,
 	});
 	const before = f.db.workTaskGet(taskId)!;
-	const proof = f.db.workTaskSourceGet(`worktree-admission-${taskId}`);
+	const proof = f.db.workTaskSourceGet(`native-allocation-result-${taskId}`);
+	expect(proof).toBeDefined();
 	// Drift after the public call has queued, before its exclusive admission callback.
 	const exclusive = f.port.runExclusive.bind(f.port);
 	let drifted = false;
@@ -1516,7 +1542,7 @@ test("actual CLI disposition revalidates original mutation worktree inside lane 
 		expect(drifted).toBe(true);
 		expect(f.db.workTaskGet(taskId)).toEqual(before);
 		expect(f.db.workControlGet(control.controlId)).toEqual(control);
-		expect(f.db.workTaskSourceGet(`worktree-admission-${taskId}`)).toEqual(proof);
+		expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toEqual(proof);
 		const sourceId = workTaskDispositionId(taskId, request.eventId, LOOPBACK_ORIGIN);
 		expect(f.db.workTaskSourceGet(sourceId)).toBeUndefined();
 		expect(f.db.deliveryGet(workTaskSourceDeliveryId(taskId, sourceId, thread))).toBeUndefined();

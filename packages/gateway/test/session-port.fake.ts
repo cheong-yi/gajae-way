@@ -57,7 +57,8 @@ export function attachTestBrokerOwnership<T extends SessionPort>(
 	port.bind = async (input) => {
 		database.assertBrokerAuthority(authority);
 		const binding = await bind(input);
-		if (binding.originKey !== input.originKey || binding.repo !== input.repo || binding.epoch !== input.epoch)
+		const expectedRepo = input.managedWorktree ? binding.executionCwd : input.repo;
+		if (binding.originKey !== input.originKey || binding.repo !== expectedRepo || binding.epoch !== input.epoch)
 			throw new Error("test session binding does not match its creation request");
 		if (!database.recordOwnedBinding({ ...binding, authority }))
 			throw new Error("test session binding lost to a durable epoch change");
@@ -153,12 +154,20 @@ export class ScriptedSessionPort implements SessionPort {
 	/** Relay that submitted each op (undefined: a throwaway send relay, so nobody observes the content). */
 	readonly #owner = new Map<string, ScriptedTailHandle | undefined>();
 	readonly #chains = new Map<string, Promise<void>>();
+	/** Managed allocations keyed by their persisted original idempotency key, like broker idempotent creates. */
+	readonly #managedSessions = new Map<
+		string,
+		{ readonly sessionId: string; readonly executionCwd: string; readonly target: string }
+	>();
 	readonly onSend?: (input: SessionSendInput, port: ScriptedSessionPort) => void | Promise<void>;
 	readonly onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
 	readonly #onBind:
 		| ((
 				input: SessionBindInput,
-		  ) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>)
+		  ) =>
+				| string
+				| { readonly sessionId: string; readonly executionCwd?: string }
+				| Promise<string | { readonly sessionId: string; readonly executionCwd?: string }>)
 		| undefined;
 	readonly #sessionIdForBind: ((input: SessionBindInput) => string) | undefined;
 
@@ -168,7 +177,10 @@ export class ScriptedSessionPort implements SessionPort {
 			onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
 			onBind?: (
 				input: SessionBindInput,
-			) => string | { readonly sessionId: string } | Promise<string | { readonly sessionId: string }>;
+			) =>
+				| string
+				| { readonly sessionId: string; readonly executionCwd?: string }
+				| Promise<string | { readonly sessionId: string; readonly executionCwd?: string }>;
 			sessionIdForBind?: (input: SessionBindInput) => string;
 		} = {},
 	) {
@@ -180,6 +192,12 @@ export class ScriptedSessionPort implements SessionPort {
 
 	async bind(input: SessionBindInput): Promise<SessionBinding> {
 		this.binds.push(input);
+		const managed = input.managedWorktree;
+		const existing = managed ? this.#managedSessions.get(managed.idempotencyKey) : undefined;
+		if (managed?.lookupOnly && !existing)
+			throw new Error(`scripted managed lookup found no session for ${managed.idempotencyKey}`);
+		if (managed && existing && existing.target !== JSON.stringify(managed.createTarget))
+			throw new Error("scripted managed target conflict");
 		const cacheKey = this.#onBind ? `${input.originKey}#${input.epoch}` : input.originKey;
 		const supplied = await this.#onBind?.(input);
 		const sessionId =
@@ -188,6 +206,30 @@ export class ScriptedSessionPort implements SessionPort {
 			this.#sessionIdForBind?.(input) ??
 			`session-${this.#sessions.size + 1}`;
 		this.#sessions.set(cacheKey, sessionId);
+		if (managed) {
+			// Tests supply an independently allocated checkout, never the source
+			// cwd disguised as a native execution result.
+			const executionCwd = existing?.executionCwd ?? (typeof supplied === "object" ? supplied.executionCwd : undefined);
+			if (!executionCwd) throw new Error("scripted managed create requires an execution cwd fixture");
+			const identity = existing ?? { sessionId, executionCwd, target: JSON.stringify(managed.createTarget) };
+			this.#managedSessions.set(managed.idempotencyKey, identity);
+			this.#sessionStates.set(identity.sessionId, {
+				sessionId: identity.sessionId,
+				repo: identity.executionCwd,
+				live: true,
+				deleted: false,
+			});
+			// Admission gate before any ownership record: a throw holds the bind.
+			managed.validateResult({ sessionId: identity.sessionId, cwd: identity.executionCwd });
+			return {
+				sessionId: identity.sessionId,
+				originKey: input.originKey,
+				epoch: input.epoch,
+				repo: identity.executionCwd,
+				executionCwd: identity.executionCwd,
+				...(managed.createTarget.modelId || managed.createTarget.modelPreset ? { startupModelApplied: true } : {}),
+			};
+		}
 		this.#sessionStates.set(sessionId, {
 			sessionId,
 			repo: input.repo,

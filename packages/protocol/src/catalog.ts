@@ -683,6 +683,38 @@ export type WorkTaskSurfaceProjection =
 	| { readonly phase: "bound"; readonly origin: WorkTaskThreadOrigin; readonly claimId?: string }
 	| { readonly phase: "held"; readonly reason: string; readonly claimId?: string };
 
+export const WORK_TASK_CODING_COMPLETION_PENDING_REASONS = [
+	"report_not_admitted",
+	"terminal_uncertain",
+	"administrative_unresolved",
+	"evidence_missing",
+	"evidence_incomplete",
+	"target_missing",
+	"approval_missing",
+	"approval_unstructured",
+	"approval_provenance",
+	"approval_mismatch",
+	"verification_unstructured",
+	"serialization_unstructured",
+	"serialization_mismatch",
+	"repository_mismatch",
+	"verification_incomplete",
+	"conflicts",
+	"failed_checks",
+	"mismatch",
+	"owner_question",
+] as const;
+export type WorkTaskCodingCompletionPendingReason = (typeof WORK_TASK_CODING_COMPLETION_PENDING_REASONS)[number];
+
+/**
+ * Separate coding closeout projection. `final_admitted` still means ORIGINAL
+ * REPORT admission; this state admits retained closeout evidence only.
+ */
+export interface WorkTaskCodingCompletion {
+	/** Evidence admission only; never independent proof that integration ran. */
+	readonly state: "evidence_admitted" | "pending" | "not_applicable";
+	readonly pendingReasons: readonly WorkTaskCodingCompletionPendingReason[];
+}
 export interface WorkTaskProjection {
 	/** Task-aware status only; durable snapshot, never SDK proof or action permission. */
 	readonly dispositionBasis?: WorkTaskDispositionBasis;
@@ -702,6 +734,8 @@ export interface WorkTaskProjection {
 		readonly disposition: "pending" | "admitted" | "held";
 		readonly reason?: string;
 	};
+	/** Coding closeout evidence admission only; never independent proof that integration ran. */
+	readonly codingCompletion?: WorkTaskCodingCompletion;
 }
 
 /** A committed control projection. PromptStatusBody cannot prove this receipt. */
@@ -1031,6 +1065,96 @@ export interface WorkTaskSourceReadResult {
 	};
 }
 
+/** Bounded check list a closeout verification claim must enumerate completely. */
+export const WORK_TASK_CLOSEOUT_MAX_CHECKS = 32;
+
+/** Exact retained identity of a source record; never its content. */
+export interface WorkTaskSourceReference {
+	readonly sourceId: string;
+	/** sha256 over the complete retained source record. */
+	readonly contentHash: string;
+}
+
+/**
+ * The exact structured owner instruction retained as an existing authenticated
+ * instruction source, bound to the reviewed original, report, repository and
+ * exact worker result. A reviewer disposition or prose inference never qualifies.
+ */
+export interface WorkTaskOwnerApproval {
+	readonly kind: "work_task_closeout_approval";
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly action: "integrate";
+	readonly repository: { readonly commonDir: string };
+	/** This authenticated approval establishes the per-task target; no target is inferred from a reviewer or global default. */
+	readonly target: { readonly ref: string; readonly baseCommit: string; readonly resultCommit: string };
+	/** Exact worker result the owner approved: base, worker commit and diff. */
+	readonly result: { readonly baseCommit: string; readonly commit: string; readonly diffHash: string };
+	/** Reviewed original source, its hash and the bound report of the enclosing review. */
+	readonly reviewed: { readonly sourceId: string; readonly contentHash: string; readonly reportId: string };
+	/** Owner acceptance of the exact combined checks and integration ownership evidence. */
+	readonly verification: WorkTaskSourceReference;
+	readonly serialization: WorkTaskSourceReference;
+	/** Explicit owner decisions; answer text alone never resolves a retained question. */
+	readonly answers: readonly (WorkTaskSourceReference & {
+		readonly reviewId: string;
+		readonly answer: string;
+		readonly resolution: "resolved" | "unresolved";
+	})[];
+}
+
+/** Retained combined verification; a source reference alone never proves claimed check fields. */
+export interface WorkTaskCloseoutVerificationStatement {
+	readonly kind: "work_task_closeout_verification";
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly repository: { readonly commonDir: string };
+	readonly target: { readonly ref: string; readonly baseCommit: string; readonly resultCommit: string };
+	/** Exact worker result, distinct from the integrated target result. */
+	readonly result: { readonly baseCommit: string; readonly commit: string; readonly diffHash: string };
+	readonly resultingCommit: string;
+	readonly checks: readonly { readonly name: string; readonly outcome: "pass" | "fail" }[];
+	readonly conflicts: "none" | "detected";
+}
+
+/** Retained integration serialization; an ordinary control sequence alone is never serialization. */
+export interface WorkTaskCloseoutSerializationStatement {
+	readonly kind: "work_task_closeout_serialization";
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly repository: { readonly commonDir: string };
+	readonly target: { readonly ref: string; readonly baseCommit: string; readonly resultCommit: string };
+	/** Explicit authenticated owner of the serialized integration slot. */
+	readonly integrationOwner: string;
+	readonly order: {
+		readonly baseCommit: string;
+		readonly resultCommit: string;
+	};
+}
+
+/**
+ * Typed coding closeout evidence carried optionally on a review. Task, opRef,
+ * report and reviewed source hash bind through the enclosing review only.
+ * Submission admits evidence; it never executes or independently proves integration.
+ */
+export interface WorkTaskCloseoutEvidence {
+	/** Canonical repository common directory of the reviewed checkout. */
+	readonly repository: { readonly commonDir: string };
+	readonly result: { readonly baseCommit: string; readonly commit: string; readonly diffHash: string };
+	readonly target: { readonly ref: string; readonly baseCommit: string; readonly resultCommit: string };
+	/** Retained record proving serialized integration ownership and order. */
+	readonly serialization: WorkTaskSourceReference & { readonly controlId: string; readonly sequence: number };
+	/** Retained record for the combined verification of the exact resulting identity. */
+	readonly verification: WorkTaskSourceReference & {
+		readonly resultingCommit: string;
+		readonly checks: readonly { readonly name: string; readonly outcome: "pass" | "fail" }[];
+		readonly conflicts: "none" | "detected";
+	};
+	/** Latest authenticated closeout instruction in retained owner-control order; older approvals cannot supersede it. */
+	readonly ownerApproval: WorkTaskSourceReference;
+	readonly action: "integrate";
+}
+
 /** An agent judgment about an exact retained original; never owner authorization. */
 export interface WorkTaskReviewParams {
 	readonly taskId: string;
@@ -1046,6 +1170,8 @@ export interface WorkTaskReviewParams {
 	readonly disposition: "no_exception" | "owner_question";
 	readonly rationale: string;
 	readonly question?: string;
+	/** Optional coding closeout evidence; report admission and review CAS are unchanged. */
+	readonly closeout?: WorkTaskCloseoutEvidence;
 }
 
 export interface WorkTaskReviewResult {
@@ -1602,6 +1728,260 @@ export function validateWorkTaskSourceReadParams(value: unknown): WorkTaskSource
 	};
 }
 
+function closeoutCommit(value: unknown, field: string): string {
+	const commit = taskText(value, field, 64);
+	if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit))
+		throw new ProtocolError("invalid_params", `${field} must be a full lowercase commit id`);
+	return commit;
+}
+
+function closeoutDigest(value: unknown, field: string): string {
+	const digest = taskText(value, field, 64);
+	if (!/^[0-9a-f]{64}$/.test(digest)) throw new ProtocolError("invalid_params", `${field} must be a sha256 hex digest`);
+	return digest;
+}
+
+function closeoutPath(value: unknown, field: string): string {
+	const path = taskText(value, field, 4096);
+	if (
+		!path.startsWith("/") ||
+		(path !== "/" &&
+			(path.endsWith("/") ||
+				path
+					.split("/")
+					.slice(1)
+					.some((part) => part === "" || part === "." || part === "..")))
+	)
+		throw new ProtocolError("invalid_params", `${field} must be canonical absolute path`);
+	return path;
+}
+
+function closeoutRef(value: unknown): string {
+	const ref = taskText(value, "target ref", 256);
+	if (
+		!ref.startsWith("refs/") ||
+		ref.split("/").some((part) => part.startsWith(".") || part.endsWith(".lock")) ||
+		ref.endsWith("/") ||
+		ref.endsWith(".") ||
+		ref.endsWith(".lock") ||
+		ref.includes("..") ||
+		ref.includes("@{") ||
+		ref.includes("//") ||
+		/[\s~^:?*[\\]/.test(ref)
+	)
+		throw new ProtocolError("invalid_params", "fully qualified target ref required");
+	return ref;
+}
+
+function closeoutTarget(value: unknown): WorkTaskCloseoutEvidence["target"] {
+	const input = taskRecord(value, ["ref", "baseCommit", "resultCommit"]);
+	return {
+		ref: closeoutRef(input.ref),
+		baseCommit: closeoutCommit(input.baseCommit, "baseCommit"),
+		resultCommit: closeoutCommit(input.resultCommit, "resultCommit"),
+	};
+}
+
+function closeoutResult(value: unknown): WorkTaskCloseoutEvidence["result"] {
+	const input = taskRecord(value, ["baseCommit", "commit", "diffHash"]);
+	return {
+		baseCommit: closeoutCommit(input.baseCommit, "baseCommit"),
+		commit: closeoutCommit(input.commit, "commit"),
+		diffHash: closeoutDigest(input.diffHash, "diffHash"),
+	};
+}
+
+function closeoutReference(value: unknown): WorkTaskSourceReference {
+	const input = taskRecord(value, ["sourceId", "contentHash"]);
+	return {
+		sourceId: taskText(input.sourceId, "sourceId", 1024),
+		contentHash: closeoutDigest(input.contentHash, "contentHash"),
+	};
+}
+
+function closeoutRepository(value: unknown): { readonly commonDir: string } {
+	const input = taskRecord(value, ["commonDir"]);
+	return { commonDir: closeoutPath(input.commonDir, "commonDir") };
+}
+
+function closeoutConflicts(value: unknown): "none" | "detected" {
+	if (value !== "none" && value !== "detected") throw new ProtocolError("invalid_params", "invalid closeout conflicts");
+	return value === "none" ? ("none" as const) : ("detected" as const);
+}
+
+function closeoutChecks(value: unknown): readonly { readonly name: string; readonly outcome: "pass" | "fail" }[] {
+	if (!Array.isArray(value) || value.length === 0 || value.length > WORK_TASK_CLOSEOUT_MAX_CHECKS)
+		throw new ProtocolError("invalid_params", "closeout verification requires a bounded complete check list");
+	const checks = value.map((entry: unknown) => {
+		const check = taskRecord(entry, ["name", "outcome"]);
+		if (check.outcome !== "pass" && check.outcome !== "fail")
+			throw new ProtocolError("invalid_params", "invalid closeout check outcome");
+		return {
+			name: taskText(check.name, "check name", 128),
+			outcome: check.outcome === "pass" ? ("pass" as const) : ("fail" as const),
+		};
+	});
+	if (new Set(checks.map((check) => check.name)).size !== checks.length)
+		throw new ProtocolError("invalid_params", "duplicate closeout check name");
+	return checks;
+}
+
+/** The exact structured owner instruction body; prose or a reviewer boolean never validates. */
+export function validateWorkTaskOwnerApproval(value: unknown): WorkTaskOwnerApproval {
+	const input = taskRecord(value, [
+		"kind",
+		"taskId",
+		"opRef",
+		"action",
+		"repository",
+		"target",
+		"result",
+		"reviewed",
+		"verification",
+		"serialization",
+		"answers",
+	]);
+	if (input.kind !== "work_task_closeout_approval")
+		throw new ProtocolError("invalid_params", "owner approval statement kind required");
+	if (input.action !== "integrate") throw new ProtocolError("invalid_params", "owner approval action required");
+	const result = taskRecord(input.result, ["baseCommit", "commit", "diffHash"]);
+	const reviewed = taskRecord(input.reviewed, ["sourceId", "contentHash", "reportId"]);
+	if (!Array.isArray(input.answers) || input.answers.length > 32)
+		throw new ProtocolError("invalid_params", "bounded explicit owner answers required");
+	const answers = input.answers.map((value: unknown) => {
+		const answer = taskRecord(value, ["sourceId", "contentHash", "reviewId", "answer", "resolution"]);
+		if (answer.resolution !== "resolved" && answer.resolution !== "unresolved")
+			throw new ProtocolError("invalid_params", "explicit owner resolution required");
+		return {
+			...closeoutReference({ sourceId: answer.sourceId, contentHash: answer.contentHash }),
+			reviewId: taskUuid(answer.reviewId, "reviewId"),
+			answer: taskText(answer.answer, "answer", 2048),
+			resolution: answer.resolution === "resolved" ? ("resolved" as const) : ("unresolved" as const),
+		};
+	});
+	if (new Set(answers.map((answer) => answer.reviewId)).size !== answers.length)
+		throw new ProtocolError("invalid_params", "duplicate owner answer");
+	return {
+		kind: "work_task_closeout_approval",
+		taskId: taskUuid(input.taskId, "taskId"),
+		opRef: taskOpRef(input.opRef),
+		action: "integrate",
+		repository: closeoutRepository(input.repository),
+		target: closeoutTarget(input.target),
+		result: {
+			baseCommit: closeoutCommit(result.baseCommit, "baseCommit"),
+			commit: closeoutCommit(result.commit, "commit"),
+			diffHash: closeoutDigest(result.diffHash, "diffHash"),
+		},
+		reviewed: {
+			sourceId: taskText(reviewed.sourceId, "sourceId", 1024),
+			contentHash: closeoutDigest(reviewed.contentHash, "contentHash"),
+			reportId: taskText(reviewed.reportId, "reportId", 1024),
+		},
+		verification: closeoutReference(input.verification),
+		serialization: closeoutReference(input.serialization),
+		answers,
+	};
+}
+
+/** Retained combined verification statement; a bare source reference never proves check fields. */
+export function validateWorkTaskCloseoutVerificationStatement(value: unknown): WorkTaskCloseoutVerificationStatement {
+	const input = taskRecord(value, [
+		"kind",
+		"taskId",
+		"opRef",
+		"repository",
+		"target",
+		"result",
+		"resultingCommit",
+		"checks",
+		"conflicts",
+	]);
+	if (input.kind !== "work_task_closeout_verification")
+		throw new ProtocolError("invalid_params", "verification statement kind required");
+	return {
+		kind: "work_task_closeout_verification",
+		taskId: taskUuid(input.taskId, "taskId"),
+		opRef: taskOpRef(input.opRef),
+		repository: closeoutRepository(input.repository),
+		target: closeoutTarget(input.target),
+		result: closeoutResult(input.result),
+		resultingCommit: closeoutCommit(input.resultingCommit, "resultingCommit"),
+		checks: closeoutChecks(input.checks),
+		conflicts: closeoutConflicts(input.conflicts),
+	};
+}
+
+/** Retained integration serialization statement; an ordinary control sequence alone never qualifies. */
+export function validateWorkTaskCloseoutSerializationStatement(value: unknown): WorkTaskCloseoutSerializationStatement {
+	const input = taskRecord(value, ["kind", "taskId", "opRef", "repository", "target", "integrationOwner", "order"]);
+	if (input.kind !== "work_task_closeout_serialization")
+		throw new ProtocolError("invalid_params", "serialization statement kind required");
+	const order = taskRecord(input.order, ["baseCommit", "resultCommit"]);
+	return {
+		kind: "work_task_closeout_serialization",
+		taskId: taskUuid(input.taskId, "taskId"),
+		opRef: taskOpRef(input.opRef),
+		repository: closeoutRepository(input.repository),
+		target: closeoutTarget(input.target),
+		integrationOwner: taskText(input.integrationOwner, "integrationOwner", 1024),
+		order: {
+			baseCommit: closeoutCommit(order.baseCommit, "baseCommit"),
+			resultCommit: closeoutCommit(order.resultCommit, "resultCommit"),
+		},
+	};
+}
+
+export function validateWorkTaskCloseoutEvidence(value: unknown): WorkTaskCloseoutEvidence {
+	const input = taskRecord(value, [
+		"repository",
+		"result",
+		"target",
+		"serialization",
+		"verification",
+		"ownerApproval",
+		"action",
+	]);
+	if (input.action !== "integrate") throw new ProtocolError("invalid_params", "closeout action required");
+	const repository = taskRecord(input.repository, ["commonDir"]);
+	const serialization = taskRecord(input.serialization, ["sourceId", "contentHash", "controlId", "sequence"]);
+	const verification = taskRecord(input.verification, [
+		"sourceId",
+		"contentHash",
+		"resultingCommit",
+		"checks",
+		"conflicts",
+	]);
+	if (
+		!Number.isSafeInteger(serialization.sequence) ||
+		(serialization.sequence as number) < 0 ||
+		serialization.sequence === Number.MAX_SAFE_INTEGER
+	)
+		throw new ProtocolError("invalid_params", "invalid serialization sequence");
+	const conflicts = closeoutConflicts(verification.conflicts);
+	const checks = closeoutChecks(verification.checks);
+	return {
+		repository: { commonDir: closeoutPath(repository.commonDir, "commonDir") },
+		result: closeoutResult(input.result),
+		target: closeoutTarget(input.target),
+		serialization: {
+			sourceId: taskText(serialization.sourceId, "sourceId", 1024),
+			contentHash: closeoutDigest(serialization.contentHash, "contentHash"),
+			controlId: taskText(serialization.controlId, "controlId", 1024),
+			sequence: serialization.sequence as number,
+		},
+		verification: {
+			sourceId: taskText(verification.sourceId, "sourceId", 1024),
+			contentHash: closeoutDigest(verification.contentHash, "contentHash"),
+			resultingCommit: closeoutCommit(verification.resultingCommit, "resultingCommit"),
+			checks,
+			conflicts,
+		},
+		ownerApproval: closeoutReference(input.ownerApproval),
+		action: "integrate",
+	};
+}
+
 export function validateWorkTaskReviewParams(value: unknown): WorkTaskReviewParams {
 	const input = taskRecord(value, [
 		"taskId",
@@ -1617,6 +1997,7 @@ export function validateWorkTaskReviewParams(value: unknown): WorkTaskReviewPara
 		"disposition",
 		"rationale",
 		"question",
+		"closeout",
 	]);
 	const source = validateWorkTaskSourceReadParams({
 		mode: "source",
@@ -1644,6 +2025,7 @@ export function validateWorkTaskReviewParams(value: unknown): WorkTaskReviewPara
 		disposition: input.disposition,
 		rationale: taskText(input.rationale, "rationale", 2048),
 		...("question" in input ? { question: taskText(input.question, "question", 2048) } : {}),
+		...("closeout" in input ? { closeout: validateWorkTaskCloseoutEvidence(input.closeout) } : {}),
 	};
 }
 

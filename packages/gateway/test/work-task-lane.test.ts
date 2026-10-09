@@ -1,13 +1,22 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import { closeAttempt, createLaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
-import type { SessionPort, SessionSteerStatusInput, SessionSteerStatusResult } from "../src/orchestrator/session-port";
+import {
+	SESSION_CREATE_READINESS_MS,
+	sessionCreateRef,
+	type SessionBindInput,
+	type SessionPort,
+	type SessionSteerStatusInput,
+	type SessionSteerStatusResult,
+} from "../src/orchestrator/session-port";
 import { type MappedWorkEvent, WorkLaneManager, type WorkLaneManagerOptions } from "../src/orchestrator/work-lane";
+import { admitDedicatedWorktree, assertManagedWorktreeIgnored } from "../src/orchestrator/worktree-admission";
 import { buildWorkTaskContext, buildWorkTaskReviewTurnContext } from "../src/server/work-task-context";
 import { GatewayDatabase } from "../src/store/db";
 import { attachTestBrokerOwnership, ScriptedSessionPort, steerRefused } from "./session-port.fake";
@@ -54,12 +63,32 @@ async function fixture(
 ) {
 	const directory = await mkdtemp(join(tmpdir(), "firstmate-lane-"));
 	const db = await GatewayDatabase.open(join(directory, "gateway.db"));
+	/** Native managed-allocation fixture state: one original result per persisted idempotency key. */
+	const native = {
+		allocations: new Map<string, { readonly sessionId: string; readonly executionCwd: string }>(),
+		/** Simulates a failed/uncertain create before any checkout is allocated. */
+		failCreate: false,
+		/** Returns an arbitrary SDK execution identity instead of allocating the default nested checkout. */
+		override: undefined as undefined | ((input: SessionBindInput) => string),
+	};
 	const port = new TaskPort({
 		...portOptions,
-		onBind: (input) => {
+		onBind: async (input) => {
 			const sessionId = db.getSessionRecord(input.originKey)?.sessionId ?? crypto.randomUUID();
 			if (!owned) db.putSession(input.originKey, sessionId);
-			return sessionId;
+			const managed = input.managedWorktree;
+			if (!managed) return sessionId;
+			const original = native.allocations.get(managed.idempotencyKey);
+			// Lookup-only (or a repeated create attempt) recovers the original result; it never allocates again.
+			if (original) return original;
+			if (managed.lookupOnly) return sessionId;
+			if (native.failCreate) throw new Error("uncertain native create outcome");
+			const executionCwd = native.override
+				? native.override(input)
+				: allocateNativeCheckout(input.repo, managed.idempotencyKey);
+			const identity = { sessionId, executionCwd };
+			native.allocations.set(managed.idempotencyKey, identity);
+			return identity;
 		},
 	});
 	if (owned) {
@@ -93,6 +122,7 @@ async function fixture(
 		port,
 		lanes,
 		input,
+		native,
 		get manager() {
 			return manager;
 		},
@@ -140,6 +170,57 @@ function event(eventId = "event-1", extra: Partial<MappedWorkEvent> = {}): Mappe
 
 function executionSources(db: GatewayDatabase) {
 	return db.workTaskSources(taskId)!.sources.filter((source) => source.sourceId.startsWith("execution-"));
+}
+function runGit(cwd: string, ...args: string[]): string {
+	const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+	return result.stdout.toString().trim();
+}
+function gitExitCode(cwd: string, ...args: string[]): number {
+	return Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }).exitCode;
+}
+/** A fixture repository ignoring GJC's default `/.worktrees` nested checkout bucket. */
+async function initRepo(directory: string): Promise<void> {
+	await mkdir(directory, { recursive: true });
+	runGit(directory, "init");
+	await writeFile(join(directory, ".gitignore"), ".worktrees/\n");
+	runGit(directory, "add", ".gitignore");
+	runGit(directory, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture");
+}
+async function directoryExists(path: string): Promise<boolean> {
+	try {
+		await readdir(path);
+		return true;
+	} catch {
+		return false;
+	}
+}
+/**
+ * The SDK's native default: a distinct real registered linked checkout under
+ * `<source>/.worktrees`, with `/.worktrees` ignored inside the source checkout.
+ */
+function allocateNativeCheckout(source: string, idempotencyKey: string): string {
+	const root = realpathSync(source);
+	const ignorePath = join(root, ".gitignore");
+	let ignore = "";
+	try {
+		ignore = readFileSync(ignorePath, "utf8");
+	} catch {
+		/* A source checkout without an ignore file gets one. */
+	}
+	if (!ignore.split("\n").some((line) => line.trim() === ".worktrees/"))
+		writeFileSync(
+			ignorePath,
+			ignore === "" || ignore.endsWith("\n") ? `${ignore}.worktrees/\n` : `${ignore}\n.worktrees/\n`,
+		);
+	const checkout = join(root, ".worktrees", idempotencyKey);
+	const result = Bun.spawnSync(["git", "-C", root, "worktree", "add", checkout], {
+		stdout: "pipe",
+		stderr: "pipe",
+		env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+	});
+	if (result.exitCode !== 0) throw new Error(`fixture native checkout failed: ${result.stderr.toString()}`);
+	return checkout;
 }
 
 for (const availability of ["healthy", "held", "absent"] as const)
@@ -1718,7 +1799,25 @@ for (const kind of ["read_only", "code_mutating"] as const)
 		coordinatorCwd = primary;
 		await f.manager.start({ ...f.input, cwd: worker, task: { ...f.input.task, kind } }, context);
 		await f.bind();
-		expect(f.port.sends[0]?.repo).toBe(worker);
+		const executionCwd =
+			kind === "code_mutating"
+				? (JSON.parse(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)!.body).executionCwd as string)
+				: worker;
+		// Read-only tasks still dispatch on the immutable assignment cwd; a code
+		// task dispatches on the distinct checkout the SDK returned natively.
+		expect(f.port.sends[0]?.repo).toBe(executionCwd);
+		if (kind === "code_mutating") {
+			const allocationRequest = JSON.parse(f.db.workTaskSourceGet(`native-allocation-request-${taskId}`)!.body);
+			expect(executionCwd).toBe(join(realpathSync(worker), ".worktrees", allocationRequest.requestKey));
+			expect(allocationRequest.source.base).toBe(allocationRequest.source.head);
+			expect(f.db.workTaskGet(taskId)?.request.cwd).toBe(worker);
+			expect(f.port.binds[0]?.repo).toBe(worker);
+			expect(f.port.binds[0]?.epoch).toBe(allocationRequest.epoch);
+			expect(f.port.binds[0]?.managedWorktree).toMatchObject({
+				idempotencyKey: allocationRequest.requestKey,
+				lookupOnly: false,
+			});
+		}
 		const append = f.db.workTaskSourceAppendInTransaction.bind(f.db);
 		const rollback = spyOn(f.db, "workTaskSourceAppendInTransaction").mockImplementation((input, delivery) => {
 			if (input.sourceId.startsWith("scope-control-")) throw new Error("scope proof failed");
@@ -1796,6 +1895,527 @@ test("unfenced mutation admission never creates a worker or authorizes thread cr
 	await expect(f.manager.threadClaim({ taskId, claimId })).rejects.toThrow();
 	expect(f.port.binds).toHaveLength(0);
 	expect(f.port.sends).toHaveLength(0);
+});
+
+for (const invalid of ["key", "target", "initial-prompt", "provenance"] as const)
+	test(`invalid persisted native ${invalid} fails before claim and permits only a restored original create`, async () => {
+		let coordinatorCwd = "";
+		const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+		const primary = join(f.directory, "primary");
+		await initRepo(primary);
+		coordinatorCwd = primary;
+		await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context);
+		const authorization = f.db.workTaskSourceGet(`native-allocation-request-${taskId}`)!;
+		const raw = new Database(join(f.directory, "gateway.db"));
+		const replace = (body: string, principalId = authorization.evidence.principalId) => {
+			raw.query("DELETE FROM work_task_sources WHERE source_id = ?").run(authorization.sourceId);
+			f.db.withTransaction(() =>
+				f.db.workTaskSourceAppendInTransaction({
+					sourceId: authorization.sourceId,
+					taskId,
+					kind: "decision",
+					body,
+					evidence: { ...authorization.evidence, principalId },
+					supersedes: null,
+					completeness: "complete",
+					controlId: null,
+					reportId: null,
+				}),
+			);
+		};
+		try {
+			const wrong = JSON.parse(authorization.body);
+			if (invalid === "key") wrong.requestKey = "";
+			if (invalid === "target") wrong.target.readinessTimeoutMs = -1;
+			if (invalid === "initial-prompt") wrong.target.body = "Mutate before task admission.";
+			replace(JSON.stringify(wrong), invalid === "provenance" ? "coordinator:forged" : undefined);
+			await expect(f.bind()).rejects.toThrow("native_allocation_authorization");
+			expect(f.port.binds).toHaveLength(0);
+			expect(f.port.sends).toHaveLength(0);
+			expect(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)).toBeUndefined();
+			replace(authorization.body);
+		} finally {
+			raw.close();
+		}
+		await f.restart();
+		expect(f.port.binds).toHaveLength(0);
+		// Invalid authorization was rejected before even claiming the surface.
+		// Restore the original binding, not a replacement native identity.
+		await f.bind();
+		expect(f.port.binds).toHaveLength(1);
+		expect(f.port.binds[0]!.managedWorktree).toMatchObject({
+			idempotencyKey: JSON.parse(authorization.body).requestKey,
+			createTarget: JSON.parse(authorization.body).target,
+			lookupOnly: false,
+		});
+		expect(f.port.sends).toHaveLength(1);
+	});
+
+test("known-unsent capacity refusal leaves original native create permission available", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+	const primary = join(f.directory, "primary");
+	await initRepo(primary);
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	const admission = spyOn(f.lanes, "assertAdmission").mockImplementation(() => {
+		throw new Error("capacity_full");
+	});
+	try {
+		await expect(f.bind()).rejects.toThrow("capacity_full");
+		expect(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)).toBeUndefined();
+		expect(f.port.binds).toHaveLength(0);
+	} finally {
+		admission.mockRestore();
+	}
+	await f.restart();
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.binds[0]!.managedWorktree?.lookupOnly).toBe(false);
+	expect(f.port.sends).toHaveLength(1);
+});
+
+test("source checkout replacement during native create cannot acquire task ownership", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+	const primary = join(f.directory, "primary");
+	const foreign = join(f.directory, "foreign");
+	const source = join(f.directory, "source");
+	await initRepo(primary);
+	await initRepo(foreign);
+	runGit(primary, "worktree", "add", "--detach", source, "HEAD");
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: source, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	f.native.override = (input) => {
+		const checkout = allocateNativeCheckout(primary, input.managedWorktree!.idempotencyKey);
+		runGit(primary, "worktree", "move", source, join(f.directory, "original-source"));
+		runGit(foreign, "worktree", "add", "--detach", source, "HEAD");
+		return checkout;
+	};
+	await expect(f.bind()).rejects.toThrow("source_checkout_identity_changed");
+	expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toBeUndefined();
+	expect(f.db.getSessionRecord(workSessionKey(name))).toBeUndefined();
+	expect(f.port.sends).toHaveLength(0);
+});
+
+test("missing claim with retained allocation evidence never permits another create on restart", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+	const primary = join(f.directory, "primary");
+	await initRepo(primary);
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	const bind = f.port.bind.bind(f.port);
+	const lost = spyOn(f.port, "bind").mockImplementationOnce(async (input) => {
+		await bind(input);
+		throw new Error("receipt_lost");
+	});
+	await expect(f.bind()).rejects.toThrow("native_allocation_unresolved");
+	lost.mockRestore();
+	const original = f.db.workTaskSourceGet(`native-allocation-result-${taskId}`);
+	const raw = new Database(join(f.directory, "gateway.db"));
+	try {
+		raw.query("DELETE FROM work_task_sources WHERE source_id = ?").run(`native-allocation-claimed-${taskId}`);
+	} finally {
+		raw.close();
+	}
+	await f.restart();
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(0);
+	expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toEqual(original);
+	expect(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)).toBeUndefined();
+	expect(await f.manager.status({ name, taskId })).toMatchObject({
+		state: "held",
+		task: { holdReason: "native_allocation_unresolved" },
+	});
+});
+
+test("nested native allocation succeeds under source/.worktrees and drives runtime, baseline, ownership and control", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+	const primary = join(f.directory, "primary");
+	await initRepo(primary);
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	await f.bind();
+	const task = f.db.workTaskGet(taskId)!;
+	const request = JSON.parse(f.db.workTaskSourceGet(`native-allocation-request-${taskId}`)!.body);
+	const claim = JSON.parse(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)!.body);
+	const allocation = JSON.parse(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)!.body);
+	const checkout = allocation.executionCwd as string;
+	expect(claim).toEqual({ requestKey: request.requestKey, opRef: task.opRef });
+	expect(checkout).toBe(join(realpathSync(primary), ".worktrees", request.requestKey));
+	expect(checkout).not.toBe(primary);
+	// A real registered linked checkout of the source repository at the retained primary base.
+	expect(runGit(primary, "worktree", "list", "--porcelain")).toContain(checkout);
+	expect(runGit(checkout, "rev-parse", "HEAD")).toBe(request.source.base);
+	// The assignment source stays immutable while the returned path drives execution.
+	expect(task.request.cwd).toBe(primary);
+	expect(f.port.binds[0]?.repo).toBe(primary);
+	expect(f.port.binds[0]?.epoch).toBe(request.epoch);
+	expect(f.port.binds[0]?.managedWorktree).toMatchObject({
+		idempotencyKey: request.requestKey,
+		lookupOnly: false,
+	});
+	expect(request.epoch).toBe(0);
+	expect(request.target).toMatchObject({ cwd: primary, worktree: { enabled: true } });
+	expect(request.target.readinessTimeoutMs).toBe(SESSION_CREATE_READINESS_MS);
+	expect(request.source.root).toBe(realpathSync(primary));
+	expect(request.source.base).toMatch(/^[0-9a-f]{40}$/);
+	expect(request.source.base).toBe(request.source.head);
+	// Returned identity drives the runtime, the lane baseline and the ownership binding.
+	expect(allocation.sessionId).toBe(task.sessionId);
+	expect(allocation.epoch).toBe(request.epoch);
+	expect(f.port.sends[0]).toMatchObject({ sessionId: task.sessionId!, repo: checkout });
+	const runtime = f.db.workAttemptGet(task.opRef)!;
+	expect(runtime.cwd).toBe(checkout);
+	const laneJob = JSON.parse(f.db.laneJobJsonByLaneKey(laneJobIdentity(name).laneKey)!);
+	expect(laneJob.lane).toMatchObject({ worktreePath: checkout, branch: request.requestKey });
+	expect(laneJob.baselineSha).toBe(request.source.base);
+	const authority = f.db.inspectBrokerAuthority().authority!;
+	const owned = f.db.assertOwnedSession(task.sessionId!, checkout, authority);
+	expect(owned.originKey).toBe(workSessionKey(name));
+	expect(f.db.getSessionRecord(workSessionKey(name))).toMatchObject({ sessionId: task.sessionId!, epoch: 0 });
+	// The control scope proof carries the returned execution path, not the source.
+	expect(await f.manager.admitMappedEvent(event("mutation", { scope: "code_mutating" }))).toMatchObject({
+		delivery: "accepted",
+	});
+	const control = f.db.workControlList(taskId)[0]!;
+	expect(control.request.scope).toBe("code_mutating");
+	expect(JSON.parse(f.db.workTaskSourceGet(`worktree-${control.controlId}`)!.body).cwd).toBe(checkout);
+	// Release assessment targets the returned path.
+	f.port.complete(task.opRef, "Original coding result");
+	await until(() => f.db.workAttemptGet(task.opRef)?.settledAt != null);
+	expect(f.manager.assessTaskRelease(name)).toMatchObject({ kind: "eligible", cwd: checkout });
+	// The nested bucket really is ignored in the primary — the check is not vacuous.
+	const proof = admitDedicatedWorktree(checkout, primary);
+	expect(proof.cwd).toBe(checkout);
+	assertManagedWorktreeIgnored(proof);
+	await rm(join(primary, ".gitignore"));
+	expect(() => assertManagedWorktreeIgnored(admitDedicatedWorktree(checkout, primary))).toThrow(
+		"managed_worktree_bucket_not_ignored",
+	);
+});
+
+test("original native request, key and epoch persist before any create and are reused verbatim", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd });
+	const primary = join(f.directory, "primary");
+	const worker = join(f.directory, "worker");
+	await initRepo(primary);
+	runGit(primary, "worktree", "add", "-b", "worker", worker);
+	coordinatorCwd = primary;
+	const admission = await f.manager.start(
+		{ ...f.input, cwd: worker, task: { ...f.input.task, kind: "code_mutating" } },
+		context,
+	);
+	expect(admission).toMatchObject({ accepted: "durable", execution: "pending_surface" });
+	// The original authorization is durable before any bind or create attempt.
+	expect(f.port.binds).toHaveLength(0);
+	const stored = f.db.workTaskSourceGet(`native-allocation-request-${taskId}`)!;
+	expect(stored).toMatchObject({ kind: "decision", completeness: "complete" });
+	const request = JSON.parse(stored.body);
+	expect(request.requestKey).toBe(sessionCreateRef(f.db.instanceId, workSessionKey(name), 0, worker));
+	expect(request.epoch).toBe(0);
+	expect(request.target).toMatchObject({
+		cwd: worker,
+		worktree: { enabled: true },
+		readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+	});
+	expect(request.source).toMatchObject({ root: realpathSync(worker), commonDir: realpathSync(join(primary, ".git")) });
+	expect(request.source.base).toBe(request.source.head);
+	await f.bind();
+	// The single create reuses the exact persisted key, epoch and provisioning input.
+	expect(f.port.binds).toHaveLength(1);
+	const binding = f.port.binds[0]!;
+	expect(binding.managedWorktree).toMatchObject({ idempotencyKey: request.requestKey, lookupOnly: false });
+	expect(binding.epoch).toBe(request.epoch);
+	expect(binding.repo).toBe(worker);
+	const claim = JSON.parse(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)!.body);
+	expect(claim).toEqual({ requestKey: request.requestKey, opRef: f.db.workTaskGet(taskId)!.opRef });
+	const allocation = JSON.parse(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)!.body);
+	expect(allocation.sessionId).toBe(f.port.sends[0]?.sessionId);
+	expect(allocation.epoch).toBe(request.epoch);
+	expect(allocation.executionCwd).not.toBe(worker);
+});
+
+for (const refusal of ["source", "coordinator", "foreign", "other-task"] as const)
+	test(`native ${refusal} checkout return is refused before any send, send authorization or owned binding`, async () => {
+		let coordinatorCwd = "";
+		const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+		const primary = join(f.directory, "primary");
+		const worker = join(f.directory, "worker");
+		await initRepo(primary);
+		runGit(primary, "worktree", "add", "-b", "worker", worker);
+		coordinatorCwd = primary;
+		let returned: string;
+		let expected: string;
+		if (refusal === "source") {
+			returned = realpathSync(worker);
+			expected = "checkout_is_the_source";
+		} else if (refusal === "coordinator") {
+			const coordinatorCheckout = join(f.directory, "coordinator");
+			runGit(primary, "worktree", "add", "-b", "coordinator-work", coordinatorCheckout);
+			coordinatorCwd = coordinatorCheckout;
+			returned = realpathSync(coordinatorCheckout);
+			expected = "native_allocation_unresolved";
+		} else if (refusal === "foreign") {
+			const foreign = join(f.directory, "foreign");
+			await initRepo(foreign);
+			const foreignCheckout = join(foreign, ".worktrees", "foreign-worker");
+			runGit(foreign, "worktree", "add", foreignCheckout);
+			returned = realpathSync(foreignCheckout);
+			expected = "checkout_foreign_to_source_repository";
+		} else {
+			const worker2 = join(f.directory, "worker2");
+			runGit(primary, "worktree", "add", "-b", "worker2", worker2);
+			const otherTaskId = crypto.randomUUID();
+			const otherCoordinator: OriginRef = {
+				platform: "discord",
+				kind: "channel",
+				conversationId: "900",
+				boundaryId: "1",
+			};
+			await f.manager.start(
+				{
+					name: `fm-${otherTaskId}`,
+					text: "Independent second assignment",
+					cwd: worker2,
+					task: { taskId: otherTaskId, kind: "read_only" as const, surface: { parentOrigin: otherCoordinator } },
+				},
+				{
+					stableOrigin: otherCoordinator,
+					evidence: {
+						principalId: "owner",
+						origin: otherCoordinator,
+						eventId: "assignment-2",
+						editId: null,
+						evidenceAt: at,
+						observedAt: at,
+					},
+				},
+			);
+			// The second task's retained dedicated admission already owns worker2.
+			expect(f.db.workTaskSourceGet(`worktree-admission-${otherTaskId}`)).toBeDefined();
+			returned = realpathSync(worker2);
+			expected = "native_allocation_unresolved";
+		}
+		f.native.override = () => returned;
+		await f.manager.start({ ...f.input, cwd: worker, task: { ...f.input.task, kind: "code_mutating" } }, context);
+		expect(f.db.workTaskSourceGet(`native-allocation-request-${taskId}`)).toBeDefined();
+		await expect(f.bind()).rejects.toThrow(`native managed allocation held: ${expected}`);
+		expect(f.port.binds).toHaveLength(1);
+		expect(f.port.sends).toHaveLength(0);
+		expect(f.port.steers).toHaveLength(0);
+		expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toBeUndefined();
+		expect(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)).toBeDefined();
+		expect(f.db.workAttemptGet(f.db.workTaskGet(taskId)!.opRef)).toBeUndefined();
+		expect(f.db.workTaskGet(taskId)).toMatchObject({ dispatchPhase: "pending", surfacePhase: "bound" });
+		// Refused before any durable owned binding for the work lane.
+		expect(f.db.getSessionRecord(workSessionKey(name))).toBeUndefined();
+	});
+
+test("a source subdirectory of the same checkout is refused as a native return", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+	const primary = join(f.directory, "primary");
+	const worker = join(f.directory, "worker");
+	await initRepo(primary);
+	runGit(primary, "worktree", "add", "-b", "worker", worker);
+	const subdir = join(worker, "module");
+	await mkdir(subdir);
+	coordinatorCwd = primary;
+	f.native.override = () => realpathSync(subdir);
+	await f.manager.start({ ...f.input, cwd: worker, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	await expect(f.bind()).rejects.toThrow("native managed allocation held: native_allocation_unresolved");
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.sends).toHaveLength(0);
+	expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toBeUndefined();
+	expect(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)).toBeDefined();
+	expect(f.db.getSessionRecord(workSessionKey(name))).toBeUndefined();
+});
+
+test("a source diverged from the canonical primary base is refused before create and claims no permission", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+	const primary = join(f.directory, "primary");
+	const worker = join(f.directory, "worker");
+	await initRepo(primary);
+	runGit(primary, "worktree", "add", "-b", "worker", worker);
+	runGit(
+		worker,
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"source-only commit",
+	);
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: worker, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	const authorization = JSON.parse(f.db.workTaskSourceGet(`native-allocation-request-${taskId}`)!.body);
+	expect(authorization.source.head).not.toBe(authorization.source.base);
+	await expect(f.bind()).rejects.toThrow("native managed allocation held: source_repository_changed_or_divergent");
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)).toBeUndefined();
+	expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toBeUndefined();
+	expect(await directoryExists(join(worker, ".worktrees"))).toBe(false);
+	// The known-unsent refusal consumed no create permission: the lane still reads pending.
+	expect(await f.manager.status({ name, taskId })).toMatchObject({ state: "pending" });
+	expect(
+		await f.manager.start({ ...f.input, cwd: worker, task: { ...f.input.task, kind: "code_mutating" } }, context),
+	).toMatchObject({ accepted: "durable", execution: "pending_surface" });
+	expect(f.port.binds).toHaveLength(0);
+});
+
+test("a failed native create recovers lookup-only: not_found holds the task without recreating a checkout", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd });
+	const primary = join(f.directory, "primary");
+	await initRepo(primary);
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	f.native.failCreate = true;
+	await expect(f.bind()).rejects.toThrow("native managed allocation held: native_allocation_unresolved");
+	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.binds[0].managedWorktree).toMatchObject({ lookupOnly: false });
+	expect(f.db.workTaskSourceGet(`native-allocation-claimed-${taskId}`)).toBeDefined();
+	expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toBeUndefined();
+	expect(await directoryExists(join(primary, ".worktrees"))).toBe(false);
+	// A claimed pending allocation reads as held in status and on a duplicate start.
+	expect(await f.manager.status({ name, taskId })).toMatchObject({
+		state: "held",
+		task: { holdReason: "native_allocation_unresolved" },
+	});
+	expect(
+		await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context),
+	).toMatchObject({ held: true, reason: "native_allocation_unresolved" });
+	f.native.failCreate = false;
+	await f.restart();
+	// Recovery is lookup-only: the missing original is a not_found, never a recreate.
+	expect(f.port.binds).toHaveLength(2);
+	expect(f.port.binds[1].managedWorktree).toMatchObject({ lookupOnly: true });
+	expect(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)).toBeUndefined();
+	expect(await directoryExists(join(primary, ".worktrees"))).toBe(false);
+	expect(f.port.sends).toHaveLength(0);
+	expect(f.db.workTaskGet(taskId)).toMatchObject({ dispatchPhase: "pending" });
+});
+
+test("lookup-only recovery reuses the original native result after the source HEAD advances", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd });
+	const primary = join(f.directory, "primary");
+	await initRepo(primary);
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	const bind = f.port.bind.bind(f.port);
+	let crashed = false;
+	const crash = spyOn(f.port, "bind").mockImplementation(async (input) => {
+		const binding = await bind(input);
+		if (input.managedWorktree && !crashed) {
+			crashed = true;
+			throw new Error("gateway lost after the native create");
+		}
+		return binding;
+	});
+	cleanup.push(async () => {
+		crash.mockRestore();
+	});
+	// The create itself persisted; only the gateway-side recording of it was lost.
+	await expect(f.bind()).rejects.toThrow("native managed allocation held: native_allocation_unresolved");
+	const resultId = `native-allocation-result-${taskId}`;
+	const persisted = f.db.workTaskSourceGet(resultId)!;
+	expect(persisted).toBeDefined();
+	const allocation = JSON.parse(persisted.body);
+	const request = JSON.parse(f.db.workTaskSourceGet(`native-allocation-request-${taskId}`)!.body);
+	const checkout = allocation.executionCwd as string;
+	expect(checkout).toBe(join(realpathSync(primary), ".worktrees", request.requestKey));
+	expect(f.db.workTaskGet(taskId)).toMatchObject({ dispatchPhase: "pending" });
+	// The source advances beyond the retained authorization base.
+	runGit(
+		primary,
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"--allow-empty",
+		"-m",
+		"source advanced",
+	);
+	expect(runGit(primary, "rev-parse", "HEAD")).not.toBe(request.source.base);
+	await f.restart();
+	expect(f.port.binds).toHaveLength(2);
+	expect(f.port.binds[1].managedWorktree).toMatchObject({ lookupOnly: true });
+	expect(f.db.workTaskSourceGet(resultId)!.body).toBe(persisted.body);
+	expect(await readdir(join(primary, ".worktrees"))).toEqual([request.requestKey]);
+	expect(f.port.sends).toHaveLength(1);
+	expect(f.port.sends[0]?.repo).toBe(checkout);
+	expect(f.db.workTaskGet(taskId)?.request.cwd).toBe(primary);
+});
+
+test("retirement never removes the native checkout: uncommitted files and unintegrated commits survive", async () => {
+	let coordinatorCwd = "";
+	const f = await fixture({ coordinatorCwd: () => coordinatorCwd }, {}, true);
+	const primary = join(f.directory, "primary");
+	await initRepo(primary);
+	coordinatorCwd = primary;
+	await f.manager.start({ ...f.input, cwd: primary, task: { ...f.input.task, kind: "code_mutating" } }, context);
+	await f.bind();
+	const task = f.db.workTaskGet(taskId)!;
+	const allocation = JSON.parse(f.db.workTaskSourceGet(`native-allocation-result-${taskId}`)!.body);
+	const checkout = allocation.executionCwd as string;
+	expect(allocation.sessionId).toBe(task.sessionId);
+	await writeFile(join(checkout, "owner-notes.txt"), "Uncommitted owner data");
+	runGit(checkout, "add", "owner-notes.txt");
+	runGit(
+		checkout,
+		"-c",
+		"user.name=Fixture",
+		"-c",
+		"user.email=fixture@example.invalid",
+		"commit",
+		"-m",
+		"unique unintegrated commit",
+	);
+	const unintegrated = runGit(checkout, "rev-parse", "HEAD");
+	expect(unintegrated).not.toBe(runGit(primary, "rev-parse", "HEAD"));
+	f.port.complete(task.opRef, "Original coding result");
+	await until(() => f.db.workAttemptGet(task.opRef)?.settledAt != null);
+	expect(f.manager.assessTaskRelease(name)).toMatchObject({ kind: "eligible", cwd: checkout });
+	expect(f.manager.taskDebt(name)).toMatchObject({ safeToReleaseExecution: true, safeToCleanupWorktree: false });
+	// Release itself is gated on the nested-bucket ignore invariant.
+	await rm(join(primary, ".gitignore"));
+	expect(f.manager.assessTaskRelease(name)).toMatchObject({
+		kind: "hold",
+		reason: "task_original_worktree_proof_unavailable",
+	});
+	await writeFile(join(primary, ".gitignore"), ".worktrees/\n");
+	expect(f.manager.assessTaskRelease(name)).toMatchObject({ kind: "eligible" });
+	const jobs = spyOn(f.port, "runningJobs");
+	const live = spyOn(f.port, "liveness").mockImplementation(async ({ sessionId }: { sessionId: string }) => ({
+		live: sessionId !== allocation.sessionId,
+		disowned: false,
+	}));
+	expect(await f.lanes.retire(name, "operator")).toMatchObject({
+		retired: true,
+		closed: true,
+		sessionId: allocation.sessionId,
+	});
+	live.mockRestore();
+	expect(jobs).toHaveBeenCalledWith({ sessionId: allocation.sessionId, repo: checkout });
+	jobs.mockRestore();
+	expect(f.port.closes).toEqual([{ sessionId: allocation.sessionId, repo: checkout }]);
+	// Retirement released capacity only: the checkout and both kinds of work survive.
+	expect(await readFile(join(checkout, "owner-notes.txt"), "utf8")).toBe("Uncommitted owner data");
+	expect(runGit(checkout, "rev-parse", "HEAD")).toBe(unintegrated);
+	expect(runGit(primary, "worktree", "list", "--porcelain")).toContain(checkout);
+	expect(gitExitCode(primary, "merge-base", "--is-ancestor", unintegrated, runGit(primary, "rev-parse", "HEAD"))).toBe(
+		1,
+	);
+	expect(f.lanes.activeLanes().map((lane) => lane.name)).toEqual([]);
+	expect(f.db.getSessionRecord(workSessionKey(name))).toEqual({ sessionId: "", epoch: task.epoch! + 1 });
 });
 
 async function releaseFixture(remote = false, scope: "dedicated" | "shared" | "ordinary" = "dedicated") {
