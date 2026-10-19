@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
 	type BrokerSession,
 	type CliResult,
@@ -158,6 +159,7 @@ export class ScriptedSessionPort implements SessionPort {
 	/** Relay that submitted each op (undefined: a throwaway send relay, so nobody observes the content). */
 	readonly #owner = new Map<string, ScriptedTailHandle | undefined>();
 	readonly #chains = new Map<string, Promise<void>>();
+	readonly #exclusiveOwner = new AsyncLocalStorage<string>();
 	readonly onSend?: (input: SessionSendInput, port: ScriptedSessionPort) => void | Promise<void>;
 	readonly onSteer?: (input: SessionSteerInput, port: ScriptedSessionPort) => void | Promise<void>;
 	readonly #onBind:
@@ -579,9 +581,11 @@ export class ScriptedSessionPort implements SessionPort {
 	setStallTimeoutMs(_timeoutMs: number): void {}
 
 	async runExclusive<T>(key: string, work: () => Promise<T>): Promise<T> {
+		if (this.#exclusiveOwner.getStore() === key) return work();
 		const previous = this.#chains.get(key);
+		const run = () => this.#exclusiveOwner.run(key, work);
 		if (!previous) {
-			const task = work();
+			const task = run();
 			const settled = task.then(
 				() => undefined,
 				() => undefined,
@@ -601,7 +605,7 @@ export class ScriptedSessionPort implements SessionPort {
 		this.#chains.set(key, chain);
 		await previous.catch(() => undefined);
 		try {
-			return await work();
+			return await run();
 		} finally {
 			release();
 			if (this.#chains.get(key) === chain) this.#chains.delete(key);

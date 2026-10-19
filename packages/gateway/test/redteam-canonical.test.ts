@@ -1200,6 +1200,11 @@ test("D8: migration 19 maps every v18 row exactly once even when a corrupt attri
 		for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
 			for (const action of ["update", "delete"]) raw.exec(`DROP TRIGGER ${table}_immutable_${action}`);
 		for (const table of [
+			"firstmate_release_receipts",
+			"firstmate_release_intents",
+			"firstmate_approvals",
+			"firstmate_attempts",
+			"firstmate_assignments",
 			"broker_authority",
 			"broker_owned_bindings",
 			"broker_tail_cursors",
