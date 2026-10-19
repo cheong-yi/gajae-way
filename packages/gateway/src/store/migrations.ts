@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 37;
+export const LATEST_SCHEMA_VERSION = 39;
 
 export interface MigrationHost {
 	readonly database: {
@@ -826,6 +826,83 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(37, new Date().toISOString());
+		});
+	}
+	if (current < 38) {
+		// Owner evidence is independent of the mutable native journal projections.
+		// No historical FirstMate task import or reconstruction from native rows.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE firstmate_assignments (
+					task_id TEXT PRIMARY KEY,
+					lane_name TEXT NOT NULL UNIQUE,
+					owner_id TEXT NOT NULL,
+					message_id TEXT NOT NULL,
+					thread_key TEXT NOT NULL UNIQUE,
+					worktree_path TEXT NOT NULL UNIQUE,
+					git_dir TEXT NOT NULL UNIQUE,
+					assignment_json TEXT NOT NULL,
+					UNIQUE(owner_id, message_id)
+				);
+				CREATE TABLE firstmate_attempts (
+					op_ref TEXT PRIMARY KEY,
+					task_id TEXT NOT NULL REFERENCES firstmate_assignments(task_id),
+					lane_name TEXT NOT NULL,
+					ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+					record_json TEXT NOT NULL,
+					UNIQUE(task_id, ordinal)
+				);
+				CREATE INDEX firstmate_attempts_lane ON firstmate_attempts(lane_name);
+			`);
+			for (const table of ["firstmate_assignments", "firstmate_attempts"]) {
+				for (const action of ["UPDATE", "DELETE"]) {
+					host.database.execute(`CREATE TRIGGER ${table}_immutable_${action.toLowerCase()}
+						BEFORE ${action} ON ${table}
+						BEGIN SELECT RAISE(ABORT, 'immutable FirstMate evidence'); END`);
+				}
+			}
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(38, new Date().toISOString());
+		});
+	}
+	if (current < 39) {
+		// Fresh policy receipts only: no historical approval inference or native replay.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE firstmate_approvals (
+					approval_id TEXT PRIMARY KEY,
+					task_id TEXT NOT NULL REFERENCES firstmate_assignments(task_id),
+					op_ref TEXT NOT NULL REFERENCES firstmate_attempts(op_ref),
+					owner_id TEXT NOT NULL,
+					message_id TEXT NOT NULL,
+					record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+					UNIQUE(owner_id, message_id)
+				);
+				CREATE TABLE firstmate_release_intents (
+					release_id TEXT PRIMARY KEY,
+					approval_id TEXT NOT NULL REFERENCES firstmate_approvals(approval_id),
+					op_ref TEXT NOT NULL UNIQUE REFERENCES firstmate_attempts(op_ref),
+					owner_id TEXT NOT NULL,
+					message_id TEXT NOT NULL,
+					record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+					UNIQUE(owner_id, message_id)
+				);
+				CREATE TABLE firstmate_release_receipts (
+					release_id TEXT PRIMARY KEY REFERENCES firstmate_release_intents(release_id),
+					record_json TEXT NOT NULL CHECK(json_valid(record_json))
+				);
+			`);
+			for (const table of ["firstmate_approvals", "firstmate_release_intents", "firstmate_release_receipts"]) {
+				for (const action of ["UPDATE", "DELETE"]) {
+					host.database.execute(`CREATE TRIGGER ${table}_immutable_${action.toLowerCase()}
+						BEFORE ${action} ON ${table}
+						BEGIN SELECT RAISE(ABORT, 'immutable FirstMate receipt'); END`);
+				}
+			}
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(39, new Date().toISOString());
 		});
 	}
 }
