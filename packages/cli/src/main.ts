@@ -14,12 +14,18 @@ import type {
 	OpsDeliveriesResult,
 	OpsSloParams,
 	OpsSloResult,
+	WorkApproveParams,
+	WorkApproveResult,
+	WorkFirstmateAssignmentParams,
+	WorkFirstmateCorrectionParams,
+	WorkFirstmateRetireParams,
+	WorkFirstmateRetireResult,
+	WorkRunParams,
 	WorkJobsParams,
 	WorkJobsResult,
 	WorkRetireResult,
 	WorkRunResult,
 	WorkStartParams,
-	WorkStartResult,
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
@@ -87,6 +93,7 @@ export const COMMANDS = [
 ] as const;
 
 export const CLI_USAGE =
+	"usage: gajaeway [--socket PATH] work start --firstmate ASSIGNMENT_JSON_FILE|work start --firstmate-correction CORRECTION_JSON_FILE|work approve --firstmate APPROVAL_JSON_FILE|work retire --firstmate CLOSEOUT_JSON_FILE|work inspect NAME --task TASK_ID --op OP_REF [--native]\n" +
 	"usage: gajaeway [--version] [--socket PATH] status|shutdown|chat|daemon run|sessions list [--json] [--fields a,b,c] [--limit N] [--offset N]|sessions inspect <originKey-or-index>|memory audit|memory search <query>|monitors ... (settle <eventId>|retry <eventId>|test <id> [--type T] [--payload J] [--wait[=SECONDS]])|work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] [--notify originKey (start only)] <text>|work status <name>|work steer <name> <text>|work retire [--force] <name>|work retire --all-dead|work jobs [--limit N] [--offset N]|ops backup <path>|ops deliveries [--since ISO] [--state S] [--limit N] [--json]|ops redeliver <deliveryId>|ops redeliver --since <iso>|ops cycle [--limit N] [--offset N] [--json]|ops integrity|ops restart-stack [--status|--recover --confirm-service-manager-settled]|services install|repair --bin-dir DIR [--launch-agents-dir DIR] [--unit-dir DIR] [--platform darwin|linux]|migrate [--source PATH] [--target PATH] [--dry-run]|update [--check] [--force] [--bin-dir DIR] [--no-restart]|setup [--from-env] [--adapters discord,slack,telegram] [--owner ID] [--discord-app-id ID]|setup --status|setup --broker-agent [--from DIR] (work run waits for a response; caller timeout does not end the attempt); cron timezone is an IANA zone and defaults to the gateway host's local timezone";
 
 /** Usage errors exit 2, as `gajaeway-gateway` does; 1 stays a runtime failure. */
@@ -986,7 +993,102 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 			case "work": {
 				const [command, ...args] = parsed.rest;
 				const usage =
-					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|status <name>|steer <name> <text>|retire <name>|jobs';
+					'usage: gajaeway work run|start <name> [--cwd DIR] [--repo PATH|URL [--base REF]] [--resume] [--model ID|--preset NAME] "<task text>"|start --firstmate ASSIGNMENT_JSON_FILE|start --firstmate-correction CORRECTION_JSON_FILE|approve --firstmate APPROVAL_JSON_FILE|inspect NAME --task TASK_ID --op OP_REF [--native]|status <name>|steer <name> <text>|retire <name>|retire --firstmate CLOSEOUT_JSON_FILE|jobs';
+				if (command === "retire" && args.includes("--firstmate")) {
+					const [flag, file] = args;
+					if (args.length !== 2 || flag !== "--firstmate" || !file?.trim() || file.startsWith("--"))
+						throw new Error(usage);
+					// Forward exact authority; only the native closeout can prove obligations fulfilled.
+					const params: WorkFirstmateRetireParams = JSON.parse(await Bun.file(file).text());
+					const client = await connectGatewaySocket(parsed.socket, { requestTimeoutMs: 120_000 });
+					try {
+						const result = await client.request<WorkFirstmateRetireResult>("work.retire", params);
+						console.log(JSON.stringify(result));
+						if (!result.retired) process.exitCode = 1;
+					} finally {
+						await client.close();
+					}
+					break;
+				}
+				if (command === "approve") {
+					const [flag, file] = args;
+					if (args.length !== 2 || flag !== "--firstmate" || !file?.trim() || file.startsWith("--"))
+						throw new Error(usage);
+					// Forward the exact decision; gateway validation owns evidence and authority.
+					const params: WorkApproveParams = JSON.parse(await Bun.file(file).text());
+					const client = await connectGatewaySocket(parsed.socket);
+					try {
+						const result = await client.request<WorkApproveResult>("work.approve", params);
+						console.log(JSON.stringify(result));
+						if (!result.recorded) process.exitCode = 1;
+					} finally {
+						await client.close();
+					}
+					break;
+				}
+				if (command === "start" && (args.includes("--firstmate") || args.includes("--firstmate-correction"))) {
+					const flag = args[0];
+					const file = args[1];
+					if (
+						args.length !== 2 ||
+						(flag !== "--firstmate" && flag !== "--firstmate-correction") ||
+						!file?.trim() ||
+						file.startsWith("--")
+					)
+						throw new Error(usage);
+					// Decode once; the gateway owns payload validation and admission.
+					let params: WorkStartParams;
+					if (flag === "--firstmate-correction") {
+						const firstmateCorrection: WorkFirstmateCorrectionParams = JSON.parse(await Bun.file(file).text());
+						params = { firstmateCorrection };
+					} else {
+						const firstmate: WorkFirstmateAssignmentParams = JSON.parse(await Bun.file(file).text());
+						params = { firstmate };
+					}
+					const client = await connectGatewaySocket(parsed.socket, { requestTimeoutMs: 120_000 });
+					try {
+						const result = await client.workStart(params);
+						console.log(JSON.stringify(result));
+						if (!result.started) process.exitCode = 1;
+					} finally {
+						await client.close();
+					}
+					break;
+				}
+				if (command === "inspect") {
+					const name = args[0];
+					let taskId: string | undefined;
+					let opRef: string | undefined;
+					let native = false;
+					if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) throw new Error(usage);
+					for (let i = 1; i < args.length; i++) {
+						const arg = args[i];
+						if (arg === "--native") {
+							if (native) throw new Error(usage);
+							native = true;
+						} else if (arg === "--task" || arg === "--op") {
+							const value = args[++i];
+							if (!value?.trim() || value.startsWith("--")) throw new Error(usage);
+							if (arg === "--task") {
+								if (taskId !== undefined) throw new Error(usage);
+								taskId = value;
+							} else {
+								if (opRef !== undefined) throw new Error(usage);
+								opRef = value;
+							}
+						} else throw new Error(usage);
+					}
+					if (taskId === undefined || opRef === undefined) throw new Error(usage);
+					const client = await connectGatewaySocket(parsed.socket);
+					try {
+						console.log(
+							JSON.stringify(await client.workInspect({ name, taskId, opRef, ...(native ? { native: true } : {}) })),
+						);
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (command === "status" || command === "steer") {
 					const name = args[0];
 					const text = args.slice(1).join(" ").trim();
@@ -1130,7 +1232,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 				});
 				try {
 					const callerSessionId = process.env.GJC_SESSION_ID?.trim();
-					const params: WorkStartParams = {
+					const params: WorkRunParams = {
 						name,
 						text,
 						...(cwd ? { cwd } : {}),
@@ -1141,7 +1243,7 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						...(callerSessionId ? { callerSessionId } : {}),
 					};
 					if (command === "start") {
-						const result = await client.request<WorkStartResult>("work.start", params);
+						const result = await client.workStart(params);
 						if (result.started) {
 							console.log(
 								`started: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,

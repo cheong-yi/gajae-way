@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/Yeachan-Heo/gajae-way/actions/workflows/build.yml"><img alt="Build" src="https://github.com/Yeachan-Heo/gajae-way/actions/workflows/build.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
-  <img alt="Bun" src="https://img.shields.io/badge/bun-%3E%3D1.4.0-000000?logo=bun&logoColor=white">
+  <img alt="Bun" src="https://img.shields.io/badge/bun-%3E%3D1.4.2-000000?logo=bun&logoColor=white">
   <img alt="Runtime" src="https://img.shields.io/badge/runtime-TypeScript-3178C6?logo=typescript&logoColor=white">
 </p>
 
@@ -85,7 +85,7 @@ Then send your bot a DM on Discord/Slack/Telegram and start chatting.
 
 **Option 2: Local installation with build**
 
-Requirements: Bun ≥1.4.0, `gjc` ≥0.16.0 on your PATH.
+Requirements: Bun ≥1.4.2, `gjc` ≥0.16.0 on your PATH.
 
 ```sh
 # Build the binaries
@@ -122,6 +122,20 @@ Put `SOUL.md`, `AGENTS.md`, and `USER.md` in `$GAJAEWAY_HOME/workspace`. `SOUL.m
 - [Monitor guide](docs/monitors.md) — scheduled and event-driven work
 - [Architecture](docs/architecture.md) — protocol and reliability details
 - [Operator runbook](docs/runbooks/gajaeway-v1.md) — recovery and troubleshooting
+
+Local FirstMate commands use an explicit immutable assignment supplied by a privileged trusted caller, not automatic Discord-message interpretation:
+
+- `gajaeway work start --firstmate FILE` submits assignment JSON and prints the full accepted/held JSON result; held exits nonzero. Do not mix this form with ordinary start arguments.
+- `gajaeway --socket PATH work start --firstmate-correction CORRECTION_JSON_FILE` submits a trusted-local same-task correction with `name`, `taskId`, `ownerId`, `messageId`, `thread`, `mandateId`, `priorOpRef`, and `text`. It is exclusive with assignment and ordinary command flags and returns the same accepted/held JSON shape. The exact latest settled, attributable, accepted `end_turn` in `done` or `attempt_ended` is the only eligible predecessor. A new independent attempt keeps the task/worktree/thread/mandate/session/epoch and preserves prior best-effort evidence.
+- `gajaeway work inspect NAME --task TASK_ID --op OP_REF [--native]` prints full exact-result JSON, keeping identity/lifecycle separate from complete/partial/unavailable evidence, provenance, reasons, and `execution: "not_evaluated"`. The default reads retained evidence only; `--native` permits a bounded exact-operation query, never execution or replay.
+
+An exact correction duplicate returns its existing acceptance or an uncertainty hold; reuse of its message identity with conflicting content is rejected. Lost acceptance is never blindly resent, and correction never implicitly recreates or recovers a session. Supplied local identities do not prove Discord authentication. Correction success is neither owner approval nor publication authority.
+
+`gajaeway [--socket PATH] work approve --firstmate APPROVAL_JSON_FILE` submits the exact local `WorkApproveParams` object, not a `firstmate` wrapper. It binds `name`, `identity` (`taskId`, `jobId`, `opRef`, `ordinal`, `sessionId`, `epoch`), `ownerId`, distinct decision `messageId`, exact `thread`, `mandateId`, and explicit `scope` to `decision` and the reviewed `evidence`. Complete/partial retained or native evidence permits explicit `accept_outcome`; partial evidence must disclose limitations in `reasons`. Unavailable evidence permits only `acknowledge_unavailable`, never outcome acceptance or release authority. See the [runbook](docs/runbooks/gajaeway-v1.md#local-exact-result-decision-unverified) for the full evidence shape.
+
+`WorkApproveResult` is `{ recorded: true, approval }` (the exact request plus `approvalId` and `recordedAt`) or `{ recorded: false, held: true, reason }`; the CLI prints full JSON and held exits 1. Recorded acknowledgement is not acceptance. Native `done`/`attempt_ended`, owner outcome acceptance, and separate preserving closeout are distinct. Approval grants no publication, commit, push, deployment, deletion, or session-release permission. Reconstructed/logs input is held; there is no reconstruction service or automatic rerun. Release records/types are internal preparatory storage only: preserving closeout runtime/CLI is not wired. Source and guidance remain UNVERIFIED pending consolidated verification and fresh Luna/Sol gateway reviews; natural-language Discord/model and full owner-journey readiness are not claimed.
+
+Ordinary start/run/status remain unchanged; generic steer is not mapped-task correction. Partial/unavailable evidence is not execution failure, and pointers guarantee neither retrieval nor full original output above 16 KiB or after release. Internal native reports use the primary supervisor's existing delivery, not direct worker chat. Inspection or commit permission grants no task approval or publication authority; push/PR/merge/release/deploy/retire/delete approvals stay separate. This best-effort, fresh-database source slice establishes neither migration/historical resume, a complete owner journey, nor live activation. See the [runbook](docs/runbooks/gajaeway-v1.md) for the assignment example and trust boundaries.
 
 ## Development
 

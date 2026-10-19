@@ -54,6 +54,156 @@ Per conversation, `/model` shows the effective selection and its source, `/model
 
 `sessions.maxLiveHosts` (integer 1–256, default 8) caps concurrently live persona session hosts: each bound conversation origin runs one `gjc sdk session-host-internal` process of roughly 360 MB, so an unbounded count on a busy workspace exhausts memory and the broker answers `broker_unavailable` to everything. At the cap the least-recently-active idle host is ended before a new origin binds; when every host is busy the new turn is held (`persona_bind_hold … reason=host_capacity live=N max=M`, with one `[turn held]` notice in the channel) and dispatched as soon as a host frees. `sessions.idleRetireMs` (integer 60000–604800000 milliseconds, default 21600000 / 6 hours) ends hosts idle that long on the 60-second sweep (`persona_host_retired … reason=host_idle`). Ending a host keeps its session: the next turn resumes it with full history (`session_resumed … reason=idle_dead_binding`), and a host with background jobs is skipped. `sessions.idleResetMs` (optional integer 60000–2592000000 milliseconds; unset disables it) instead rotates quiet non-loopback, non-monitor session contexts like `/new`, so the next turn starts with fresh GJC history. It skips running turns and rows with no bound GJC session after an earlier reset, avoiding repeated no-op epoch changes. All three settings are reloadable; a lowered cap applies to the next bind and sweep and never kills a busy host.
 
+For local FirstMate submission, a privileged trusted caller (Trust A) supplies an explicit immutable assignment JSON file. It contains `taskId`, `name`, `ownerId`, `messageId`, `thread`, `mandate`, and verified pre-provisioned `worktree` identity; the caller maps the actual author, source message, selected thread, and authorized mandate. Supplied IDs are not Discord authentication, and this route does not construct assignments from natural-language Discord messages.
+
+EXAMPLE only: save the following shape as `firstmate-example.json` after replacing every `EXAMPLE_*` identity and `/EXAMPLE/` path with the actual authorized source identities and registered scratch worktree paths. `firstmate-example` is the example lane name; the branch and Git directories must match that worktree, not paths created by this command. These are illustrative inputs, not provisioned resources.
+
+```json
+{
+  "taskId": "EXAMPLE_TASK_ID",
+  "name": "firstmate-example",
+  "ownerId": "EXAMPLE_OWNER_ID",
+  "messageId": "EXAMPLE_MESSAGE_ID",
+  "thread": {
+    "platform": "discord",
+    "kind": "thread",
+    "conversationId": "EXAMPLE_THREAD_ID",
+    "parentId": "EXAMPLE_CHANNEL_ID"
+  },
+  "mandate": {
+    "id": "EXAMPLE_MANDATE_ID",
+    "text": "Inspect the assigned scratch checkout and report findings internally; no publication or cleanup.",
+    "checkRetries": false,
+    "commit": false,
+    "push": false
+  },
+  "worktree": {
+    "path": "/EXAMPLE/firstmate-scratch",
+    "commonDir": "/EXAMPLE/repo/.git",
+    "gitDir": "/EXAMPLE/repo/.git/worktrees/firstmate-scratch",
+    "branch": "example/firstmate-scratch"
+  }
+}
+```
+
+```sh
+gajaeway work start --firstmate firstmate-example.json
+gajaeway work inspect firstmate-example --task EXAMPLE_TASK_ID --op EXAMPLE_OP_REF
+# Optional bounded native observation of the same exact operation:
+gajaeway work inspect firstmate-example --task EXAMPLE_TASK_ID --op EXAMPLE_OP_REF --native
+```
+
+Replace `EXAMPLE_OP_REF` with the exact accepted `opRef`, and retain the submitted task/name alongside it. Mapped start prints the full JSON result: accepted means `started: true` with `jobId`, `opRef`, `sessionKey`, and `sessionId`, not task completion; held means `started: false`, `held: true`, `jobId`, `state`, and `reason`, and exits nonzero. `--firstmate FILE` cannot be mixed with an ordinary name, task text, or ordinary start options, and has no `work run` alias. Ordinary `work start`, `work run`, and `work status` remain unchanged. Generic `work.steer` does not correct mapped tasks; do not substitute duplicate submission, resume, or blind replay for an authorized successor decision. Check retries stay within the immutable mandate.
+
+#### Local same-task correction (UNVERIFIED)
+
+This source contract awaits combined verification and review; it is not a live deployment or full-readiness claim. A trusted local caller can submit an explicit correction within the unchanged original mandate. Save the following illustrative shape as `firstmate-correction-example.json`, replacing all example identities and the text with the actual authorized correction. Copy the exact original `thread` (including any parent/visibility fields), owner, task, name, and mandate ID; use a distinct correction source `messageId`. These supplied identifiers do not prove Discord authentication.
+
+```json
+{
+  "name": "firstmate-example",
+  "taskId": "EXAMPLE_TASK_ID",
+  "ownerId": "EXAMPLE_OWNER_ID",
+  "messageId": "EXAMPLE_CORRECTION_MESSAGE_ID",
+  "thread": {
+    "platform": "discord",
+    "kind": "thread",
+    "conversationId": "EXAMPLE_THREAD_ID",
+    "parentId": "EXAMPLE_CHANNEL_ID"
+  },
+  "mandateId": "EXAMPLE_MANDATE_ID",
+  "priorOpRef": "EXAMPLE_PRIOR_OP_REF",
+  "text": "Correct the identified result within the original mandate."
+}
+```
+
+The exact command form is `gajaeway --socket PATH work start --firstmate-correction CORRECTION_JSON_FILE`. The file is the correction object, not an outer `firstmateCorrection` envelope. SDK callers use `workStart({ firstmateCorrection: correction })` over the existing `work.start` transport. Do not combine this CLI form with `--firstmate`, a positional name/text, or ordinary command flags such as `--cwd`, `--repo`, `--resume`, `--model`, or authority options. There is no `work run` or `work steer` correction alias.
+
+```sh
+# Inspect the exact predecessor, not an inferred latest answer:
+gajaeway --socket /EXAMPLE/gateway.sock work inspect firstmate-example --task EXAMPLE_TASK_ID --op EXAMPLE_PRIOR_OP_REF
+gajaeway --socket /EXAMPLE/gateway.sock work start --firstmate-correction firstmate-correction-example.json
+# Save the correction's accepted opRef as EXAMPLE_CORRECTION_OP_REF:
+gajaeway --socket /EXAMPLE/gateway.sock work inspect firstmate-example --task EXAMPLE_TASK_ID --op EXAMPLE_CORRECTION_OP_REF
+# The prior answer remains independently addressable:
+gajaeway --socket /EXAMPLE/gateway.sock work inspect firstmate-example --task EXAMPLE_TASK_ID --op EXAMPLE_PRIOR_OP_REF
+# Optional bounded query of the exact corrected operation:
+gajaeway --socket /EXAMPLE/gateway.sock work inspect firstmate-example --task EXAMPLE_TASK_ID --op EXAMPLE_CORRECTION_OP_REF --native
+```
+
+Admission requires `priorOpRef` to select the exact latest settled, attributable, accepted `end_turn` in native `done` or `attempt_ended`, with no open attempt or pending checks. A stale predecessor, uncertain or unaccepted result, aborted/held state, changed worktree identity, or missing/rebound/dead session cannot authorize a fresh correction. The task/worktree/thread/mandate/session/epoch remain the same; a fresh operation and attempt ordinal are appended through native preparation, preserving prior independent best-effort evidence and reporting. Original-mandate check retries remain distinct from correction.
+
+The full accepted/held JSON and held nonzero exit behavior are the same as assignment submission above. An exact duplicate correction returns its existing acceptance or an uncertainty hold, not another send; conflicting reuse of the message identity (including changed text or predecessor) is rejected. Duplicate lookup can return an older correction's acceptance after a newer attempt, subject to its identity and current binding checks. A repeated original assignment still selects its original attempt, not the correction. Lost acceptance must never be blindly resent or bypassed with a fresh message. Retain the selectors and hold reason for exact inspection; absence of evidence is not nonexecution. Correction never implicitly recreates a session, resumes a hold, or invokes recovery.
+
+Successful execution is not owner approval or publication authority. Natural-language Discord correction and authenticated author ingress, safe closeout runtime, and live deployment remain unfinished and outside this local slice. Local exact-result decisions are described below. No new security boundary, mechanical no-push enforcement, historical resume, or cleanup is provided.
+
+Exact `work inspect NAME --task TASK_ID --op OP_REF [--native]` prints full JSON: `identity` (task/job/attempt ordinal/op/session/epoch) and `lifecycle` (job state/send phase/terminal/settlement) are separate from `evidence.completeness` (`complete`, `partial`, or `unavailable`), available text/source/provenance, `reasons`, and `execution: "not_evaluated"`. Identity and lifecycle can be null when unavailable. Partial or unavailable observations are not execution failures; request or validation errors still fail. By default inspection reads retained evidence without a native query or execution. `--native` permits only a bounded exact-operation query, not execution or recovery. Pointers do not guarantee retrieval; there is no latest-result heuristic or blind replay. Completeness describes evidence, not task approval or success. Evidence is best effort, with no guarantee of full original output above 16 KiB or after native release.
+
+Mapped tasks keep the assigned thread as their single report parent. Settlement sends one gateway-authored state-and-pointers outcome per terminal operation, not a model excerpt or child transcript. Replaying the same event does not add another outcome; a correction's new terminal event does. Preserving release waits for confirmation of that exact outcome delivery; an unrelated parent reply or `decision=reported` is not proof. Inspection and commit permission imply neither outcome approval nor publication authority. Push, PR, merge, release, deployment, retirement, and deletion each need separate explicit approval; mandate booleans are not a sandbox, authentication layer, or mechanical no-push guarantee. Evidence remains best-effort; no live activation or runtime/channel configuration is established here.
+
+A connected Discord adapter can receive an explicit gateway request to open a FirstMate pane under the parent channel. The gateway saves child provenance in existing meta storage before binding its persona through the existing actor. Only the recorded owning persona may POST, WAKE or WATCH it; an ordinary session binding is not permission. Running transcript stays in the child. Human child input steers only the captured running attempt under the existing lane lock; bot text, ended attempts, releasing lanes and missing/corrupt provenance are refused. It never fabricates approval, resumes a mapped task or launches a replacement. Restart reuses the record and actor; unavailable provenance leaves the headless lane intact. Child deliveries persist `noChildFallback: true`, so missing/archived-thread failures remain failed deliveries rather than public parent fallbacks. A timed-out creation request remains held, not automatically retried. Existing same-task/session/epoch correction and explicit approval requirements still apply.
+
+#### Local exact-result decision (UNVERIFIED)
+
+Source and guidance are drafts pending parent consolidated verification and fresh Luna/Sol gateway reviews. This is a trusted-local exact-result decision surface, not public natural-language Discord authentication, model integration proof, live activation, or a completed owner journey.
+
+The exact syntax is `gajaeway [--socket PATH] work approve --firstmate APPROVAL_JSON_FILE`. The JSON file contains the complete `WorkApproveParams` object below, with no outer `firstmate` wrapper. No positional name or extra identity/authority/evidence, correction, force, or publication flags are accepted. The CLI decodes JSON and forwards it unchanged once; it never fills in missing fields or chooses a latest result.
+
+The following is an illustrative complete-evidence shape, not a reusable approval. Replace every example with the trusted assignment, the exact inspected result, and the owner's explicit decision. Copy the entire `thread` including parent/visibility fields; use a distinct decision `messageId`, not the assignment/correction message. Copy `ordinal` and `epoch` exactly, rather than assuming their values.
+
+```json
+{
+  "name": "firstmate-example",
+  "identity": {
+    "taskId": "EXAMPLE_TASK_ID",
+    "jobId": "EXAMPLE_JOB_ID",
+    "opRef": "EXAMPLE_OP_REF",
+    "ordinal": 0,
+    "sessionId": "EXAMPLE_SESSION_ID",
+    "epoch": 0
+  },
+  "ownerId": "EXAMPLE_OWNER_ID",
+  "messageId": "EXAMPLE_DECISION_MESSAGE_ID",
+  "thread": {
+    "platform": "discord",
+    "kind": "thread",
+    "conversationId": "EXAMPLE_THREAD_ID",
+    "parentId": "EXAMPLE_CHANNEL_ID"
+  },
+  "mandateId": "EXAMPLE_MANDATE_ID",
+  "scope": "Accept only this exact reviewed outcome; no publication or session release.",
+  "decision": "accept_outcome",
+  "evidence": {
+    "completeness": "complete",
+    "text": "EXAMPLE_RESULT_TEXT",
+    "source": "retained",
+    "provenance": {
+      "source": "turn.result",
+      "fullness": "original",
+      "sessionId": "EXAMPLE_SESSION_ID",
+      "repo": "/EXAMPLE/owned-worktree",
+      "opRef": "EXAMPLE_OP_REF",
+      "clientRef": "EXAMPLE_OP_REF",
+      "terminalAt": 0,
+      "contentVersion": 1,
+      "byteLength": 19
+    },
+    "reasons": []
+  }
+}
+```
+
+Evidence must match the observed snapshot exactly: `completeness`, `text`, `source`, full `provenance`, and `reasons`. Inspection's top-level `reasons` belong in the submitted evidence's `reasons`. Do not fabricate provenance from this example: retain observed optional `commandId`/`turnId` and, when present, `epoch`, `observedAtMs`, and `attribution: "operation_ref"`. `terminalAt`, byte length and content version are observed values, not defaults. Available evidence uses retained/native source and `turn.result` provenance with original/partial fullness. Complete evidence requires original fullness and the exact UTF-8 byte length. The gateway validates authority, attribution, settlement and the reviewed snapshot; supplied local identifiers do not prove Discord authorship.
+
+- **Complete or partial:** explicit `decision: "accept_outcome"` accepts only the bound snapshot and stated scope. Partial evidence retains its exact text/source/provenance and nonempty limitation `reasons`; accepting those limits does not turn partial evidence into a full original.
+- **Unavailable:** use `decision: "acknowledge_unavailable"` with `evidence: { "completeness": "unavailable", "reasons": ["EXACT_OBSERVED_REASON"] }`, replacing the reason with the full observed reasons array. Omit text, source and provenance entirely. This records acknowledgement only, never outcome acceptance, release authority, abandonment, or closeout.
+- **Reconstructed/logs:** excluded from the public approval type; unsupported runtime input is held. There is no reconstruction service, automatic reconstruction/rerun, guaranteed retrieval, or full-original retention promise beyond 16 KiB.
+
+The CLI prints `WorkApproveResult` unchanged: `{ "recorded": true, "approval": ... }` or `{ "recorded": false, "held": true, "reason": "..." }`. Held exits 1. A recorded approval contains the exact submitted binding/decision/evidence plus immutable `approvalId` and `recordedAt`; inspect `decision`, since recorded acknowledgement is not acceptance. Invalid JSON/grammar or transport errors fail rather than synthesizing a receipt.
+
+Fresh decisions require conclusively accepted and settled native `end_turn`, completed attempts in `done` or `attempt_ended`, current session/epoch and no open/check/recovery/quarantine ambiguity. These native states are execution facts, not owner acceptance. Exact same-owner/message requests return the original receipt; changed content holds. Newer prepared attempts, including uncertain ones, invalidate currentness without rewriting historical decisions. Never substitute later evidence, infer a latest answer, or automatically retry execution to clear a hold.
+
+Outcome acceptance grants no publication, commit, push, PR, merge, release, deployment, deletion, or session-release permission and changes neither native success nor mandate flags. Preserving closeout is a separate sequential action requiring current outcome acceptance, exact binding and obligation checks while preserving worktree/branch, dirty/untracked work, unique commits, evidence, delivery/control/report records and native journal history. Its runtime and CLI are **not wired**; do not use ordinary retirement as a substitute. Schema 39's release intents/receipts and exported release types are internal preparatory storage only, not usable closeout commands or proof of native close.
 For delegated long work, use `gajaeway work start <name> --cwd "<absolute_worktree_path>" "<task>"` for an existing checkout, or `gajaeway work start <name> --repo <absolute_path_or_git_url> [--base <ref>] "<task>"` to create a separate worktree. Relative `--repo` paths are resolved by the CLI; `--base` requires `--repo`. A repo-backed worktree must live outside the gateway service directory, is bound to the selected repository's push remote, and reports its repository, work branch, and baseline SHA in `work status`. Observe with `gajaeway work status <name>`, and send additional input to its open attempt with `gajaeway work steer <name> "<input>"`. Start returns an accepted receipt, not completion, and binds to the calling conversation (or the configured owner target if no known caller id is supplied). A settled start result is routed to its parent as an internal lane report turn, not as a human message. Lane parents receive reports through a durable inbox; an open parent attempt is steered, otherwise a new parent attempt is woken. Reports follow lane -> persona -> human. Runs remain response-only and never report; a run from a lane session is refused unless `work.allowNested=true`. Status is read-only: it does not bind, settle, refresh activity, or clear a hold. Steer never rebinds or starts a successor; `work steer acceptance uncertain` must not trigger an automatic retry with a new reference. An open attempt refuses another start/run even with `--resume`; steer or wait instead. A caller timeout (`work wait timed out; attempt remains observable`), disconnect, or shutdown ends only the wait, not the worker attempt.
 
 `GJC_SESSION_ID` is forwarded as `callerSessionId`, an untrusted routing hint on the owner-trusted socket. Socket clients are owner-equivalent, so this is not a security boundary; the nested-lane check is a policy guard. If report admission is refused, exactly one `[lane ...]` fallback entry is committed to the parent origin's delivery ledger. The ledger row is durable once, but the physical post is at-least-once and may duplicate after a crash. `work jobs` shows pending, claimed, held, and undeliverable report counts as `reports=p:N c:N h:N u:N` when any are non-zero; held and undeliverable entries require operator attention.
@@ -197,7 +347,7 @@ Changing the configured `gjc.agentDir` changes database authority; it is not a r
 The transaction preserves immutable historical snapshots and quarantine records, retires old session identities, advances origin epochs, and installs the single active target authority. It neither controls old broker sessions nor settles or replays their work. Accepted or unproven old work remains non-replayable; old private held lanes remain under their original authority and must not be converted to another authority's lanes. Old worker names remain reserved: use new names for new work, not `--resume`, a no-op run, or rewritten session IDs. The cutover does not authorize restoring shared configuration, host reaping, or session deletion. `ops cycle` treats an unbound origin as cutover history only while no inbound row, lane job, or monitor event for it exists outside quarantine and its `last_activity_at` is not after the cutover; any post-cutover admission evidence, including an inbound turn whose first bind fails, gates it again until it binds.
 5. Re-enable managed startup only after apply succeeds and the executable path explicitly configured in the service unit matches the normal user's verified `command -v gjc`, with the same canonical user profile and agent directory. Start recovery only under that target authority. Verify a newly gateway-created session has exactly the same ID in the gateway and the normal user's SDK; compare unrelated sessions and configuration fingerprints with the pre-cutover record, and verify the same user daemon survives a subsequent gateway restart without resend of accepted work.
 
-The database is currently schema 37 and still contains `broker_quarantine` and `broker_cutovers`. Preserve the cutover evidence and quarantine records during upgrades and authority changes.
+The database is currently schema 39 and still contains `broker_quarantine` and `broker_cutovers`. Schema 37 remains the native broker mutation journal. Schema 38 adds FirstMate assignment/attempt evidence; schema 39 adds immutable `firstmate_approvals`, `firstmate_release_intents`, and `firstmate_release_receipts` under the work owner without changing native journal schema 36 or projection replay. This source description does not establish a live database upgrade or historical approval backfill. Preserve the cutover evidence and quarantine records during upgrades and authority changes.
 
 ### Persistent-session binary rollback
 
@@ -227,7 +377,8 @@ Worker recovery independently resumes observation of the saved operation/session
 - **`inbound_starved` or stalled turns:** inspect `gajaeway ops cycle` and the session status/recovery fields. It is a gateway-owned session recovery condition; do not launch another GJC process or resend an operation with a new reference.
 - **Broker service unavailable or churning:** inspect the service-manager status and logs, then read `gajaeway-gateway broker-agent status [--json]` and `gajaeway ops cycle`. `broker_respawn_churn` and `broker_index_lock_blocked` are gates, not permission to delete broker state or a lease file. The gateway and broker host set `GJC_SDK_BROKER_AUTOSTART=0`, so GJC clients never start a replacement broker: the broker unit is the only lifecycle authority, and `broker_unavailable` from a client means the service is down, not that a client should restart it.
 - **Broker alive but not answering:** the broker host probes its own broker every 15s (fresh discovery heartbeat for the child pid plus a `session.get_endpoint` round trip, 10s bound). Until the broker first answers it gets 5 minutes (reboot recovery can be slow); after that, 90s of continuous failures makes it log `broker_host_unresponsive`, sends SIGTERM to the broker's private process group (including `session-host-internal` children), escalates to SIGKILL after 20s (`broker_host_stop_timeout`), waits for the group to exit, then exits 1 so the service manager restarts it. On macOS this terminates the broker's inherited SDK-host subprocesses together; Linux also has systemd's broader `KillMode=control-group` fence. Repeated replacement-broker `startup-deadline` failures or `persona_host_retired ... outcome=refused detail=inspect_failed: broker_unavailable` with `host_capacity` holds can indicate orphaned session hosts from an older broker host; check for stale `session-host-internal` processes and preserve the broker's `sdk/lifecycle-ledger.jsonl`. Do not kill unrelated ppid-1 processes. Expect about two minutes from wedge to a fresh broker, inside the gateway's 195s live-outage exit. Repeated `broker_host_unresponsive` lines are a GJC defect to report with the broker's `sdk/lifecycle-ledger.jsonl`, not a reason to disable the check.
-- **`broker_agent_unprovisioned` or entry drift:** status reports provision state and per-entry source/copy differences. Review it before `gajaeway setup --broker-agent`, which force-provisions the allowlist and can replace private copies. Stop the broker service before provisioning. The current schema is 37; `broker_quarantine` and `broker_cutovers` remain broker-authority evidence.
+- **Mapped FirstMate evidence is partial or unavailable:** use the saved `NAME`, `TASK_ID`, and `OP_REF` with `gajaeway work inspect NAME --task TASK_ID --op OP_REF`; inspect lifecycle, completeness, provenance, and reasons separately. Only an explicit `--native` permits a bounded exact-operation query. A pointer or missing text is not proof of execution failure or permission to select the latest answer, replay, steer a correction, or approve the task.
+- **`broker_agent_unprovisioned` or entry drift:** status reports provision state and per-entry source/copy differences. Review it before `gajaeway setup --broker-agent`, which force-provisions the allowlist and can replace private copies. Stop the broker service before provisioning. The current schema is 39; `broker_quarantine` and `broker_cutovers` remain broker-authority evidence.
 - **`gjc_unverified_version`:** the detected version exceeds the gateway's verified error contract. Test the pinned release against the gateway contract before changing the pin; the current GJC package pin is 0.18.12.
 - **`memory_git_index_locked`:** Git reported an existing `.git/index.lock`. Identify its owner; the closure queue retains the intent for recovery and `ops cycle` clears the gate when the lock is gone.
 - **`config.json is unreadable (...); refusing to start on defaults`:** repair the file or its target before restarting. An unreadable configuration does not silently become defaults.
