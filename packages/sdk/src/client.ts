@@ -9,8 +9,18 @@ import type {
 	OpsDeliveriesResult,
 	OpsSloParams,
 	OpsSloResult,
+	WorkApproveParams,
+	WorkApproveResult,
+	WorkFirstmateRetireParams,
+	WorkFirstmateRetireResult,
+	WorkInspectParams,
+	WorkInspectResult,
+	WorkRetireParams,
+	WorkRetireResult,
 	WorkRunParams,
 	WorkRunResult,
+	WorkStartParams,
+	WorkStartResult,
 } from "@gajae-gateway/protocol";
 import {
 	type ChatMessagePayload,
@@ -328,6 +338,21 @@ export class GajaewayClient {
 	}
 	workRun(params: WorkRunParams): Promise<WorkRunResult> {
 		return this.request("work.run", params);
+	}
+	workStart(params: WorkStartParams): Promise<WorkStartResult> {
+		return this.request("work.start", params);
+	}
+	/** Approval receipts require an explicit params.approvalId; never infer the latest approval. */
+	workInspect(params: WorkInspectParams): Promise<WorkInspectResult> {
+		return this.request("work.inspect", params);
+	}
+	workApprove(params: WorkApproveParams): Promise<WorkApproveResult> {
+		return this.request("work.approve", params);
+	}
+	workRetire(
+		params: WorkRetireParams | WorkFirstmateRetireParams,
+	): Promise<WorkRetireResult | WorkFirstmateRetireResult> {
+		return this.request("work.retire", params);
 	}
 	opsCycle(params?: OpsCycleParams): Promise<OpsCycleResult> {
 		return this.request("ops.cycle", params);

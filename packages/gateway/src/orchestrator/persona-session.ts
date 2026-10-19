@@ -34,6 +34,8 @@ import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold 
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
 import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
+import { childPanes, readChildPane } from "./firstmate-pane";
+import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import {
 	ModelNotSelectedError,
 	type SessionBinding,
@@ -773,6 +775,13 @@ export class PersonaSessionManager {
 		return this.#actor(originKey).enqueue(async () => await this.#actor(originKey).admit());
 	}
 
+	/** Creation provenance is durable before this actor owns the persona binding. */
+	bindChildPane(origin: OriginRef): Promise<void> {
+		if (this.#stopped || this.#draining) return Promise.reject(new Error("persona manager unavailable"));
+		const actor = this.#actor(originKey(origin));
+		return actor.enqueue(() => actor.bindChildPane(origin));
+	}
+
 	/** Current durable/in-memory admission hold for lane-report decisions. */
 	admissionHold(originKey: string): string | undefined {
 		return this.#actor(originKey).admissionHold();
@@ -965,11 +974,15 @@ export class PersonaSessionManager {
 	 */
 	recover(): Promise<void> {
 		if (this.#stopped) return Promise.resolve();
+		const panes = childPanes(this.#database).filter(
+			(pane) => this.#database.work.workAttemptOpenByLane(`work-${pane.laneName}`) !== undefined,
+		);
 		const origins = new Set<string>([
 			...escalationNoticeOrigins(this.#database),
 			...this.#database.inbox.nonterminalOrigins(),
 			...this.#database.inbox.pendingOrigins(),
 			...this.#database.inbox.heldSteerOrigins(),
+			...panes.map((pane) => originKey(pane.childOrigin)),
 			...this.#database.bindings
 				.sessionIdentityRows()
 				.filter(
@@ -982,16 +995,19 @@ export class PersonaSessionManager {
 				.map((row) => row.origin_key),
 		]);
 		return Promise.all(
-			[...origins].map((originKey) =>
-				this.#actor(originKey).enqueue(async () => {
-					await this.#actor(originKey).recover();
-					await this.#actor(originKey).reconcile();
-					await this.#actor(originKey).recoverObserver();
+			[...origins].map((key) => {
+				const firstRecovery = !this.#actors.has(key);
+				return this.#actor(key).enqueue(async () => {
+					const pane = panes.find((pane) => originKey(pane.childOrigin) === key);
+					if (pane && firstRecovery) await this.#actor(key).bindChildPane(pane.childOrigin);
+					await this.#actor(key).recover();
+					await this.#actor(key).reconcile();
+					await this.#actor(key).recoverObserver();
 					// Pending rows outside a turn (released before the restart, or
 					// arrived while down) are dispatched now; nothing is expired.
-					await this.#actor(originKey).admit();
-				}),
-			),
+					await this.#actor(key).admit();
+				});
+			}),
 		).then(() => undefined);
 	}
 
@@ -1361,6 +1377,25 @@ class OriginActor {
 	/** A signalled host remains counted but cannot be reused until its process exits. */
 	#hostTerminatingSessionId: string | undefined;
 	#hostLastActiveAt = 0;
+
+	async bindChildPane(origin: OriginRef): Promise<void> {
+		if (originKey(origin) !== this.originKey || !readChildPane(this.#manager.database, origin))
+			throw new Error("FirstMate child provenance unavailable");
+		if (this.hostLive) return;
+		const admission = await this.#manager.admitHost(this);
+		if (!admission.admitted) throw new Error("FirstMate child persona host capacity unavailable");
+		try {
+			const binding = await this.#bindSession(this.#epoch());
+			// Recheck after native binding yields; provenance is independent of identity/epoch.
+			if (!readChildPane(this.#manager.database, origin)) throw new Error("FirstMate child provenance unavailable");
+			this.#manager.database.transaction((tx) =>
+				this.#manager.database.bindings.touch(tx, this.originKey, JSON.stringify(origin)),
+			);
+			this.#touchHost(binding.sessionId);
+		} finally {
+			this.#manager.releaseHostAdmission(this);
+		}
+	}
 	/** Set while the oldest pending trigger waits for a host slot. */
 	#hostHeldSince: number | undefined;
 	/** A proven refusal waits for an explicit model change or /new; process restart clears it. */

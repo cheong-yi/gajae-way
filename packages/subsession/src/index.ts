@@ -50,6 +50,7 @@ export {
 	type ReconciliationClass,
 	type RepositoryFacts,
 	recordChecksRetry,
+	reopenCompletedJob,
 	settleAwaitingChecks,
 	transitionToAwaitingChecks,
 } from "./job";
