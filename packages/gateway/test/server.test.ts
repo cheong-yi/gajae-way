@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
-import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdir, mkdtemp, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -8,16 +9,25 @@ import {
 	originKey,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
+	ProtocolError,
+	type WorkApproveParams,
+	type WorkFirstmateAssignmentParams,
+	type WorkFirstmateCorrectionParams,
+	type WorkInspectResult,
+	type WorkStartResult,
 } from "@gajae-gateway/protocol";
 import { createLaneJobRecord, MAX_STALLED_CONTINUATIONS, parseLaneJobRecord } from "@gajae-gateway/subsession";
+import { GajaewayClient } from "../../sdk/src/client";
 import type { GatewayConfig } from "../src/config";
 import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
 import { initializeMemory, memoryGit, memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { ModelNotSelectedError } from "../src/orchestrator/session-port";
+import * as ghChecks from "../src/orchestrator/gh-checks";
+import { WorkLaneManager } from "../src/orchestrator/work-lane";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
-import { Store } from "../src/store";
+import { FirstmateStore, Store } from "../src/store";
 import {
 	attachTestBrokerOwnership,
 	ScriptedSessionPort,
@@ -159,6 +169,1436 @@ async function startDeliveryServer(
 	return { client, config, database };
 }
 
+test("FirstMate work.retire dispatch requires exact outcome despite confirmed unrelated parent delivery", async () => {
+	directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-firstmate-closeout-")));
+	const repo = join(directory, "repo");
+	await mkdir(repo);
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "fixture",
+				GIT_AUTHOR_EMAIL: "fixture@example.test",
+				GIT_COMMITTER_NAME: "fixture",
+				GIT_COMMITTER_EMAIL: "fixture@example.test",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		return result.stdout.toString().trim();
+	};
+	git("init", "-q");
+	git("commit", "--allow-empty", "-qm", "fixture");
+	const path = join(directory, "assigned");
+	git("worktree", "add", "-qb", "firstmate/closeout", path);
+	const assignment: WorkFirstmateAssignmentParams = {
+		taskId: "closeout-task",
+		name: "closeout",
+		ownerId: "fixture-owner",
+		messageId: "assignment-message",
+		thread: { platform: "discord", kind: "thread", conversationId: "fixture-thread", parentId: "fixture-parent" },
+		mandate: { id: "closeout-mandate", text: "Scoped local result", checkRetries: false, commit: false, push: false },
+		worktree: {
+			path,
+			commonDir: await realpath(git("-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+			gitDir: await realpath(git("-C", path, "rev-parse", "--absolute-git-dir")),
+			branch: "firstmate/closeout",
+		},
+	};
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		dmPolicy: "open",
+		channels: { "discord:fixture-parent": { engagement: "mention-open" } },
+	};
+	const database = await Store.open(config.dbPath);
+	const port = new ScriptedSessionPort({ onBind: (input) => bindWorkFixture(input.originKey, input.epoch) });
+	attachTestBrokerOwnership(database, port, join(directory, "agent"));
+	const checks = spyOn(ghChecks, "ghCheckStatusClient").mockReturnValue({ getCheckStatus: async () => null });
+	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	try {
+		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+		client = await connect(config.socketPath);
+		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
+		await waitFor(client.frames, 1);
+		const request = async (id: string, verb: string, params: unknown) => {
+			client!.send({ v: "0.1", type: "request", id, verb, params });
+			await waitFrame(client!.frames, id);
+			const frame = client!.frames.find((frame) => frame.id === id);
+			expect(frame.type).toBe("response");
+			return frame.result;
+		};
+		const until = async (predicate: () => boolean) => {
+			for (let index = 0; index < 400 && !predicate(); index++) await Bun.sleep(5);
+			expect(predicate()).toBe(true);
+		};
+		const parent = originKey(assignment.thread);
+		await request("parent", "chat.send", {
+			origin: assignment.thread,
+			messageId: "parent-message",
+			text: "Unrelated parent turn",
+			engagement: { mentioned: true, group: true, authorId: assignment.ownerId },
+		});
+		await until(() => port.sends.some((send) => send.text.includes("Unrelated parent turn")));
+		const parentSend = port.sends.find((send) => send.text.includes("Unrelated parent turn"))!;
+		const start = await request("start", "work.start", { firstmate: assignment });
+		expect(start.started).toBe(true);
+		port.complete(start.opRef, "Scoped local result");
+		await until(() => Boolean(database.work.workAttemptGet(start.opRef)?.settledAt));
+		await port.runExclusive(start.sessionKey, async () => {});
+		const runtime = database.work.workAttemptGet(start.opRef)!;
+		expect(runtime.decision).toBe("fallback");
+		expect(database.inbox.messageDisposition(parent, runtime.reportId)).toBeUndefined();
+		expect(database.outbox.get(runtime.deliveryId)).toMatchObject({ turnId: runtime.opRef, originKey: parent });
+		expect(port.steers).toHaveLength(0);
+		port.complete(parentSend.opRef, "Unrelated parent reply");
+		await until(() => database.inbox.messageDisposition(parent, "parent-message")?.message.turn_state === "done");
+		await port.runExclusive(parent, async () => {});
+		const claims = JSON.parse(
+			database.inbox.messageDisposition(parent, "parent-message")!.message.terminal_delivery_id!,
+		);
+		expect(claims).not.toHaveProperty("none");
+		const deliveryId = Object.values(claims)[0] as string;
+		expect(database.outbox.get(deliveryId)).toBeDefined();
+		database.transaction((tx) => database.outbox.confirm(tx, deliveryId));
+		expect(database.outbox.get(deliveryId)?.state).toBe("confirmed");
+		const observed = await request("inspect", "work.inspect", {
+			name: assignment.name,
+			taskId: assignment.taskId,
+			opRef: start.opRef,
+		});
+		expect(observed.evidence.completeness).toBe("complete");
+		const { sessionKey: _key, ...identity } = observed.identity;
+		const binding = {
+			name: assignment.name,
+			identity,
+			ownerId: assignment.ownerId,
+			messageId: "approval-message",
+			thread: assignment.thread,
+			mandateId: assignment.mandate.id,
+			scope: "Accept only the scoped local result",
+		};
+		const approved = await request("approve", "work.approve", {
+			...binding,
+			decision: "accept_outcome",
+			evidence: { ...observed.evidence, reasons: observed.reasons },
+		});
+		expect(approved.recorded).toBe(true);
+		const retire = {
+			firstmate: {
+				...binding,
+				messageId: "release-message",
+				approvalId: approved.approval.approvalId,
+				action: "release_session_preserve_work",
+			},
+		};
+		const before = database.bindings.getSessionRecord(start.sessionKey);
+		const recover = spyOn(WorkLaneManager.prototype, "recover");
+		const dispatch = spyOn(WorkLaneManager.prototype, "retireFirstmate");
+		try {
+			expect(await request("retire", "work.retire", retire)).toEqual({
+				retired: false,
+				held: true,
+				reason: "release_obligations_unsettled",
+				obligations: [{ id: runtime.deliveryId, reason: "delivery_inflight" }],
+			});
+			expect(dispatch).toHaveBeenCalledTimes(1);
+			expect(dispatch).toHaveBeenCalledWith(retire);
+			expect(recover).not.toHaveBeenCalled();
+		} finally {
+			dispatch.mockRestore();
+			recover.mockRestore();
+		}
+		expect(port.closes).toHaveLength(0);
+		expect(database.bindings.getSessionRecord(start.sessionKey)).toEqual(before);
+		const owner = new FirstmateStore(database.core);
+		expect(owner.releaseForAttempt(start.opRef)).toBeUndefined();
+		expect(owner.approval(approved.approval.approvalId)).toEqual(approved.approval);
+		expect(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD")).toBe(assignment.worktree.branch);
+	} finally {
+		client?.close();
+		checks.mockRestore();
+	}
+});
+
+for (const { output, state, unavailable } of [
+	{ output: "exact local result", unavailable: false },
+	{ output: "한".repeat(8_000), unavailable: false },
+	{ output: "exact local result", unavailable: true },
+].flatMap(({ output, unavailable }) =>
+	(["attempt_ended", "done"] as const).map((state) => ({ output, state, unavailable })),
+)) {
+	test(`FirstMate local CLI/SDK correction and approval from ${state} preserves ${unavailable ? "unavailable corrected" : output.length > 100 ? "partial Unicode" : "complete"} evidence and thread attribution`, async () => {
+		directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-firstmate-wire-")));
+		const repo = join(directory, "repo");
+		await mkdir(repo);
+		const git = (...args: string[]) => {
+			const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+				env: {
+					...process.env,
+					GIT_AUTHOR_NAME: "fixture",
+					GIT_AUTHOR_EMAIL: "fixture@example.test",
+					GIT_COMMITTER_NAME: "fixture",
+					GIT_COMMITTER_EMAIL: "fixture@example.test",
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+			return result.stdout.toString().trim();
+		};
+		git("init", "-q");
+		git("commit", "--allow-empty", "-qm", "fixture");
+		git("init", "--bare", "-q", join(directory, "remote.git"));
+		git("remote", "add", "origin", join(directory, "remote.git"));
+		const path = join(directory, "assigned");
+		git("worktree", "add", "-qb", "firstmate/wire", path);
+		const independentPath = join(directory, "independent");
+		git("worktree", "add", "-qb", "firstmate/independent", independentPath);
+		if (state === "done") git("-C", path, "push", "-qu", "origin", "HEAD");
+		const headSha = git("-C", path, "rev-parse", "HEAD");
+		const assignment: WorkFirstmateAssignmentParams = {
+			taskId: "wire-task",
+			name: "wire",
+			ownerId: "fixture-owner",
+			messageId: "fixture-message",
+			thread: { platform: "discord", kind: "thread", conversationId: "fixture-thread", parentId: "fixture-parent" },
+			mandate: {
+				id: "wire-mandate",
+				text: "Produce only the scoped local result.",
+				checkRetries: false,
+				commit: false,
+				push: false,
+			},
+			worktree: {
+				path,
+				commonDir: await realpath(git("-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+				gitDir: await realpath(git("-C", path, "rev-parse", "--absolute-git-dir")),
+				branch: "firstmate/wire",
+			},
+		};
+		const config: GatewayConfig = {
+			schemaVersion: 1,
+			home: directory,
+			gjc: { agentDir: join(directory, "agent") },
+			configPath: join(directory, "config.json"),
+			socketPath: join(directory, "gateway.sock"),
+			dbPath: join(directory, "gateway.db"),
+			logVerbosity: "info",
+			dmPolicy: "open",
+			channels: { "discord:fixture-parent": { engagement: "mention-open" } },
+			work: { maxLanes: 5 },
+		};
+		let database = await Store.open(config.dbPath);
+		const parentOpening = "Establish the owner conversation for the local assignment.";
+		const port = new ScriptedSessionPort({
+			onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
+			onSend: (input, scripted) => {
+				// Persona opening/reports are auto-answered; worker settlement is explicitly scripted below.
+				if (input.text.includes(parentOpening) || input.text.includes("[Internal report from another Gajae session"))
+					scripted.complete(input.opRef, "[SILENT]");
+				if (input.text === "ordinary run") scripted.complete(input.opRef, "ordinary result");
+			},
+		});
+		attachTestBrokerOwnership(database, port, join(directory, "agent"));
+		// Script the existing checks dependency; this local proof must never invoke GitHub.
+		const checks = {
+			getCheckStatus: async (_branch: string, cwd: string) => {
+				expect([path, repo, independentPath]).toContain(cwd);
+				return state === "done" && cwd === path
+					? { prNumber: 610, headSha, status: "green" as const, failingChecks: [] }
+					: null;
+			},
+		};
+		const checksFactory = spyOn(ghChecks, "ghCheckStatusClient").mockReturnValue(checks);
+		server = await startUnixServer({ config, database, sessionPort: port });
+		let sdk = await GajaewayClient.connectSocket(config.socketPath);
+		const cli = async (...args: string[]) => {
+			const process = Bun.spawn(
+				[
+					Bun.which("bun")!,
+					new URL("../../cli/src/main.ts", import.meta.url).pathname,
+					"--socket",
+					config.socketPath,
+					"work",
+					...args,
+				],
+				{ stdout: "pipe", stderr: "pipe" },
+			);
+			const [stdout, stderr, code] = await Promise.all([
+				new Response(process.stdout).text(),
+				new Response(process.stderr).text(),
+				process.exited,
+			]);
+			return { stdout, stderr, code };
+		};
+		const until = async (predicate: () => boolean) => {
+			for (let index = 0; index < 400 && !predicate(); index++) await Bun.sleep(5);
+			expect(predicate()).toBe(true);
+		};
+		const file = join(directory, "assignment.json");
+		await writeFile(file, JSON.stringify(assignment));
+		try {
+			// Native reports require an existing parent session, not only an immutable origin reference.
+			expect(
+				await sdk.request("chat.send", {
+					origin: assignment.thread,
+					messageId: assignment.messageId,
+					text: parentOpening,
+					engagement: { mentioned: true, group: true, authorId: assignment.ownerId },
+				}),
+			).toMatchObject({ engaged: true });
+			await until(() =>
+				Boolean(
+					database.core
+						.groupDb("work")
+						.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND state = 'done'")
+						.get(assignment.messageId, originKey(assignment.thread)),
+				),
+			);
+			await port.runExclusive(originKey(assignment.thread), async () => {});
+			expect(database.bindings.getSessionRecord(originKey(assignment.thread))?.sessionId).toBeDefined();
+			let manager!: WorkLaneManager;
+			const startFirstmate = WorkLaneManager.prototype.startFirstmate;
+			const managerSpy = spyOn(WorkLaneManager.prototype, "startFirstmate").mockImplementation(function (
+				this: WorkLaneManager,
+				input,
+			) {
+				manager = this;
+				return startFirstmate.call(this, input);
+			});
+			let submitted: Awaited<ReturnType<typeof cli>>;
+			try {
+				submitted = await cli("start", "--firstmate", file);
+			} finally {
+				managerSpy.mockRestore();
+			}
+			expect(submitted.stderr).toBe("");
+			expect(submitted.code).toBe(0);
+			const start: WorkStartResult = JSON.parse(submitted.stdout);
+			if (!start.started) throw new Error("unexpected initial hold");
+			const owner = new FirstmateStore(database.core);
+			expect(owner.assignment(assignment.name)).toEqual(assignment);
+			expect(owner.initial(assignment.taskId)).toMatchObject({
+				taskId: assignment.taskId,
+				jobId: start.jobId,
+				opRef: start.opRef,
+				sessionId: start.sessionId,
+				ordinal: 0,
+				text: assignment.mandate.text,
+			});
+			expect(port.sends.filter((send) => send.opRef === start.opRef)).toHaveLength(1);
+			expect(port.sends.find((send) => send.opRef === start.opRef)).toMatchObject({
+				text: assignment.mandate.text,
+				repo: path,
+			});
+			expect(database.work.workAttemptGet(start.opRef)?.parent).toEqual({
+				kind: "persona",
+				originKey: originKey(assignment.thread),
+				origin: assignment.thread,
+			});
+			expect(await sdk.workStart({ firstmate: assignment })).toEqual(start);
+			expect(port.sendAttempts.filter((send) => send.opRef === start.opRef)).toHaveLength(1);
+			const selectors = { name: assignment.name, taskId: assignment.taskId, opRef: start.opRef };
+			const inspectArgs = ["inspect", assignment.name, "--task", assignment.taskId, "--op", start.opRef];
+			const beforeReads = port.workerOutputReads.length;
+			const open = await sdk.workInspect(selectors);
+			expect(open).toMatchObject({
+				identity: { taskId: assignment.taskId, opRef: start.opRef },
+				lifecycle: { sendPhase: "accepted", terminal: null, settledAt: null },
+				evidence: { completeness: "unavailable" },
+				execution: "not_evaluated",
+			});
+			const openCli = await cli(...inspectArgs);
+			expect(openCli.code).toBe(0);
+			expect(JSON.parse(openCli.stdout)).toEqual(open);
+			expect(port.workerOutputReads).toHaveLength(beforeReads);
+
+			for (const firstmate of [
+				{ ...assignment, messageId: "conflicting-message" },
+				{ ...assignment, thread: { ...assignment.thread, conversationId: "other-thread" } },
+				{ ...assignment, mandate: { ...assignment.mandate, push: true } },
+				{ ...assignment, worktree: { ...assignment.worktree, branch: "other-branch" } },
+			])
+				await expect(sdk.workStart({ firstmate })).rejects.toBeDefined();
+			for (const params of [
+				null,
+				[],
+				{ firstmate: null },
+				{ firstmate: [] },
+				{ firstmate: assignment, name: "bypass" },
+				{ firstmate: { ...assignment, mandate: [] } },
+				{ firstmate: { ...assignment, worktree: null } },
+				{ firstmate: { ...assignment, thread: [] } },
+			]) {
+				await expect(sdk.request("work.start", params)).rejects.toMatchObject({ code: "invalid_params" });
+			}
+			for (const params of [
+				null,
+				[],
+				{},
+				{ ...selectors, native: null },
+				{ ...selectors, native: "true" },
+				{ ...selectors, taskId: " " },
+				{ ...selectors, opRef: "" },
+				{ ...selectors, latest: true },
+			]) {
+				await expect(sdk.request("work.inspect", params)).rejects.toMatchObject({ code: "invalid_params" });
+			}
+			const inspect = spyOn(WorkLaneManager.prototype, "inspectFirstmate");
+			try {
+				await expect(sdk.workInspect({ ...selectors, approvalId: " " })).rejects.toMatchObject({
+					code: "invalid_params",
+					detail: { reasonCode: "invalid_work_params" },
+				});
+				expect(inspect).not.toHaveBeenCalled();
+				await sdk.workInspect({ ...selectors, approvalId: "approval-explicit" });
+				expect(inspect).toHaveBeenCalledWith({ ...selectors, approvalId: "approval-explicit" });
+				await sdk.workInspect(selectors);
+				expect(inspect.mock.calls.at(-1)?.[0]).not.toHaveProperty("approvalId");
+			} finally {
+				inspect.mockRestore();
+			}
+			for (const verb of ["work.start", "work.run", "work.steer"]) {
+				const diagnostic = `FirstMate bypass ${output.length > 100 ? "partial" : "complete"} ${verb}`;
+				let rejected = false;
+				let rejection: unknown;
+				console.info(`${diagnostic}: pending`);
+				try {
+					await sdk.request(verb, { name: assignment.name, text: "bypass", cwd: path });
+				} catch (error) {
+					rejected = true;
+					rejection = error;
+				}
+				if (!rejected) throw new Error(`${diagnostic}: unexpectedly fulfilled`);
+				if (!(rejection instanceof ProtocolError)) throw new Error(`${diagnostic}: rejected without SDK ProtocolError`);
+				console.info(`${diagnostic}: ProtocolError received`);
+				expect(rejection.name).toBe("ProtocolError");
+				expect(rejection.code).toBe("invalid_params");
+				expect(rejection.message).toBe("FirstMate admission refused");
+				expect(rejection.detail).toEqual({
+					reasonCode: "firstmate_admission_refused",
+					reason: "mapped_lane_requires_owner_admission",
+				});
+				console.info(`${diagnostic}: exact mapped admission refusal confirmed`);
+			}
+			expect(port.sends.filter((send) => send.opRef === start.opRef)).toHaveLength(1);
+			expect(port.steers).toHaveLength(0);
+
+			port.complete(start.opRef, output);
+			await until(() => Boolean(database.work.workAttemptGet(start.opRef)?.settledAt));
+			await port.runExclusive(start.sessionKey, async () => {});
+			if (state === "done") await manager.recover();
+			const job = () => parseLaneJobRecord(database.work.laneJobJson(start.jobId)!);
+			expect(job().state).toBe(state);
+			expect(database.work.workAttemptGet(start.opRef)?.decision).toBe("fallback");
+			const sql = () => database.core.groupDb("work");
+			const initialRuntime = database.work.workAttemptGet(start.opRef)!;
+			expect(database.outbox.get(initialRuntime.deliveryId)).toMatchObject({
+				turnId: start.opRef,
+				originKey: originKey(assignment.thread),
+			});
+			expect(database.inbox.messageDisposition(originKey(assignment.thread), initialRuntime.reportId)).toBeUndefined();
+			expect(port.sends.some((send) => send.text.includes("[Internal report from another Gajae session"))).toBe(false);
+			const confirmOutcomes = () =>
+				database.transaction((tx) => {
+					for (const row of database.outbox.rows())
+						if (row.origin_key === originKey(assignment.thread) && row.state !== "confirmed")
+							database.outbox.confirm(tx, row.delivery_id);
+				});
+			confirmOutcomes();
+
+			// All asynchronous settlement/reporting is outside the read-only window.
+			const snapshot = () => ({
+				jobs: sql().prepare("SELECT * FROM lane_jobs ORDER BY job_id").all(),
+				runtimes: sql().prepare("SELECT * FROM work_attempt_runtime ORDER BY op_ref").all(),
+				bindings: database.bindings.workLaneRows(),
+				attributions: sql().prepare("SELECT * FROM firstmate_attempts ORDER BY op_ref").all(),
+				assignments: sql().prepare("SELECT * FROM firstmate_assignments ORDER BY task_id").all(),
+				journal: sql().prepare("SELECT * FROM work_journal ORDER BY seq").all(),
+				reports: sql().prepare("SELECT * FROM lane_reports ORDER BY report_id").all(),
+				inbox: sql().prepare("SELECT * FROM inbound_messages ORDER BY message_id").all(),
+				deliveries: sql().prepare("SELECT * FROM deliveries ORDER BY delivery_id").all(),
+			});
+			const observe = async <T>(
+				request: () => Promise<T>,
+				reads = 0,
+				connection: "sdk" | "cli" = "sdk",
+			): Promise<T> => {
+				const before = structuredClone(snapshot());
+				// A fresh CLI negotiates hello before work.inspect. Attribute its synchronous
+				// empty delivery sweep separately; no transaction is allowed in the route.
+				type SweepObservation = {
+					stack: string;
+					onConnect: boolean | undefined;
+					duringInspection: boolean;
+					before: ReturnType<typeof snapshot>;
+					after?: ReturnType<typeof snapshot>;
+					result?: ReturnType<DeliveryService["sweep"]>;
+				};
+				const sweeps: SweepObservation[] = [];
+				let activeSweep: SweepObservation | undefined;
+				let inspecting = false;
+				const transactions: Array<{ sweep: SweepObservation | undefined; inspecting: boolean; stack: string }> = [];
+				const transaction = database.transaction.bind(database);
+				const observeTransaction: typeof database.transaction = (operation) => {
+					transactions.push({ sweep: activeSweep, inspecting, stack: new Error("Store.transaction").stack ?? "" });
+					return transaction(operation);
+				};
+				const transactionSpy = spyOn(database, "transaction").mockImplementation(observeTransaction);
+				const sweep = DeliveryService.prototype.sweep;
+				const sweepSpy = spyOn(DeliveryService.prototype, "sweep").mockImplementation(function (
+					this: DeliveryService,
+					...args: Parameters<DeliveryService["sweep"]>
+				) {
+					const observation: SweepObservation = {
+						stack: new Error("DeliveryService.sweep").stack ?? "",
+						onConnect: args[1],
+						duringInspection: inspecting,
+						before: structuredClone(snapshot()),
+					};
+					sweeps.push(observation);
+					const previous = activeSweep;
+					activeSweep = observation;
+					try {
+						observation.result = sweep.apply(this, args);
+						return observation.result;
+					} finally {
+						observation.after = structuredClone(snapshot());
+						activeSweep = previous;
+					}
+				});
+				const inspect = WorkLaneManager.prototype.inspectFirstmate;
+				const inspectSpy = spyOn(WorkLaneManager.prototype, "inspectFirstmate").mockImplementation(async function (
+					this: WorkLaneManager,
+					input,
+				) {
+					const routeBefore = structuredClone(snapshot());
+					const routeTransactions = transactions.length;
+					expect(activeSweep).toBeUndefined();
+					expect(sweeps).toHaveLength(connection === "cli" ? 1 : 0);
+					inspecting = true;
+					try {
+						return await inspect.call(this, input);
+					} finally {
+						inspecting = false;
+						expect(transactions).toHaveLength(routeTransactions);
+						expect(snapshot()).toEqual(routeBefore);
+					}
+				});
+				const spies = [
+					["WorkLaneManager.recover", spyOn(WorkLaneManager.prototype, "recover")] as const,
+					["work.workAttemptPrepare", spyOn(database.work, "workAttemptPrepare")] as const,
+					["checks.getCheckStatus", spyOn(checks, "getCheckStatus")] as const,
+					...(["bind", "send", "status", "liveness", "inspect", "resume", "steer", "close", "attachTail"] as const).map(
+						(method) => [`port.${method}`, spyOn(port, method)] as const,
+					),
+				];
+				const outputSpy = spyOn(port, "fetchWorkerOutput");
+				try {
+					const result = await request();
+					expect(inspectSpy).toHaveBeenCalledTimes(1);
+					expect(sweeps).toHaveLength(connection === "cli" ? 1 : 0);
+					for (const observed of sweeps) {
+						expect(observed.onConnect).toBe(true);
+						expect(observed.duringInspection).toBe(false);
+						expect(observed.stack).toMatch(/at handleFrame \([^)\n]*\/server\/server\.ts:\d+:\d+\)/);
+						expect(observed.stack).not.toContain("at handleRequest ");
+						expect(observed.before.deliveries).toEqual(before.deliveries);
+						expect(observed.result).toEqual({ payloads: [], expired: [] });
+						expect(observed.after).toEqual(observed.before);
+						expect(transactions.filter((call) => call.sweep === observed)).toHaveLength(1);
+					}
+					for (const call of transactions) {
+						expect(call.inspecting).toBe(false);
+						expect(call.sweep).toBe(sweeps[0]);
+						expect(call.sweep, call.stack).not.toBeUndefined();
+						expect(call.stack).toMatch(/at sweep \([^)\n]*\/delivery\/delivery\.ts:\d+:\d+\)/);
+						expect(call.stack).toMatch(/at handleFrame \([^)\n]*\/server\/server\.ts:\d+:\d+\)/);
+						expect(call.stack).not.toContain("at handleRequest ");
+					}
+					expect(transactionSpy).toHaveBeenCalledTimes(connection === "cli" ? 1 : 0);
+					for (const [method, spy] of spies)
+						expect({ method, calls: spy.mock.calls.length }).toEqual({ method, calls: 0 });
+					expect(outputSpy).toHaveBeenCalledTimes(reads);
+					expect(snapshot()).toEqual(before);
+					return result;
+				} finally {
+					outputSpy.mockRestore();
+					for (const [, spy] of spies.reverse()) spy.mockRestore();
+					inspectSpy.mockRestore();
+					sweepSpy.mockRestore();
+					transactionSpy.mockRestore();
+				}
+			};
+			const retained: WorkInspectResult = await observe(() => sdk.workInspect(selectors));
+			expect(retained.identity).toEqual({
+				taskId: assignment.taskId,
+				jobId: start.jobId,
+				ordinal: 0,
+				opRef: start.opRef,
+				sessionKey: start.sessionKey,
+				sessionId: start.sessionId,
+				epoch: owner.initial(assignment.taskId)!.epoch,
+			});
+			expect(retained.lifecycle?.settledAt).toBeTruthy();
+			expect(retained.lifecycle?.terminal?.kind).toBe("broker");
+			expect(retained.execution).toBe("not_evaluated");
+			expect(retained.evidence.provenance).toEqual(database.work.workAttemptGet(start.opRef)!.output.proof!);
+			const exactCli = await observe(() => cli(...inspectArgs), 0, "cli");
+			expect(exactCli.code).toBe(0);
+			expect(JSON.parse(exactCli.stdout)).toEqual(retained);
+			const partial = output.length > 100;
+			expect(retained.evidence.completeness).toBe(partial ? "partial" : "complete");
+			expect(output.startsWith(retained.evidence.text!)).toBe(true);
+			const native = await observe(() => sdk.workInspect({ ...selectors, native: true }), partial ? 1 : 0);
+			expect(native.lifecycle).toEqual(retained.lifecycle);
+			if (partial) {
+				expect(native.evidence).toMatchObject({ completeness: "partial", source: "native" });
+				expect(Buffer.byteLength(native.evidence.text!)).toBe(16_383);
+				expect(native.evidence.text).not.toContain("�");
+				expect(port.workerOutputReads.at(-1)).toMatchObject({
+					opRef: start.opRef,
+					sessionId: start.sessionId,
+					repo: path,
+				});
+				port.setWorkerOutputFixture(start.opRef, {
+					exitCode: 0,
+					stdout: JSON.stringify({ ok: false, error: { code: "endpoint_stale" } }),
+					stderr: "",
+				});
+				const stale = await observe(() => sdk.workInspect({ ...selectors, native: true }), 1);
+				expect(stale.evidence).toEqual(retained.evidence);
+				expect(stale.reasons).toContain("output_unavailable");
+				// Wrong operation ownership in native content must never leak that body.
+				port.setWorkerOutputFixture(start.opRef, {
+					exitCode: 0,
+					stdout: JSON.stringify({
+						ok: true,
+						result: {
+							kind: "prompt",
+							clientRef: "other-op",
+							status: "terminal_ok",
+							terminalAt: Date.now(),
+							receiptState: "present",
+							content: { version: 1, type: "text", text: "foreign private body", byteLength: 20, truncated: false },
+						},
+					}),
+					stderr: "",
+				});
+				const foreign = await observe(() => sdk.workInspect({ ...selectors, native: true }), 1);
+				expect(foreign.evidence).toEqual(retained.evidence);
+				expect(JSON.stringify(foreign)).not.toContain("foreign private body");
+			} else {
+				expect(native).toEqual(retained);
+				expect(retained.evidence.text).toBe(output);
+				const nativeCli = await observe(() => cli(...inspectArgs, "--native"), 0, "cli");
+				expect(JSON.parse(nativeCli.stdout)).toEqual(retained);
+			}
+			for (const wrong of [
+				{ ...selectors, taskId: "wrong-task" },
+				{ ...selectors, opRef: "wrong-op" },
+				{ ...selectors, name: "wrong-name" },
+			]) {
+				const result = await observe(() => sdk.workInspect({ ...wrong, native: true }));
+				expect(result.identity).toBeNull();
+				expect(result.evidence).toEqual({ completeness: "unavailable" });
+			}
+			const getBinding = database.bindings.getSessionRecord.bind(database.bindings);
+			const bindingSpy = spyOn(database.bindings, "getSessionRecord").mockImplementation((key) => {
+				const record = getBinding(key);
+				return key === start.sessionKey && record ? { ...record, sessionId: "foreign-session" } : record;
+			});
+			try {
+				const foreign = await observe(() => sdk.workInspect({ ...selectors, native: true }));
+				expect(foreign.evidence).toEqual({ completeness: "unavailable" });
+				expect(foreign.reasons).toContain("stale_binding");
+			} finally {
+				bindingSpy.mockRestore();
+			}
+			const correction: WorkFirstmateCorrectionParams = {
+				name: assignment.name,
+				taskId: assignment.taskId,
+				ownerId: assignment.ownerId,
+				messageId: "fixture-correction",
+				thread: assignment.thread,
+				mandateId: assignment.mandate.id,
+				priorOpRef: start.opRef,
+				text: "Correct the same scoped task without changing its mandate.",
+			};
+			const noEffects = async <T>(request: () => Promise<T>, currentPort = port): Promise<T> => {
+				const before = structuredClone(snapshot());
+				const spies = [
+					spyOn(database, "transaction"),
+					spyOn(database.work, "workAttemptPrepare"),
+					spyOn(WorkLaneManager.prototype, "recover"),
+					...(["bind", "send", "resume", "steer", "inspect", "status", "liveness", "attachTail", "close"] as const).map(
+						(method) => spyOn(currentPort, method),
+					),
+				];
+				try {
+					const result = await request();
+					for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+					expect(snapshot()).toEqual(before);
+					return result;
+				} finally {
+					for (const spy of spies.reverse()) spy.mockRestore();
+				}
+			};
+			const refuse = (input: WorkFirstmateCorrectionParams, reason: string) =>
+				noEffects(async () => {
+					await expect(sdk.workStart({ firstmateCorrection: input })).rejects.toMatchObject({
+						name: "ProtocolError",
+						code: "invalid_params",
+						message: "FirstMate admission refused",
+						detail: { reasonCode: "firstmate_admission_refused", reason },
+					});
+				});
+			const malformed = [
+				null,
+				[],
+				{},
+				...["name", "taskId", "ownerId", "messageId", "mandateId", "priorOpRef", "text"].flatMap((key) =>
+					[undefined, null, 1, false, "", " "].map((value) => ({ ...correction, [key]: value })),
+				),
+				...["resume", "cwd", "repo", "model", "preset", "commit", "push", "mandate", "worktree", "extra"].map(
+					(key) => ({ ...correction, [key]: true }),
+				),
+				...[
+					null,
+					[],
+					{},
+					{ ...correction.thread, platform: "invalid" },
+					{ ...correction.thread, kind: "invalid" },
+					{ ...correction.thread, conversationId: " " },
+					{ ...correction.thread, parentId: null },
+					{ ...correction.thread, peerId: "" },
+					{ ...correction.thread, threadVisibility: "unknown" },
+					{ ...correction.thread, extra: true },
+				].map((thread) => ({ ...correction, thread })),
+			];
+			for (const params of [
+				...malformed.map((firstmateCorrection) => ({ firstmateCorrection })),
+				...["firstmate", "name", "text", "cwd", "repo", "resume", "model", "preset", "extra"].map((key) => ({
+					firstmateCorrection: correction,
+					[key]: key === "firstmate" ? assignment : true,
+				})),
+			]) {
+				await noEffects(async () => {
+					const dispatch = spyOn(WorkLaneManager.prototype, "startFirstmateCorrection");
+					const initialDispatch = spyOn(WorkLaneManager.prototype, "startFirstmate");
+					const ordinaryDispatch = spyOn(WorkLaneManager.prototype, "start");
+					try {
+						await expect(sdk.request("work.start", params)).rejects.toMatchObject({
+							name: "ProtocolError",
+							code: "invalid_params",
+							detail: { reasonCode: "invalid_work_params" },
+						});
+						expect(dispatch).not.toHaveBeenCalled();
+						expect(initialDispatch).not.toHaveBeenCalled();
+						expect(ordinaryDispatch).not.toHaveBeenCalled();
+					} finally {
+						dispatch.mockRestore();
+						initialDispatch.mockRestore();
+						ordinaryDispatch.mockRestore();
+					}
+				});
+			}
+			for (const verb of ["work.run", "work.status", "work.steer"]) {
+				await noEffects(async () => {
+					await expect(
+						sdk.request(verb, { name: assignment.name, text: "bypass", firstmateCorrection: correction }),
+					).rejects.toMatchObject({ code: "invalid_params", detail: { reasonCode: "invalid_work_params" } });
+				});
+			}
+			for (const patch of [
+				{ name: "wrong" },
+				{ taskId: "wrong" },
+				{ ownerId: "wrong" },
+				{ mandateId: "wrong" },
+				{ messageId: assignment.messageId },
+				{ thread: { ...assignment.thread, conversationId: "wrong" } },
+				{ thread: { ...assignment.thread, parentId: "wrong" } },
+				{ thread: { ...assignment.thread, threadVisibility: "private" as const } },
+			])
+				await refuse({ ...correction, ...patch }, "correction_authority_mismatch");
+			await refuse({ ...correction, priorOpRef: "wrong" }, "correction_predecessor_not_settled");
+			git("-C", path, "branch", "-m", "firstmate/swapped");
+			try {
+				await refuse(correction, "branch_changed");
+			} finally {
+				git("-C", path, "branch", "-m", assignment.worktree.branch);
+			}
+			const movedPath = join(directory, "temporarily-unavailable");
+			await rename(path, movedPath);
+			try {
+				const missing = await observe(() => sdk.workInspect(selectors));
+				expect(missing.identity).toEqual(retained.identity);
+				expect(missing.evidence).toEqual(retained.evidence);
+				expect(missing.reasons).toContain("worktree_missing_execution_held");
+				await refuse(correction, "worktree_unavailable");
+			} finally {
+				await rename(movedPath, path);
+			}
+			const originalRuntime = structuredClone(database.work.workAttemptGet(start.opRef)!);
+			const originalAttribution = structuredClone(owner.initial(assignment.taskId)!);
+			const originalJob = job();
+			const originalReport = database.outbox.get(originalRuntime.deliveryId);
+			expect(originalReport).toMatchObject({
+				originKey: originKey(assignment.thread),
+				turnId: start.opRef,
+				payloadJson: expect.stringContaining(start.opRef),
+			});
+			const correctionFile = join(directory, "correction.json");
+			await writeFile(correctionFile, JSON.stringify(correction));
+			const dispatch = spyOn(WorkLaneManager.prototype, "startFirstmateCorrection");
+			const prepare = spyOn(database.work, "workAttemptPrepare");
+			const binds = spyOn(port, "bind");
+			const resumes = spyOn(port, "resume");
+			const recoverCorrection = spyOn(WorkLaneManager.prototype, "recover");
+			let correctedCli: Awaited<ReturnType<typeof cli>>;
+			let concurrentCorrection: WorkStartResult;
+			try {
+				[correctedCli, concurrentCorrection] = await Promise.all([
+					cli("start", "--firstmate-correction", correctionFile),
+					sdk.workStart({ firstmateCorrection: correction }),
+				]);
+				expect(dispatch).toHaveBeenCalledTimes(2);
+				for (const args of dispatch.mock.calls) expect(args).toEqual([correction]);
+				expect(prepare).toHaveBeenCalledTimes(1);
+				expect(binds).not.toHaveBeenCalled();
+				expect(resumes).not.toHaveBeenCalled();
+				expect(recoverCorrection).not.toHaveBeenCalled();
+			} finally {
+				dispatch.mockRestore();
+				prepare.mockRestore();
+				binds.mockRestore();
+				resumes.mockRestore();
+				recoverCorrection.mockRestore();
+			}
+			expect(correctedCli.stderr).toBe("");
+			expect(correctedCli.code).toBe(0);
+			const corrected: WorkStartResult = JSON.parse(correctedCli.stdout);
+			expect(concurrentCorrection).toEqual(corrected);
+			if (!corrected.started) throw new Error("correction unexpectedly held");
+			expect(corrected).toEqual({ ...start, opRef: corrected.opRef });
+			expect(corrected.opRef).not.toBe(start.opRef);
+			expect(job().state).toBe("running");
+			expect(job().lane).toEqual(originalJob.lane);
+			expect(job().attempts.slice(0, -1)).toEqual([...originalJob.attempts]);
+			expect(owner.assignment(assignment.name)).toEqual(assignment);
+			expect(owner.attempt(corrected.opRef)).toMatchObject({
+				taskId: assignment.taskId,
+				jobId: start.jobId,
+				sessionId: start.sessionId,
+				epoch: originalAttribution.epoch,
+				ordinal: 1,
+				text: correction.text,
+				cause: {
+					kind: "correction",
+					priorOpRef: start.opRef,
+					ownerId: correction.ownerId,
+					messageId: correction.messageId,
+					mandateId: correction.mandateId,
+				},
+			});
+			expect(await noEffects(() => sdk.workStart({ firstmateCorrection: correction }))).toEqual(corrected);
+			await refuse({ ...correction, text: "changed" }, "correction_conflict");
+			await refuse({ ...correction, priorOpRef: corrected.opRef }, "correction_conflict");
+			await refuse({ ...correction, messageId: "stale-message" }, "correction_predecessor_not_settled");
+			const secondOutput = partial ? "별".repeat(8_000) : "independent corrected result";
+			const fetchOutput = port.fetchWorkerOutput.bind(port);
+			if (unavailable) {
+				port.fetchWorkerOutput = async (input) =>
+					input.opRef === corrected.opRef ? { status: "unavailable", code: "output_unavailable" } : fetchOutput(input);
+			}
+			port.complete(corrected.opRef, secondOutput);
+			await until(() => Boolean(database.work.workAttemptGet(corrected.opRef)?.settledAt));
+			await port.runExclusive(start.sessionKey, async () => {});
+			if (state === "done") await manager.recover();
+			expect(job().state).toBe(state);
+			const correctedRuntime = database.work.workAttemptGet(corrected.opRef)!;
+			confirmOutcomes();
+			expect(correctedRuntime.reportId).not.toBe(originalRuntime.reportId);
+			expect(database.outbox.get(correctedRuntime.deliveryId)).toMatchObject({
+				originKey: originKey(assignment.thread),
+				turnId: corrected.opRef,
+				payloadJson: expect.stringContaining(corrected.opRef),
+			});
+			expect(
+				database.inbox.messageDisposition(originKey(assignment.thread), correctedRuntime.reportId),
+			).toBeUndefined();
+			expect(port.sends.some((send) => send.text.includes("[Internal report from another Gajae session"))).toBe(false);
+			expect(database.outbox.get(originalRuntime.deliveryId)).toEqual(originalReport);
+			expect(database.work.workAttemptGet(start.opRef)).toEqual(originalRuntime);
+			expect(owner.initial(assignment.taskId)).toEqual(originalAttribution);
+			expect(await observe(() => sdk.workInspect(selectors))).toEqual(retained);
+			const correctedSelectors = { ...selectors, opRef: corrected.opRef };
+			const second = await observe(() => sdk.workInspect(correctedSelectors));
+			expect(second.identity).toEqual({ ...retained.identity!, opRef: corrected.opRef, ordinal: 1 });
+			expect(second.evidence.provenance).toEqual(correctedRuntime.output.proof ?? undefined);
+			expect(second.evidence.completeness).toBe(unavailable ? "unavailable" : partial ? "partial" : "complete");
+			if (unavailable) expect(second.evidence.text).toBeUndefined();
+			else {
+				expect(secondOutput.startsWith(second.evidence.text!)).toBe(true);
+				expect(second.evidence.text).not.toContain("�");
+			}
+			expect(second.evidence).not.toEqual(retained.evidence);
+			const secondNative = await observe(
+				() => sdk.workInspect({ ...correctedSelectors, native: true }),
+				partial || unavailable ? 1 : 0,
+			);
+			expect(secondNative.evidence.completeness).toBe(second.evidence.completeness);
+			if (partial) expect(Buffer.byteLength(secondNative.evidence.text!)).toBe(16_383);
+			else if (!unavailable) expect(second.evidence.text).toBe(secondOutput);
+			const secondCli = await observe(
+				() => cli("inspect", assignment.name, "--task", assignment.taskId, "--op", corrected.opRef),
+				0,
+				"cli",
+			);
+			expect(secondCli.code).toBe(0);
+			expect(JSON.parse(secondCli.stdout)).toEqual(second);
+			const decisionFor = (view: WorkInspectResult, messageId: string): WorkApproveParams => {
+				if (!view.identity) throw new Error("exact identity missing");
+				const { sessionKey: _sessionKey, ...identity } = view.identity;
+				const binding = {
+					name: assignment.name,
+					identity,
+					ownerId: assignment.ownerId,
+					messageId,
+					thread: assignment.thread,
+					mandateId: assignment.mandate.id,
+					scope:
+						view.evidence.completeness === "unavailable"
+							? "Acknowledge only the identified absence; no outcome acceptance or release."
+							: "Accept only this exact local outcome; no publication or release.",
+				};
+				if (view.evidence.completeness === "unavailable")
+					return {
+						...binding,
+						decision: "acknowledge_unavailable",
+						evidence: { completeness: "unavailable", reasons: view.reasons },
+					};
+				const { completeness, text, source, provenance } = view.evidence;
+				if (text === undefined || !source || !provenance) throw new Error("available evidence missing");
+				return {
+					...binding,
+					decision: "accept_outcome",
+					evidence: { completeness, text, source, provenance, reasons: view.reasons },
+				};
+			};
+			const approval = decisionFor(second, "approve-corrected");
+			// Native done/attempt_ended and reports alone must not create policy receipts.
+			expect(sql().prepare("SELECT * FROM firstmate_approvals").all()).toEqual([]);
+			const approvalLineage = new AsyncLocalStorage<symbol>();
+			const approvalEffects = async <T>(
+				request: () => Promise<T>,
+				expected: unknown,
+				connection: "sdk" | "cli" = "sdk",
+				currentPort = port,
+				uncertainObservers: ReadonlyArray<{ identity: WorkApproveParams["identity"]; repo: string }> = [],
+			): Promise<T> => {
+				const before = structuredClone(snapshot());
+				const gitBefore = git("-C", path, "status", "--porcelain=v1", "--untracked-files=all");
+				const method = WorkLaneManager.prototype.approveFirstmate;
+				let inApproval = false;
+				const dispatch = spyOn(WorkLaneManager.prototype, "approveFirstmate").mockImplementation(async function (
+					this: WorkLaneManager,
+					input,
+				) {
+					const envelope: { value: unknown } = { value: input };
+					expect(envelope).toEqual({ value: expected });
+					const routeBefore = structuredClone(snapshot());
+					inApproval = true;
+					try {
+						return await approvalLineage.run(Symbol("work.approve"), () => method.call(this, input));
+					} finally {
+						inApproval = false;
+						expect(snapshot()).toEqual(routeBefore);
+					}
+				});
+				const sweep = DeliveryService.prototype.sweep;
+				const hello = spyOn(DeliveryService.prototype, "sweep").mockImplementation(function (
+					this: DeliveryService,
+					...args: Parameters<DeliveryService["sweep"]>
+				) {
+					expect(inApproval).toBe(false);
+					expect(args[1]).toBe(true);
+					const helloBefore = structuredClone(snapshot());
+					const result = sweep.apply(this, args);
+					expect(result).toEqual({ payloads: [], expired: [] });
+					expect(snapshot()).toEqual(helloBefore);
+					return result;
+				});
+				const spies = [
+					spyOn(WorkLaneManager.prototype, "recover"),
+					spyOn(database.work, "workAttemptPrepare"),
+					spyOn(checks, "getCheckStatus"),
+					...(["bind", "send", "resume", "steer", "inspect", "liveness", "attachTail", "close"] as const).map(
+						(method) => spyOn(currentPort, method),
+					),
+				];
+				// Only the two explicit uncertain windows admit independently scheduled
+				// status observation. Capture attribution at invocation, never after a
+				// potentially swallowed observer assertion or a changed runtime.
+				const statusCalls: Array<{
+					input: Parameters<typeof currentPort.status>[0];
+					lineage: symbol | undefined;
+					stack: string;
+					runtime: ReturnType<typeof database.work.workAttemptGet>;
+					attribution: ReturnType<FirstmateStore["attempt"]>;
+					latestOpRef: string | undefined;
+				}> = [];
+				const status = currentPort.status.bind(currentPort);
+				const statusSpy = spyOn(currentPort, "status").mockImplementation((input) => {
+					const runtime = database.work.workAttemptGet(input.opRef);
+					statusCalls.push({
+						input: { ...input },
+						lineage: approvalLineage.getStore(),
+						stack: new Error("native status observation").stack ?? "",
+						runtime: structuredClone(runtime),
+						attribution: new FirstmateStore(database.core).attempt(input.opRef),
+						latestOpRef: runtime
+							? parseLaneJobRecord(database.work.laneJobJson(runtime.jobId)!).attempts.at(-1)?.opRef
+							: undefined,
+					});
+					return status(input);
+				});
+				try {
+					const result = await request();
+					expect(dispatch).toHaveBeenCalledTimes(1);
+					expect(hello).toHaveBeenCalledTimes(connection === "cli" ? 1 : 0);
+					for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+					if (uncertainObservers.length === 0) expect(statusSpy).not.toHaveBeenCalled();
+					expect(statusCalls).toHaveLength(statusSpy.mock.calls.length);
+					for (const call of statusCalls) {
+						expect(call.lineage).toBeUndefined();
+						const allowed = uncertainObservers.find(({ identity }) => identity.opRef === call.input.opRef);
+						if (!allowed) throw new Error(`Unexpected status observation: ${call.stack}`);
+						const { taskId, jobId, opRef, sessionId, epoch, ordinal } = allowed.identity;
+						expect(call.input).toMatchObject({
+							opRef,
+							sessionId,
+							repo: allowed.repo,
+							priority: "background",
+							relay: { sessionId },
+						});
+						expect(call.runtime).toMatchObject({
+							jobId,
+							opRef,
+							sessionId,
+							epoch,
+							cwd: allowed.repo,
+							sendPhase: "uncertain",
+							settledAt: null,
+						});
+						expect(call.attribution).toMatchObject({ taskId, jobId, opRef, sessionId, epoch, ordinal });
+						expect(call.latestOpRef).toBe(opRef);
+						// Require the evidenced native timer -> tick -> query frame order and module;
+						// source line shifts do not change observer attribution.
+						expect(call.stack).toMatch(
+							/at #query \([^\n]*\/src\/orchestrator\/work-lane\.ts:\d+:31\)\n\s+at #tick \([^\n]*\/src\/orchestrator\/work-lane\.ts:\d+:25\)\n\s+at <anonymous> \([^\n]*\/src\/orchestrator\/work-lane\.ts:\d+:25\)/,
+						);
+					}
+					expect(snapshot()).toEqual(before);
+					expect(git("-C", path, "status", "--porcelain=v1", "--untracked-files=all")).toBe(gitBefore);
+					return result;
+				} finally {
+					statusSpy.mockRestore();
+					for (const spy of spies.reverse()) spy.mockRestore();
+					hello.mockRestore();
+					dispatch.mockRestore();
+				}
+			};
+			const heldApproval = async (input: unknown) => {
+				const receipts = sql().prepare("SELECT * FROM firstmate_approvals").all();
+				expect(await approvalEffects(() => sdk.request("work.approve", input), input)).toMatchObject({
+					recorded: false,
+					held: true,
+				});
+				expect(sql().prepare("SELECT * FROM firstmate_approvals").all()).toEqual(receipts);
+			};
+			for (const input of [
+				null,
+				[],
+				{},
+				{ firstmate: approval },
+				...["force", "allDead", "firstmate", "action", "approvalId"].map((key) => ({ ...approval, [key]: true })),
+				...["name", "ownerId", "mandateId"].map((key) => ({ ...approval, [key]: "foreign" })),
+				{ ...approval, scope: "" },
+				{ ...approval, messageId: assignment.messageId },
+				{ ...approval, messageId: correction.messageId },
+				{ ...approval, thread: { ...approval.thread, conversationId: "foreign" } },
+				{ ...approval, thread: { ...approval.thread, parentId: "foreign" } },
+				...["taskId", "jobId", "opRef", "sessionId"].map((key) => ({
+					...approval,
+					identity: { ...approval.identity, [key]: "foreign" },
+				})),
+				...["ordinal", "epoch"].map((key) => ({
+					...approval,
+					identity: { ...approval.identity, [key]: 999 },
+				})),
+				{ ...approval, evidence: { ...approval.evidence, reasons: ["changed snapshot"] } },
+				decisionFor(retained, "superseded-original"),
+				{
+					...approval,
+					decision: "accept_outcome",
+					evidence: {
+						completeness: "partial",
+						text: "reconstructed",
+						source: "reconstructed",
+						provenance: { source: "logs", fullness: "reconstructed" },
+						reasons: ["reconstructed"],
+					},
+				},
+			])
+				await heldApproval(input);
+			if (approval.decision === "accept_outcome") {
+				for (const evidence of [
+					{ ...approval.evidence, text: `${approval.evidence.text}changed` },
+					{ ...approval.evidence, completeness: "unavailable" },
+					{ ...approval.evidence, source: "foreign" },
+					...Object.keys(approval.evidence.provenance).map((key) => ({
+						...approval.evidence,
+						provenance: { ...approval.evidence.provenance, [key]: "changed" },
+					})),
+				])
+					await heldApproval({ ...approval, evidence });
+			} else {
+				await heldApproval({ ...approval, decision: "accept_outcome" });
+				await heldApproval({ ...approval, evidence: { ...approval.evidence, text: "unseen" } });
+			}
+			const approvalFile = join(directory, "approval.json");
+			await writeFile(approvalFile, JSON.stringify(approval));
+			const approvedCli = await approvalEffects(() => cli("approve", "--firstmate", approvalFile), approval, "cli");
+			expect(approvedCli.code).toBe(0);
+			expect(approvedCli.stderr).toBe("");
+			const approved = JSON.parse(approvedCli.stdout);
+			expect(approved).toMatchObject({ recorded: true, approval });
+			expect(owner.approval(approved.approval.approvalId)).toEqual(approved.approval);
+			expect(await approvalEffects(() => sdk.workApprove(approval), approval)).toEqual(approved);
+			await heldApproval({ ...approval, scope: "changed same-message scope" });
+			const conflict = { ...approval, scope: "conflicting CLI scope" };
+			await writeFile(approvalFile, JSON.stringify(conflict));
+			const conflictCli = await approvalEffects(() => cli("approve", "--firstmate", approvalFile), conflict, "cli");
+			expect(conflictCli.code).not.toBe(0);
+			expect(JSON.parse(conflictCli.stdout)).toMatchObject({ recorded: false, held: true });
+			expect(sql().prepare("SELECT * FROM firstmate_approvals").all()).toHaveLength(1);
+			expect(await noEffects(() => sdk.workStart({ firstmateCorrection: correction }))).toEqual(corrected);
+			expect(await noEffects(() => sdk.workStart({ firstmate: assignment }))).toEqual(start);
+			await refuse({ ...correction, messageId: "stale-after-result" }, "correction_predecessor_not_settled");
+			expect(port.sendAttempts.filter((send) => send.opRef === corrected.opRef)).toHaveLength(1);
+			// Cross-task refusal needs a genuine, settled identity, not an uncertain
+			// attempt whose native observer can poll during the no-effects window.
+			const independentAssignment: WorkFirstmateAssignmentParams = {
+				...assignment,
+				taskId: "independent-task",
+				name: "independent",
+				messageId: "independent-message",
+				thread: { ...assignment.thread, conversationId: "independent-thread" },
+				mandate: { ...assignment.mandate, id: "independent-mandate" },
+				worktree: {
+					path: independentPath,
+					commonDir: assignment.worktree.commonDir,
+					gitDir: await realpath(git("-C", independentPath, "rev-parse", "--absolute-git-dir")),
+					branch: "firstmate/independent",
+				},
+			};
+			const independentParentKey = originKey(independentAssignment.thread);
+			expect(independentParentKey).not.toBe(originKey(assignment.thread));
+			expect(
+				await sdk.request("chat.send", {
+					origin: independentAssignment.thread,
+					messageId: independentAssignment.messageId,
+					text: parentOpening,
+					engagement: { mentioned: true, group: true, authorId: independentAssignment.ownerId },
+				}),
+			).toMatchObject({ engaged: true });
+			await until(() =>
+				Boolean(
+					sql()
+						.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND state = 'done'")
+						.get(independentAssignment.messageId, independentParentKey),
+				),
+			);
+			await port.runExclusive(independentParentKey, async () => {});
+			const independentParentSession = database.bindings.getSessionRecord(independentParentKey)?.sessionId;
+			expect(independentParentSession).toBeDefined();
+			expect(independentParentSession).not.toBe(
+				database.bindings.getSessionRecord(originKey(assignment.thread))?.sessionId,
+			);
+			const independent = await sdk.workStart({ firstmate: independentAssignment });
+			if (!independent.started) throw new Error("independent task unexpectedly held");
+			port.complete(independent.opRef, "independent task result");
+			await until(() => Boolean(database.work.workAttemptGet(independent.opRef)?.settledAt));
+			await port.runExclusive(independent.sessionKey, async () => {});
+			const independentRuntime = database.work.workAttemptGet(independent.opRef)!;
+			database.transaction((tx) => database.outbox.confirm(tx, independentRuntime.deliveryId));
+			expect(independentRuntime.decision).toBe("fallback");
+			expect(independentRuntime.reportId).not.toBe(originalRuntime.reportId);
+			expect(independentRuntime.reportId).not.toBe(correctedRuntime.reportId);
+			expect(database.outbox.get(independentRuntime.deliveryId)).toMatchObject({
+				originKey: independentParentKey,
+				turnId: independent.opRef,
+			});
+			const independentInitial = owner.initial(independentAssignment.taskId)!;
+			expect(independentInitial).toMatchObject({
+				taskId: independentAssignment.taskId,
+				jobId: independent.jobId,
+				opRef: independent.opRef,
+				sessionId: independent.sessionId,
+				ordinal: 0,
+			});
+			const crossTask = {
+				...approval,
+				messageId: "cross-task-approval",
+				identity: {
+					taskId: independentInitial.taskId,
+					jobId: independentInitial.jobId,
+					opRef: independentInitial.opRef,
+					sessionId: independentInitial.sessionId,
+					epoch: independentInitial.epoch,
+					ordinal: independentInitial.ordinal,
+				},
+			};
+			const crossTaskReceipts = sql().prepare("SELECT * FROM firstmate_approvals").all();
+			expect(await approvalEffects(() => sdk.workApprove(crossTask), crossTask)).toMatchObject({
+				recorded: false,
+				held: true,
+			});
+			expect(sql().prepare("SELECT * FROM firstmate_approvals").all()).toEqual(crossTaskReceipts);
+			const ordinary = await sdk.workStart({ name: "ordinary", cwd: repo, text: "ordinary task" });
+			if (!ordinary.started) throw new Error("ordinary lane unexpectedly held");
+			expect(await sdk.request("work.status", { name: "ordinary" })).toMatchObject({
+				jobId: ordinary.jobId,
+				attempt: { opRef: ordinary.opRef },
+			});
+			port.complete(ordinary.opRef, "ordinary result");
+			await until(() => Boolean(database.work.workAttemptGet(ordinary.opRef)?.settledAt));
+			await port.runExclusive(ordinary.sessionKey, async () => {});
+			expect(await sdk.workRun({ name: "ordinary-run", cwd: repo, text: "ordinary run" })).toMatchObject({
+				text: "ordinary result",
+			});
+			await sdk.close();
+			sdk = await GajaewayClient.connectSocket(config.socketPath);
+			expect(await approvalEffects(() => sdk.workApprove(approval), approval)).toEqual(approved);
+			expect(await observe(() => sdk.workInspect(selectors))).toEqual(retained);
+			expect(await observe(() => sdk.workInspect(correctedSelectors))).toEqual(second);
+			expect(await noEffects(() => sdk.workStart({ firstmateCorrection: correction }))).toEqual(corrected);
+			await sdk.close();
+			await server!.stop();
+			server = undefined;
+			database.close();
+			database = await Store.open(config.dbPath);
+			// A new port models a new runtime endpoint; complete retained reads need no native query.
+			const restartedPort = new ScriptedSessionPort({
+				onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
+			});
+			// The gateway restarts, not the owned native session.
+			restartedPort.setSessionState(start.sessionId, { repo: path, live: true, deleted: false });
+			attachTestBrokerOwnership(database, restartedPort, join(directory, "agent"));
+			// Startup recovery is native housekeeping, not part of the approval route.
+			const startupRecoveries: Array<Promise<void>> = [];
+			const recover = WorkLaneManager.prototype.recover;
+			const startupRecovery = spyOn(WorkLaneManager.prototype, "recover").mockImplementation(function (
+				this: WorkLaneManager,
+			) {
+				const pending = recover.call(this);
+				startupRecoveries.push(pending);
+				return pending;
+			});
+			try {
+				server = await startUnixServer({ config, database, sessionPort: restartedPort });
+				await Promise.all(startupRecoveries);
+			} finally {
+				startupRecovery.mockRestore();
+			}
+			sdk = await GajaewayClient.connectSocket(config.socketPath);
+			expect(await approvalEffects(() => sdk.workApprove(approval), approval, "sdk", restartedPort)).toEqual(approved);
+			expect(new FirstmateStore(database.core).approval(approved.approval.approvalId)).toEqual(approved.approval);
+			await writeFile(approvalFile, JSON.stringify(approval));
+			const restartedApproval = await approvalEffects(
+				() => cli("approve", "--firstmate", approvalFile),
+				approval,
+				"cli",
+				restartedPort,
+			);
+			expect(restartedApproval.code).toBe(0);
+			expect(JSON.parse(restartedApproval.stdout)).toEqual(approved);
+			expect(await sdk.workInspect(selectors)).toEqual(retained);
+			expect(restartedPort.sends).toHaveLength(0);
+			expect(restartedPort.workerOutputReads).toHaveLength(0);
+			expect(await sdk.workStart({ firstmate: assignment })).toEqual(start);
+			expect(await sdk.workStart({ firstmateCorrection: correction })).toEqual(corrected);
+			expect(await sdk.workInspect(correctedSelectors)).toEqual(second);
+			expect(restartedPort.sends).toHaveLength(0);
+			// Uncertain original acceptance stays held through the same CLI/SDK route, never replayed.
+			const heldPath = join(directory, "held");
+			git("worktree", "add", "-qb", "firstmate/held", heldPath);
+			const heldAssignment: WorkFirstmateAssignmentParams = {
+				...assignment,
+				taskId: "held-task",
+				name: "held",
+				messageId: "held-message",
+				thread: { ...assignment.thread, conversationId: "held-thread" },
+				mandate: { ...assignment.mandate, id: "held-mandate" },
+				worktree: {
+					path: heldPath,
+					commonDir: assignment.worktree.commonDir,
+					gitDir: await realpath(git("-C", heldPath, "rev-parse", "--absolute-git-dir")),
+					branch: "firstmate/held",
+				},
+			};
+			restartedPort.send = async (input) => {
+				restartedPort.sendAttempts.push(input);
+				throw new Error("scripted lost acceptance receipt");
+			};
+			await expect(sdk.workStart({ firstmate: heldAssignment })).rejects.toMatchObject({
+				detail: { reasonCode: "send_acceptance_uncertain" },
+			});
+			const heldInitial = new FirstmateStore(database.core).initial(heldAssignment.taskId)!;
+			const heldFile = join(directory, "held.json");
+			await writeFile(heldFile, JSON.stringify(heldAssignment));
+			const heldCli = await cli("start", "--firstmate", heldFile);
+			expect(heldCli.code).not.toBe(0);
+			const held: WorkStartResult = JSON.parse(heldCli.stdout);
+			expect(held).toMatchObject({ started: false, held: true, jobId: heldInitial.jobId });
+			if (held.started) throw new Error("uncertain attempt was replayed");
+			expect(held.reason).toContain(heldInitial.opRef);
+			expect(await sdk.workStart({ firstmate: heldAssignment })).toEqual(held);
+			expect(restartedPort.sendAttempts).toHaveLength(1);
+			expect(new FirstmateStore(database.core).initial(heldAssignment.taskId)).toEqual(heldInitial);
+			const lostCorrection = { ...correction, messageId: "lost-correction", priorOpRef: corrected.opRef };
+			const lostFile = join(directory, "lost-correction.json");
+			await writeFile(lostFile, JSON.stringify(lostCorrection));
+			await expect(sdk.workStart({ firstmateCorrection: lostCorrection })).rejects.toMatchObject({
+				name: "ProtocolError",
+				detail: { reasonCode: "send_acceptance_uncertain" },
+			});
+			const uncertain = job().attempts.at(-1)!;
+			expect(uncertain.opRef).not.toBe(corrected.opRef);
+			expect(database.work.workAttemptGet(uncertain.opRef)?.sendPhase).toBe("uncertain");
+			const uncertainAttribution = new FirstmateStore(database.core).attempt(uncertain.opRef);
+			expect(uncertainAttribution).toMatchObject({
+				ordinal: 2,
+				cause: {
+					kind: "correction",
+					priorOpRef: corrected.opRef,
+					messageId: lostCorrection.messageId,
+				},
+			});
+			expect(new FirstmateStore(database.core).approvalCurrent(approved.approval.approvalId)).toBe(false);
+			if (!uncertainAttribution) throw new Error("uncertain correction attribution missing");
+			const uncertainObservers = [
+				{ identity: heldInitial, repo: heldPath },
+				{ identity: uncertainAttribution, repo: path },
+			];
+			expect(
+				await approvalEffects(() => sdk.workApprove(approval), approval, "sdk", restartedPort, uncertainObservers),
+			).toEqual(approved);
+			const superseded = { ...approval, messageId: "approval-after-uncertain-successor" };
+			expect(
+				await approvalEffects(() => sdk.workApprove(superseded), superseded, "sdk", restartedPort, uncertainObservers),
+			).toMatchObject({
+				recorded: false,
+				held: true,
+			});
+			const lostCli = await cli("start", "--firstmate-correction", lostFile);
+			expect(lostCli.code).not.toBe(0);
+			const lost: WorkStartResult = JSON.parse(lostCli.stdout);
+			expect(lost).toMatchObject({ started: false, held: true, jobId: start.jobId });
+			if (lost.started) throw new Error("lost correction acceptance was replayed");
+			expect(lost.reason).toContain(uncertain.opRef);
+			expect(await noEffects(() => sdk.workStart({ firstmateCorrection: lostCorrection }), restartedPort)).toEqual(
+				lost,
+			);
+			await noEffects(async () => {
+				await expect(
+					sdk.workStart({
+						firstmateCorrection: {
+							...lostCorrection,
+							messageId: "uncertainty-bypass",
+							priorOpRef: uncertain.opRef,
+						},
+					}),
+				).rejects.toMatchObject({
+					code: "invalid_params",
+					detail: { reasonCode: "firstmate_admission_refused", reason: "correction_predecessor_not_settled" },
+				});
+			}, restartedPort);
+			expect(restartedPort.sendAttempts.filter((send) => send.opRef === uncertain.opRef)).toHaveLength(1);
+			await sdk.close();
+			sdk = await GajaewayClient.connectSocket(config.socketPath);
+			expect(await noEffects(() => sdk.workStart({ firstmateCorrection: lostCorrection }), restartedPort)).toEqual(
+				lost,
+			);
+			await sdk.close();
+			await server!.stop();
+			server = undefined;
+			database.close();
+			database = await Store.open(config.dbPath);
+			const finalPort = new ScriptedSessionPort();
+			finalPort.setSessionState(start.sessionId, { repo: path, live: true, deleted: false });
+			attachTestBrokerOwnership(database, finalPort, join(directory, "agent"));
+			const finalRecover = WorkLaneManager.prototype.recover;
+			const recoveryCalls: Promise<void>[] = [];
+			const recoverySpy = spyOn(WorkLaneManager.prototype, "recover").mockImplementation(function (
+				this: WorkLaneManager,
+			) {
+				const pending = finalRecover.call(this);
+				recoveryCalls.push(pending);
+				return pending;
+			});
+			try {
+				server = await startUnixServer({ config, database, sessionPort: finalPort });
+				await Promise.all(recoveryCalls);
+			} finally {
+				recoverySpy.mockRestore();
+			}
+			sdk = await GajaewayClient.connectSocket(config.socketPath);
+			const heldAfterRestart = await sdk.workStart({ firstmateCorrection: lostCorrection });
+			expect(heldAfterRestart).toMatchObject({
+				started: false,
+				held: true,
+				jobId: start.jobId,
+				reason: expect.stringContaining(uncertain.opRef),
+			});
+			const restartCli = await cli("start", "--firstmate-correction", lostFile);
+			expect(restartCli.code).not.toBe(0);
+			expect(JSON.parse(restartCli.stdout)).toEqual(heldAfterRestart);
+			expect(await sdk.workStart({ firstmateCorrection: correction })).toEqual(corrected);
+			expect(await sdk.workStart({ firstmate: assignment })).toEqual(start);
+			expect(finalPort.sendAttempts).toHaveLength(0);
+			expect(finalPort.binds).toHaveLength(0);
+			expect(new FirstmateStore(database.core).attempt(uncertain.opRef)).toEqual(uncertainAttribution);
+			expect(job().attempts).toHaveLength(3);
+			for (const [selector, answer] of [
+				[selectors, retained],
+				[correctedSelectors, second],
+			] as const) {
+				const inspected = await sdk.workInspect(selector);
+				expect(inspected.identity).toEqual(answer.identity);
+				expect(inspected.evidence).toEqual(answer.evidence);
+				expect(inspected.lifecycle?.terminal).toEqual(answer.lifecycle?.terminal);
+				expect(inspected.lifecycle?.settledAt).toEqual(answer.lifecycle?.settledAt);
+			}
+		} finally {
+			await sdk.close();
+			await server?.stop();
+			server = undefined;
+			database.close();
+			checksFactory.mockRestore();
+		}
+	}, 30_000);
+}
+
+
 test("requires negotiation then serves status, shutdown, and validates chat params", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
 	const config: GatewayConfig = {
@@ -194,7 +1634,7 @@ test("requires negotiation then serves status, shutdown, and validates chat para
 	expect(client.frames[1].type).toBe("negotiated");
 	client.send({ v: "0.1", type: "request", id: "status", verb: "gateway.status" });
 	await waitFor(client.frames, 3);
-	expect(client.frames[2].result.schemaVersion).toBe(37);
+	expect(client.frames[2].result.schemaVersion).toBe(39);
 	expect(client.frames[2].result.startedAt).toBe("2026-01-01T00:00:00.000Z");
 	expect(client.frames[2].result.readiness).toMatchObject({ ready: true, state: "ready", reason: null, failure: null });
 	expect(client.frames[2].result.contextDiff).toEqual({
@@ -3334,6 +4774,21 @@ test("a backlog left pending across an outage is answered on boot, never expired
 			}),
 		),
 	).toBe(true);
+	const bootSettled = Promise.withResolvers<void>();
+	const freshSettled = Promise.withResolvers<void>();
+	const transaction = database.transaction.bind(database);
+	const observeTransaction: typeof database.transaction = (operation) => {
+		const result = transaction(operation);
+		// Observe committed state, not the responder callback that precedes completion.
+		for (const [index, settled] of [bootSettled, freshSettled].entries()) {
+			const send = sessionPort.sends[index];
+			const row = send && database.inbox.turnRow(send.opRef);
+			if (row?.state === "done" && row.turn_state === "done" && database.inbox.pendingCount(key) === 0)
+				settled.resolve();
+		}
+		return result;
+	};
+	const transactionSpy = spyOn(database, "transaction").mockImplementation(observeTransaction);
 	const logs: string[] = [];
 	const original = console.error;
 	console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
@@ -3353,18 +4808,37 @@ test("a backlog left pending across an outage is answered on boot, never expired
 				engagement: { mentioned: false, group: false, authorId: "owner" },
 			},
 		});
-		for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
+		await bootSettled.promise;
+		expect(database.inbox.turnRow(sessionPort.sends[0]!.opRef)).toMatchObject({
+			message_id: "stale-1",
+			origin_key: key,
+			origin_ref_json: JSON.stringify(origin),
+			body: "from before the outage",
+			state: "done",
+			turn_role: "trigger",
+			turn_state: "done",
+		});
+		expect(database.inbox.pendingCount(key)).toBe(0);
 		expect(turns).toEqual([
 			expect.stringContaining("from before the outage"),
 			expect.stringContaining("fresh after the outage"),
 		]);
 		expect(logs.some((line) => line.includes("inbound_expired"))).toBe(false);
-		expect(database.inbox.pendingCount(key)).toBe(0);
+		await freshSettled.promise;
+		expect(database.inbox.turnRow(sessionPort.sends[1]!.opRef)).toMatchObject({
+			origin_key: key,
+			origin_ref_json: JSON.stringify(origin),
+			body: "fresh after the outage",
+			state: "done",
+			turn_role: "trigger",
+			turn_state: "done",
+		});
+		transactionSpy.mockRestore();
 		client.close();
 	} finally {
 		console.error = original;
 	}
-});
+}, 4_000);
 
 test("/restart is owner-only and triggers an ordered gateway stop after acknowledging", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));

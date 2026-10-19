@@ -4,7 +4,7 @@ import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
-import type { Store } from "../store";
+import { FirstmateStore, type Store } from "../store";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
 
@@ -87,6 +87,21 @@ export interface SweepNomination {
 export type LaneForceRetireReason = "session_dead" | "session_disowned";
 type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
+export interface PreservingRetirement<T> {
+	/** All hooks execute under the governor's one native lane lock. */
+	readonly prepare: () =>
+		| { readonly result: T }
+		| {
+				readonly sessionId: string;
+				readonly repo: string;
+				readonly pending: boolean;
+				readonly recheck: () => void;
+				readonly persistIntent: () => void;
+				readonly complete: () => T;
+		  };
+	readonly held: (reason: string) => T;
+}
+
 export interface LaneGovernorOptions {
 	readonly database: Store;
 	readonly sessionPort: SessionPort;
@@ -118,7 +133,8 @@ export class LaneGovernor {
 	#recoveryGate?: () => Promise<void>;
 	#forceRetireSettlement?: ForceRetireSettlement;
 	#stopped = false;
-	readonly #mutations = new Set<Promise<LaneRetireOutcome>>();
+	readonly #preserving = new Set<string>();
+	readonly #mutations = new Set<Promise<unknown>>();
 
 	constructor(options: LaneGovernorOptions) {
 		this.#database = options.database;
@@ -139,6 +155,69 @@ export class LaneGovernor {
 	/** Installed by the attempt owner so forced retirement settles history and runtime atomically. */
 	setForceRetireSettlement(settle: ForceRetireSettlement): void {
 		this.#forceRetireSettlement = settle;
+	}
+
+	preservingRelease(name: string): boolean {
+		return this.#preserving.has(name);
+	}
+
+	/**
+	 * Policy composition, not recovery or filesystem cleanup.
+	 * A second release for a lane already marked does not queue on the native lock.
+	 */
+	retirePreserving<T>(name: string, policy: PreservingRetirement<T>): Promise<T> {
+		if (this.#preserving.has(name)) return Promise.resolve(policy.held("task_release_pending_or_completed"));
+		this.#preserving.add(name);
+		const task = this.#port.runExclusive(workSessionKey(name), async () => {
+			if (this.#stopped) return policy.held("gateway is stopping");
+			const prepared = policy.prepare();
+			if ("result" in prepared) return prepared.result;
+			const recheck = () => {
+				if (this.#stopped) throw new Error("gateway is stopping");
+				prepared.recheck();
+			};
+			recheck();
+			if (prepared.pending) {
+				const proof = await this.#safeLiveness(prepared.sessionId, prepared.repo);
+				recheck();
+				if (proof.live !== false && !proof.disowned) {
+					// Same journaled close the first attempt used. Do not invent a second close path.
+					const closed = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
+					recheck();
+					if (!closed.released) return policy.held(closed.reason);
+				}
+			} else {
+				const job = this.#job(name);
+				if (!job || job === "corrupt") return policy.held("lane_job_unavailable");
+				const runtime = await this.#runtimeSettled(job, prepared.sessionId, prepared.repo);
+				recheck();
+				if (!runtime.settled) return policy.held(runtime.reason);
+				prepared.persistIntent();
+				recheck();
+				const proof = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
+				recheck();
+				if (!proof.released) return policy.held(proof.reason);
+			}
+			// A thrown transaction cannot undo native release. The durable intent remains.
+			return prepared.complete();
+		}).finally(() => {
+			this.#preserving.delete(name);
+		});
+		this.#mutations.add(task);
+		void task.then(
+			() => this.#mutations.delete(task),
+			() => this.#mutations.delete(task),
+		);
+		return task;
+	}
+
+	#mapped(name: string): boolean {
+		try {
+			return new FirstmateStore(this.#database.core).assignment(name) !== undefined;
+		} catch {
+			// Corrupt attribution is not permission to use a destructive bypass.
+			return true;
+		}
 	}
 
 	async stop(): Promise<void> {
@@ -214,6 +293,8 @@ export class LaneGovernor {
 	 * rebound to a new one is left alone.
 	 */
 	retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
+		if (this.#mapped(name))
+			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "firstmate_scoped_release_required" });
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,
@@ -246,6 +327,7 @@ export class LaneGovernor {
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (preflight?.attemptOpen) return Promise.resolve(unsettled(sessionKey, preflight));
 		return this.#port.runExclusive(sessionKey, async () => {
+			if (this.#mapped(name)) return { retired: false, sessionKey, reason: "firstmate_scoped_release_required" };
 			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
@@ -284,33 +366,9 @@ export class LaneGovernor {
 			// or a crash-left attempt may still be running.
 			const runtime = await this.#runtimeSettled(record, lane.sessionId, repo);
 			if (!runtime.settled) return { retired: false, sessionKey, reason: runtime.reason };
-			let closed = false;
-			try {
-				await this.#port.close({ sessionId: lane.sessionId, repo });
-				closed = true;
-			} catch (error) {
-				// An unconfirmed close must not release the slot: a worker that is
-				// still alive would then be uncounted, which is the exact failure
-				// this governor exists to prevent. Only broker liveness proving the
-				// session gone lets the binding clear.
-				const detail = sanitizeDiagnostic(diagnostic(error));
-				const liveness = await this.#safeLiveness(lane.sessionId, repo);
-				if (liveness.live !== false && !liveness.disowned) {
-					this.#log(
-						`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=retained`,
-						"error",
-					);
-					return {
-						retired: false,
-						sessionKey,
-						reason: `session.close failed and the session is not proven gone: ${detail}`,
-					};
-				}
-				this.#log(
-					`lane_close_failed name=${name} session=${lane.sessionId} detail=${detail} action=session_gone`,
-					"error",
-				);
-			}
+			const proof = await this.#closeOwnedSession(name, lane.sessionId, repo);
+			if (!proof.released) return { retired: false, sessionKey, reason: proof.reason };
+			const closed = proof.closed;
 			// Only a non-forced operator retirement (no sweep nomination) deletes the
 			// runtime-created worktree and branch. Unattended sweep/force retirement keeps
 			// the durable lane path and its unpushed commits resumable.
@@ -368,6 +426,8 @@ export class LaneGovernor {
 	 * the epoch with reason operator_force.
 	 */
 	forceRetire(name: string): Promise<LaneRetireOutcome> {
+		if (this.#mapped(name))
+			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "firstmate_scoped_release_required" });
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,
@@ -405,6 +465,7 @@ export class LaneGovernor {
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (!preflight) return Promise.resolve({ retired: false, sessionKey, reason: "no bound lane for that name" });
 		return this.#port.runExclusive(sessionKey, async () => {
+			if (this.#mapped(name)) return { retired: false, sessionKey, reason: "firstmate_scoped_release_required" };
 			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
@@ -473,6 +534,7 @@ export class LaneGovernor {
 		if (this.#stopped) return { count: 0, names: [] };
 		const retired: string[] = [];
 		for (const lane of this.activeLanes(now)) {
+			if (this.#mapped(lane.name)) continue;
 			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId)) continue;
 			const job = this.#job(lane.name);
 			const record = job === "corrupt" ? undefined : job;
@@ -562,6 +624,28 @@ export class LaneGovernor {
 			this.#log(`liveness_probe_failed session=${sessionId} repo=${repo} reason=${detail}`);
 			// Conservative: assume session still alive if we can't probe.
 			return { live: undefined, disowned: false };
+		}
+	}
+
+	async #closeOwnedSession(
+		name: string,
+		sessionId: string,
+		repo: string,
+	): Promise<{ released: true; closed: boolean } | { released: false; reason: string }> {
+		try {
+			await this.#port.close({ sessionId, repo });
+			return { released: true, closed: true };
+		} catch (error) {
+			const detail = sanitizeDiagnostic(diagnostic(error));
+			const proof = await this.#safeLiveness(sessionId, repo);
+			const released = proof.live === false || proof.disowned;
+			this.#log(
+				`lane_close_failed name=${name} session=${sessionId} detail=${detail} action=${released ? "session_gone" : "retained"}`,
+				"error",
+			);
+			return released
+				? { released: true, closed: false }
+				: { released: false, reason: `session.close failed and the session is not proven gone: ${detail}` };
 		}
 	}
 

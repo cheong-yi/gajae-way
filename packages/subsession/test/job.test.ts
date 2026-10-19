@@ -8,6 +8,7 @@ import {
 	type JobAttempt,
 	LANE_JOB_SCHEMA_VERSION,
 	LaneJobError,
+	type LaneJobRecord,
 	MAX_STALLED_CONTINUATIONS,
 	type PlanContinuationInput,
 	parseLaneJobRecord,
@@ -15,6 +16,7 @@ import {
 	projectAttemptOutcome,
 	type RepositoryFacts,
 	recordChecksRetry,
+	reopenCompletedJob,
 	settleAwaitingChecks,
 	transitionToAwaitingChecks,
 } from "../src/job";
@@ -351,6 +353,117 @@ describe("repository-first reconciliation: commits are the progress signal", () 
 		// Repository first: classification does not consult op status at all.
 		const classification = classifyWorkEvidence(repo({ headSha: `9b2be0f${"0".repeat(33)}` }));
 		expect(classification).toBe("work_committed_report_lost");
+	});
+});
+
+describe("explicit completed-job reopening", () => {
+	function completed(): LaneJobRecord {
+		const ended = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		return settleAwaitingChecks(
+			transitionToAwaitingChecks({ record: ended, at: NOW.toISOString(), prNumber: 7, headSha: "a".repeat(40) }),
+			NOW.toISOString(),
+			{ kind: "passed" },
+		);
+	}
+
+	test("reopens only the selected completed tail and preserves all prior evidence", () => {
+		const original: LaneJobRecord = Object.freeze({
+			...completed(),
+			checkpoints: Object.freeze([{ sha: "a".repeat(40), createdAt: NOW.toISOString() }]),
+			escalations: Object.freeze(["prior escalation"]),
+			stalledContinuations: 2,
+			reportSource: "transcript_body",
+			report: "retained partial evidence",
+		});
+		const before = JSON.stringify(original);
+		const reopened = reopenCompletedJob(original, attempt().opRef);
+		expect(reopened).not.toBe(original);
+		expect(Object.isFrozen(reopened)).toBe(true);
+		expect(reopened).toEqual({ ...original, state: "attempt_ended" });
+		expect(reopened.attempts).toBe(original.attempts);
+		expect(reopened.sessions).toBe(original.sessions);
+		expect(reopened.checkpoints).toBe(original.checkpoints);
+		expect(reopened.escalations).toBe(original.escalations);
+		expect(reopened.lane).toBe(original.lane);
+		const next = appendAttempt(reopened, attempt({ opRef: "gw-lanejob-01hq00000001" }));
+		expect(next.state).toBe("running");
+		expect(next.attempts).toHaveLength(2);
+		expect(next.attempts[0]).toBe(original.attempts[0]);
+		expect(next.checkpoints).toBe(original.checkpoints);
+		expect(next.stalledContinuations).toBe(2);
+		expect(JSON.stringify(original)).toBe(before);
+		expect(() => appendAttempt(reopened, attempt())).toThrow(LaneJobError);
+		expect(() => reopenCompletedJob(reopened, attempt().opRef)).toThrow(LaneJobError);
+	});
+
+	test("rejects every non-done state without changing it", () => {
+		for (const state of [
+			"running",
+			"attempt_ended",
+			"awaiting_operator",
+			"awaiting_checks",
+			"stalled",
+			"aborted",
+		] as const) {
+			const original = { ...completed(), state };
+			const before = JSON.stringify(original);
+			expect(() => reopenCompletedJob(original, attempt().opRef)).toThrow(LaneJobError);
+			expect(JSON.stringify(original)).toBe(before);
+		}
+	});
+
+	test("rejects missing, wrong, stale, uncertain, incomplete and open tails", () => {
+		const original = completed();
+		expect(() => reopenCompletedJob(original, "gw-lanejob-01hq00000001")).toThrow(LaneJobError);
+		expect(() => reopenCompletedJob({ ...original, attempts: [] }, attempt().opRef)).toThrow(LaneJobError);
+		for (const endState of [
+			undefined,
+			"terminal_uncertain",
+			"terminal_missing_receipt",
+			"failed",
+			"cancelled",
+			"stopped_incomplete",
+			"attempt_ended",
+			"accepted",
+			"running",
+		] as const) {
+			const invalid = { ...original, attempts: [attempt({ endedAt: NOW.toISOString(), endState })] };
+			expect(() => reopenCompletedJob(invalid, attempt().opRef)).toThrow(LaneJobError);
+		}
+		const later = attempt({
+			opRef: "gw-lanejob-01hq00000001",
+			endedAt: NOW.toISOString(),
+			endState: "completed",
+		});
+		expect(() => reopenCompletedJob({ ...original, attempts: [...original.attempts, later] }, attempt().opRef)).toThrow(
+			LaneJobError,
+		);
+		for (const attempts of [[attempt({ endState: "completed" })], [attempt(), later]]) {
+			const invalid = { ...original, attempts };
+			expect(() => reopenCompletedJob(invalid, attempts.at(-1)!.opRef)).toThrow(LaneJobError);
+		}
+		expect(() =>
+			reopenCompletedJob(
+				{
+					...original,
+					awaitingChecks: { prNumber: 7, headSha: "a".repeat(40), since: NOW.toISOString(), retries: 1 },
+				},
+				attempt().opRef,
+			),
+		).toThrow(LaneJobError);
+	});
+
+	test("automatic append and continuation still cannot reopen done or aborted jobs", () => {
+		for (const state of ["done", "aborted"] as const) {
+			const original = { ...completed(), state };
+			expect(appendAttempt(original, attempt({ opRef: "gw-lanejob-01hq00000001" })).state).toBe(state);
+			expect(planContinuation(planInput({ record: original })).action).toBe("hold_for_operator");
+		}
 	});
 });
 

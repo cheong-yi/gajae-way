@@ -9,6 +9,8 @@ import {
 	BrokerSessionPort,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
+	parseWorkerOutputResponse,
+	type WorkerOutputEvidence,
 	SessionRequestTimeoutError,
 } from "../src/orchestrator/session-port";
 import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
@@ -25,6 +27,168 @@ import {
 let home = "";
 let database: Store | undefined;
 
+
+test("worker output validates exact attribution before exposing truncated original fragments", () => {
+	const input = {
+		sessionId: "session-a",
+		repo: "/assigned",
+		opRef: "op-a",
+		notBeforeMs: 100,
+		includePartial: true,
+		terminalIdentity: { commandId: "command-a", turnId: "turn-a" },
+	};
+	const result = {
+		kind: "prompt",
+		status: "terminal_ok",
+		clientRef: "op-a",
+		commandId: "command-a",
+		turnId: "turn-a",
+		startedAt: 100,
+		terminalAt: 200,
+		receiptState: "present",
+		content: { version: 1, type: "text", text: "한글", byteLength: 6, truncated: true },
+	};
+	const parse = (value: unknown) =>
+		parseWorkerOutputResponse(
+			input,
+			{ exitCode: 0, stdout: JSON.stringify({ ok: true, result: value }), stderr: "" },
+			300,
+		);
+	expect(parse(result)).toEqual({
+		status: "unavailable",
+		code: "incomplete_body",
+		partial: {
+			text: "한글",
+			observedAtMs: 300,
+			provenance: {
+				source: "turn.result",
+				fullness: "partial",
+				sessionId: "session-a",
+				repo: "/assigned",
+				opRef: "op-a",
+				clientRef: "op-a",
+				commandId: "command-a",
+				turnId: "turn-a",
+				terminalAt: 200,
+				contentVersion: 1,
+				byteLength: 6,
+			},
+		},
+	});
+	for (const patch of [{ clientRef: "other" }, { commandId: "other" }, { turnId: "other" }, { kind: "steer" }])
+		expect(parse({ ...result, ...patch })).toEqual({ status: "unavailable", code: "identity_mismatch" });
+	for (const patch of [
+		{ terminalAt: 99 },
+		{ startedAt: 201 },
+		{ startedAt: 99 },
+		{ receiptState: "absent" },
+		{ status: "terminal_error" },
+		{ content: null },
+	])
+		expect(parse({ ...result, ...patch })).toEqual({ status: "unavailable", code: "invalid_evidence" });
+	for (const patch of [{ version: 2 }, { type: "json" }, { text: 1 }, { byteLength: 1 }, { truncated: "yes" }])
+		expect(parse({ ...result, content: { ...result.content, ...patch } })).toEqual({
+			status: "unavailable",
+			code: "invalid_evidence",
+		});
+	expect(parse({ ...result, content: { ...result.content, truncated: false } })).toMatchObject({ status: "proven" });
+	const withoutPartial = parseWorkerOutputResponse(
+		{ ...input, includePartial: false },
+		{ exitCode: 0, stdout: JSON.stringify({ ok: true, result }), stderr: "" },
+		300,
+	);
+	expect(withoutPartial).toEqual({ status: "unavailable", code: "incomplete_body" });
+	expect("partial" in withoutPartial).toBe(false);
+});
+
+test("worker partial display respects UTF-8 cap without promoting it to complete-output proof", () => {
+	const text = "가".repeat(6_000);
+	const bytes = new TextEncoder().encode(text);
+	const input = {
+		sessionId: "session-a",
+		repo: "/assigned",
+		opRef: "op-a",
+		notBeforeMs: 100,
+		includePartial: true,
+	};
+	const parsed = parseWorkerOutputResponse(
+		input,
+		{
+			exitCode: 0,
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					kind: "prompt",
+					status: "terminal_ok",
+					clientRef: "op-a",
+					terminalAt: 200,
+					receiptState: "present",
+					content: { version: 1, type: "text", text, byteLength: bytes.length, truncated: true },
+				},
+			}),
+			stderr: "",
+		},
+		300,
+	);
+	expect(parsed.status).toBe("unavailable");
+	if (parsed.status !== "unavailable" || !parsed.partial) throw new Error("expected partial");
+	const partial = parsed.partial satisfies WorkerOutputEvidence | { provenance: { fullness: "partial" } };
+	expect(new TextEncoder().encode(partial.text).length).toBeLessThanOrEqual(16_384);
+	expect(partial.text.length).toBeLessThan(text.length);
+	expect(partial.provenance.fullness).toBe("partial");
+	expect(partial.provenance.byteLength).toBe(new TextEncoder().encode(partial.text).length);
+});
+
+test("exact native output query works without worktree and never resumes a session", async () => {
+	const calls: string[][] = [];
+	const { port, repo, database, agentDir } = await brokerPortFixture(async (args) => {
+		calls.push([...args]);
+		return {
+			exitCode: 0,
+			stderr: "",
+			stdout: JSON.stringify({
+				ok: true,
+				result: {
+					kind: "prompt",
+					status: "terminal_ok",
+					clientRef: "exact-op",
+					terminalAt: 200,
+					content: { version: 1, type: "text", text: "fragment", byteLength: 8, truncated: true },
+				},
+			}),
+		};
+	});
+	await mkdir(repo);
+	const authority = initializeTestBrokerAuthority(database, agentDir);
+	await createOwnedSessionFixture(database, authority, {
+		sessionId: "exact-session",
+		originKey: "origin",
+		epoch: 0,
+		repo,
+	});
+	await rm(repo, { recursive: true });
+	const result = await port.fetchWorkerOutput({
+		sessionId: "exact-session",
+		repo,
+		opRef: "exact-op",
+		notBeforeMs: 100,
+		includePartial: true,
+	});
+	expect(result).toMatchObject({
+		status: "unavailable",
+		code: "incomplete_body",
+		partial: { text: "fragment", provenance: { sessionId: "exact-session", opRef: "exact-op", repo } },
+	});
+	expect(calls).toHaveLength(1);
+	expect(calls[0]).toContain("turn.result");
+	expect(calls[0]).toContain("exact-session");
+	expect(calls[0]).not.toContain(repo);
+	expect(calls[0]).not.toContain("resume");
+	await expect(
+		port.fetchWorkerOutput({ sessionId: "wrong-session", repo, opRef: "exact-op", notBeforeMs: 100 }),
+	).rejects.toBeInstanceOf(BrokerAuthorityError);
+	expect(calls).toHaveLength(1);
+});
 test("opt-in fake ownership records only successful binds and refuses unknown saved sessions", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-fake-ownership-"));
 	database = await Store.open(join(home, "gateway.db"));

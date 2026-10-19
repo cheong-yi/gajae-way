@@ -369,6 +369,8 @@ export interface ChatMessagePayload {
 			kind: string;
 		}[];
 	};
+	/** A gateway-created child pane must never fall back into its parent channel. */
+	readonly noChildFallback?: true;
 }
 
 export interface DeliveryConfirmParams {
@@ -686,8 +688,52 @@ export interface WorkRunParams {
 	readonly callerSessionId?: string;
 }
 
-/** Asynchronous starts and synchronous runs share the same caller metadata. */
-export type WorkStartParams = WorkRunParams;
+/** Explicit trusted-local owner assignment; identity is supplied, not inferred from text. */
+export interface WorkFirstmateAssignmentParams {
+	readonly taskId: string;
+	readonly name: string;
+	readonly ownerId: string;
+	readonly messageId: string;
+	readonly thread: OriginRef;
+	readonly mandate: {
+		readonly id: string;
+		readonly text: string;
+		readonly checkRetries: boolean;
+		readonly commit: boolean;
+		readonly push: boolean;
+	};
+	readonly worktree: {
+		readonly path: string;
+		readonly commonDir: string;
+		readonly gitDir: string;
+		readonly branch: string;
+	};
+}
+
+export interface WorkFirstmateStartParams {
+	readonly firstmate: WorkFirstmateAssignmentParams;
+	readonly firstmateCorrection?: never;
+}
+
+/** Trusted-local correction within the existing task's unchanged mandate. */
+export interface WorkFirstmateCorrectionParams {
+	readonly name: string;
+	readonly taskId: string;
+	readonly ownerId: string;
+	readonly messageId: string;
+	readonly thread: OriginRef;
+	readonly mandateId: string;
+	readonly priorOpRef: string;
+	readonly text: string;
+}
+
+/** Ordinary native start, mapped assignment, or correction; never a merged payload. */
+export type WorkStartParams =
+	| (WorkRunParams & { readonly firstmate?: never; readonly firstmateCorrection?: never })
+	| ((
+			| WorkFirstmateStartParams
+			| { readonly firstmateCorrection: WorkFirstmateCorrectionParams; readonly firstmate?: never }
+	  ) & { readonly [K in keyof WorkRunParams]?: never });
 
 export type WorkStartResult =
 	| {
@@ -729,6 +775,208 @@ export interface WorkStatusParams {
 	readonly name: string;
 }
 
+/** Select an immutable task and exact operation, never the latest attempt. */
+export interface WorkInspectParams {
+	readonly name: string;
+	readonly taskId: string;
+	readonly opRef: string;
+	/** Exact immutable approval for this attempt; never select the latest approval implicitly. */
+	readonly approvalId?: string;
+	/** Opt in to one bounded exact-op read when retained evidence is incomplete. */
+	readonly native?: boolean;
+}
+
+/** Public structural projection of native and retained output provenance. */
+export type WorkInspectionProvenance =
+	| {
+			readonly source: "turn.result";
+			readonly fullness: "original" | "partial";
+			readonly sessionId: string;
+			readonly repo: string;
+			readonly opRef: string;
+			readonly clientRef: string;
+			readonly commandId?: string;
+			readonly turnId?: string;
+			readonly terminalAt: number;
+			readonly contentVersion: 1;
+			readonly byteLength: number;
+	  }
+	| {
+			readonly source: "turn.result";
+			readonly fullness: "original";
+			readonly sessionId: string;
+			readonly repo: string;
+			readonly opRef: string;
+			readonly clientRef: string;
+			readonly commandId?: string;
+			readonly turnId?: string;
+			readonly terminalAt: number;
+			readonly contentVersion: 1;
+			readonly byteLength: number;
+			readonly epoch: number;
+			readonly observedAtMs: number;
+			readonly attribution: "operation_ref";
+	  };
+
+/** Exact prepared attempt identity; newer prepared attempts supersede currentness, not history. */
+export interface FirstmateResultIdentity {
+	readonly taskId: string;
+	readonly jobId: string;
+	readonly opRef: string;
+	readonly ordinal: number;
+	readonly sessionId: string;
+	readonly epoch: number;
+}
+
+/** Supported approval snapshot only; reconstructed/logs evidence is not accepted. */
+export type FirstmateReviewedEvidence =
+	| {
+			readonly completeness: "complete" | "partial";
+			readonly text: string;
+			readonly source: "retained" | "native";
+			readonly provenance: WorkInspectionProvenance;
+			readonly reasons: readonly string[];
+	  }
+	| {
+			readonly completeness: "unavailable";
+			readonly text?: never;
+			readonly source?: never;
+			readonly provenance?: never;
+			readonly reasons: readonly string[];
+	  };
+
+/** Owner/message/thread/mandate must match trusted assignment authority, not caller assertions alone. */
+export interface FirstmateDecisionBinding {
+	readonly name: string;
+	readonly identity: FirstmateResultIdentity;
+	readonly ownerId: string;
+	readonly messageId: string;
+	readonly thread: OriginRef;
+	readonly mandateId: string;
+	readonly scope: string;
+}
+
+/** Unavailable evidence can be acknowledged, never accepted as an outcome. */
+export type WorkApproveParams = FirstmateDecisionBinding &
+	(
+		| {
+				readonly decision: "accept_outcome";
+				readonly evidence: Exclude<FirstmateReviewedEvidence, { readonly completeness: "unavailable" }>;
+		  }
+		| {
+				readonly decision: "acknowledge_unavailable";
+				readonly evidence: Extract<FirstmateReviewedEvidence, { readonly completeness: "unavailable" }>;
+		  }
+	);
+
+/**
+ * Immutable policy receipt. Partial acceptance discloses limits in reasons; acknowledgement
+ * is not acceptance. Neither changes native success, launches work, changes mandate flags,
+ * nor grants publication, commit, push, deployment, deletion or session release authority.
+ * Same owner/message and exact content is idempotent; changed content must be refused.
+ */
+export type FirstmateApproval = WorkApproveParams & {
+	readonly approvalId: string;
+	readonly recordedAt: string;
+};
+
+/** An acknowledgement receipt cannot supply outcome approval for release. */
+export type FirstmateOutcomeApproval = Extract<FirstmateApproval, { readonly decision: "accept_outcome" }>;
+
+export type WorkApproveResult =
+	| { readonly recorded: true; readonly approval: FirstmateApproval }
+	| { readonly recorded: false; readonly held: true; readonly reason: string };
+
+/**
+ * Separate downstream preserving action. Runtime must resolve approvalId to a current
+ * FirstmateOutcomeApproval with this exact identity and authority, and check obligations.
+ * Acknowledgement-only abandonment/closeout is not supported.
+ */
+export interface WorkFirstmateRetireParams {
+	readonly firstmate: FirstmateDecisionBinding & {
+		readonly approvalId: string;
+		readonly action: "release_session_preserve_work";
+	};
+	readonly name?: never;
+	readonly force?: never;
+	readonly allDead?: never;
+}
+
+/** Persist intent separately from the immutable decision; unknown close remains held. */
+export interface FirstmateReleaseIntent {
+	readonly releaseId: string;
+	readonly request: WorkFirstmateRetireParams["firstmate"];
+	readonly requestedAt: string;
+}
+
+/**
+ * Confirmed native ownership release; not proof of physical process death.
+ * Preserve Git work, evidence, obligations and journal history.
+ */
+export interface FirstmateReleaseReceipt extends FirstmateReleaseIntent {
+	readonly releasedAt: string;
+	readonly sessionKey: string;
+	readonly preserved: true;
+}
+
+export type WorkFirstmateRetireResult =
+	| { readonly retired: true; readonly release: FirstmateReleaseReceipt }
+	| {
+			readonly retired: false;
+			readonly held: true;
+			readonly reason: string;
+			/** Existing owner identifiers only; no new obligation lifecycle. */
+			readonly obligations?: readonly { readonly id: string; readonly reason: string }[];
+	  };
+
+/**
+ * Immutable historical facts only, independent of observed output and release admission.
+ * Null means no matching receipt returned, not readiness, completeness or absence of debt.
+ */
+export interface WorkInspectionReceipts {
+	/** Only the explicitly requested approvalId, matched to the exact inspected identity. */
+	readonly approval: FirstmateApproval | null;
+	/**
+	 * Completed release covering the inspected task/session/epoch, including earlier corrected
+	 * attempts. Its request retains the approved attempt identity; never rewrite it to this op.
+	 */
+	readonly release: FirstmateReleaseReceipt | null;
+}
+
+/** Lifecycle and evidence completeness are independent; observation grants no execution admission. */
+export interface WorkInspectResult {
+	readonly identity: {
+		readonly taskId: string;
+		readonly jobId: string;
+		readonly ordinal: number;
+		readonly opRef: string;
+		readonly sessionKey: string;
+		readonly sessionId: string;
+		readonly epoch: number;
+	} | null;
+	readonly lifecycle: {
+		readonly jobState: string;
+		readonly sendPhase: "prepared" | "accepted" | "uncertain" | null;
+		readonly terminal: {
+			readonly kind: "broker" | "local";
+			readonly observedAt: string;
+			readonly reasonCode: string;
+			readonly status?: PromptStatusBody;
+		} | null;
+		readonly settledAt: string | null;
+	} | null;
+	readonly evidence: {
+		readonly completeness: "complete" | "partial" | "unavailable";
+		readonly text?: string;
+		readonly source?: "retained" | "native";
+		readonly provenance?: WorkInspectionProvenance;
+	};
+	/** Receipt snapshots never replace evidence or upgrade its completeness/source. */
+	readonly receipts: WorkInspectionReceipts;
+	readonly execution: "not_evaluated";
+	readonly reasons: readonly string[];
+}
+
 /** Read-only durable snapshot plus a matching-binding live operation query. */
 export interface WorkStatusResult {
 	readonly jobId: string;
@@ -764,6 +1012,7 @@ export interface WorkRetireParams {
 	readonly name?: string;
 	readonly force?: boolean;
 	readonly allDead?: boolean;
+	readonly firstmate?: never;
 }
 
 /**
@@ -1182,6 +1431,10 @@ export interface OpsDeliveriesResult {
 
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
+	"discord.thread.opened": {
+		params: { readonly requestId: string; readonly threadId?: string; readonly error?: string };
+		result: { readonly received: true };
+	};
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
 	"gateway.shutdown": { params: undefined; result: { readonly stopping: true } };
 	"gateway.restart.prepare": {
@@ -1243,10 +1496,15 @@ export interface VerbCatalogV01 {
 	"work.run": { params: WorkRunParams; result: WorkRunResult };
 
 	"work.start": { params: WorkStartParams; result: WorkStartResult };
+	"work.inspect": { params: WorkInspectParams; result: WorkInspectResult };
+	"work.approve": { params: WorkApproveParams; result: WorkApproveResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
-	"work.retire": { params: WorkRetireParams; result: WorkRetireResult };
+	"work.retire": {
+		params: WorkRetireParams | WorkFirstmateRetireParams;
+		result: WorkRetireResult | WorkFirstmateRetireResult;
+	};
 	"chat.react": { params: ChatReactParams; result: ChatReactResult };
 	"engagement.reaction": { params: EngagementReactionParams; result: EngagementReactionResult };
 	"engagement.panel_response": { params: EngagementPanelResponseParams; result: EngagementPanelResponseResult };
@@ -1257,6 +1515,12 @@ export interface VerbCatalogV01 {
 
 /** Event catalog: event name -> payload. */
 export interface EventCatalogV01 {
+	"discord.thread.open": {
+		readonly requestId: string;
+		readonly parent: OriginRef;
+		readonly messageId: string;
+		readonly name: string;
+	};
 	"chat.message": ChatMessagePayload;
 	"chat.progress": ChatProgressPayload;
 	"gateway.stopping": { readonly reason: string };
@@ -1265,6 +1529,7 @@ export interface EventCatalogV01 {
 }
 
 export const VERBS_V01 = [
+	"discord.thread.opened",
 	"gateway.status",
 	"gateway.shutdown",
 	"gateway.restart.prepare",
@@ -1294,6 +1559,8 @@ export const VERBS_V01 = [
 	"ops.deliveries",
 	"work.run",
 	"work.start",
+	"work.inspect",
+	"work.approve",
 	"work.status",
 	"work.steer",
 	"work.jobs",
@@ -1311,6 +1578,7 @@ export const EVENTS_V01 = [
 	"gateway.restart.superseded",
 	"gateway.stopping",
 	"monitor.event",
+	"discord.thread.open",
 ] as const;
 
 export type VerbName = keyof VerbCatalogV01;

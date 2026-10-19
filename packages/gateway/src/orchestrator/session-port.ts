@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { containsSilenceToken, isSilenceToken } from "@gajae-gateway/protocol";
 import {
@@ -284,6 +285,8 @@ export interface WorkerOutputInput {
 	readonly notBeforeMs: number;
 	/** Only actual receipt/status identities, never locally synthesized identifiers. */
 	readonly terminalIdentity?: { readonly commandId?: string; readonly turnId?: string };
+	/** Evidence-only callers may display a validated fragment; complete-output callers still get no body. */
+	readonly includePartial?: boolean;
 	readonly signal?: AbortSignal;
 	/** Generation/attempt fence, checked before and after transport I/O. */
 	readonly isCurrent?: () => boolean;
@@ -303,29 +306,36 @@ type SdkTransport = (
 	options?: { readonly timeoutMs?: number; readonly cursor?: string },
 ) => Promise<CliResult>;
 
+export interface WorkerOutputEvidence {
+	readonly text: string;
+	readonly observedAtMs: number;
+	readonly provenance: {
+		readonly source: "turn.result";
+		readonly fullness: "original";
+		readonly sessionId: string;
+		readonly repo: string;
+		readonly opRef: string;
+		readonly clientRef: string;
+		readonly commandId?: string;
+		readonly turnId?: string;
+		readonly terminalAt: number;
+		readonly contentVersion: 1;
+		readonly byteLength: number;
+	};
+}
+
+export type WorkerOutputPartial = Omit<WorkerOutputEvidence, "provenance"> & {
+	readonly provenance: Omit<WorkerOutputEvidence["provenance"], "fullness"> & { readonly fullness: "partial" };
+};
+
 export type WorkerOutputResult =
-	| {
-			readonly status: "proven";
-			readonly text: string;
-			readonly observedAtMs: number;
-			readonly provenance: {
-				readonly source: "turn.result";
-				readonly fullness: "original";
-				readonly sessionId: string;
-				readonly repo: string;
-				readonly opRef: string;
-				readonly clientRef: string;
-				readonly commandId?: string;
-				readonly turnId?: string;
-				readonly terminalAt: number;
-				readonly contentVersion: 1;
-				readonly byteLength: number;
-			};
-	  }
+	| ({ readonly status: "proven" } & WorkerOutputEvidence)
 	| { readonly status: "absent"; readonly code: "output_pending" | "transport_error" }
 	| {
 			readonly status: "unavailable";
 			readonly code: "output_unavailable" | "invalid_evidence" | "identity_mismatch" | "incomplete_body" | "cancelled";
+			/** Validated original fragment, never complete-output or settlement proof. */
+			readonly partial?: WorkerOutputPartial;
 	  };
 
 export interface SessionRequestInput extends SessionSendInput {
@@ -501,6 +511,7 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
+	readonly #exclusiveOwner = new AsyncLocalStorage<string>();
 	readonly #bindings = new Map<string, Promise<SessionBinding>>();
 	readonly #signaledHosts = new Map<string, SignaledHost>();
 	readonly #authority: BrokerAuthority;
@@ -1756,9 +1767,11 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async runExclusive<T>(key: string, work: () => Promise<T>): Promise<T> {
+		if (this.#exclusiveOwner.getStore() === key) return work();
 		const previous = this.#chains.get(key);
+		const run = () => this.#exclusiveOwner.run(key, work);
 		if (!previous) {
-			const task = work();
+			const task = run();
 			const settled = task.then(
 				() => undefined,
 				() => undefined,
@@ -1778,7 +1791,7 @@ export class BrokerSessionPort implements SessionPort {
 		this.#chains.set(key, chain);
 		await previous.catch(() => undefined);
 		try {
-			return await work();
+			return await run();
 		} finally {
 			release();
 			if (this.#chains.get(key) === chain) this.#chains.delete(key);
@@ -2121,18 +2134,16 @@ export function parseWorkerOutputResponse(
 			? { status: "unavailable", code: "output_unavailable" }
 			: { status: "absent", code: "output_pending" };
 	}
-	if (content.truncated === true) return { status: "unavailable", code: "incomplete_body" };
 	if (
 		content.version !== 1 ||
 		content.type !== "text" ||
 		typeof content.text !== "string" ||
-		content.truncated !== false ||
+		typeof content.truncated !== "boolean" ||
 		content.byteLength !== new TextEncoder().encode(content.text).length ||
 		(result.receiptState !== undefined && result.receiptState !== "present")
 	)
 		return { status: "unavailable", code: "invalid_evidence" };
-	return {
-		status: "proven",
+	const evidence: WorkerOutputEvidence = {
 		text: content.text,
 		observedAtMs,
 		provenance: {
@@ -2149,6 +2160,24 @@ export function parseWorkerOutputResponse(
 			byteLength: content.byteLength as number,
 		},
 	};
+	if (content.truncated) {
+		if (!input.includePartial) return { status: "unavailable", code: "incomplete_body" };
+		// Bound display evidence too. Validate the full DTO before retaining any prefix.
+		const bytes = new TextEncoder().encode(content.text);
+		let end = Math.min(bytes.length, 16_384);
+		while (end > 0 && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--;
+		const text = new TextDecoder().decode(bytes.subarray(0, end));
+		return {
+			status: "unavailable",
+			code: "incomplete_body",
+			partial: {
+				...evidence,
+				text,
+				provenance: { ...evidence.provenance, fullness: "partial", byteLength: end },
+			},
+		};
+	}
+	return { status: "proven", ...evidence };
 }
 
 /** Affirmative SDK steer evidence, excluding contradictory or malformed acceptance. */
