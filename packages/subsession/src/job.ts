@@ -672,6 +672,26 @@ export function appendAttempt(record: LaneJobRecord, attempt: JobAttempt): LaneJ
 	});
 }
 
+/**
+ * Pure explicit correction transition for an exactly selected completed job.
+ * This is not admission or authorization. Use the returned value only together
+ * with appendAttempt inside atomic preparation; never persist a standalone reopen.
+ * All history and timestamps remain unchanged until the new attempt is appended.
+ */
+export function reopenCompletedJob(record: LaneJobRecord, priorOpRef: string): LaneJobRecord {
+	if (record.state !== "done" || record.awaitingChecks !== undefined) {
+		throw new LaneJobError(`${record.jobId} is not a settled done job`);
+	}
+	if (record.attempts.some((attempt) => attempt.endedAt === undefined)) {
+		throw new LaneJobError(`${record.jobId} has an open attempt`);
+	}
+	const tail = record.attempts.at(-1);
+	if (!tail || tail.opRef !== priorOpRef || tail.endState !== "completed") {
+		throw new LaneJobError(`${record.jobId} does not have completed tail ${priorOpRef}`);
+	}
+	return Object.freeze({ ...record, state: "attempt_ended" });
+}
+
 export type AcknowledgeHoldInput = {
 	readonly record: LaneJobRecord;
 	/** Why the hold is being released; lands in the escalation trail. */

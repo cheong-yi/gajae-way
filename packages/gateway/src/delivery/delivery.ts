@@ -7,6 +7,7 @@ import {
 	originKey,
 	type ReactionRef,
 } from "@gajae-gateway/protocol";
+import { paneDeliveryGuard } from "../orchestrator/firstmate-pane";
 import type { ExpiredDeliveryRow, LedgerOutcome } from "../store/groups/outbox";
 import type { Store } from "../store/store";
 import type { WriteTx } from "../store/tx";
@@ -38,6 +39,7 @@ export function buildDeliveryPayload(
 	deliveryId: string,
 	replyToMessageId?: string,
 	final = true,
+	noChildFallback?: true,
 ): ChatMessagePayload | undefined {
 	if (isSilentOutput(text)) return undefined;
 	originKey(origin);
@@ -48,6 +50,7 @@ export function buildDeliveryPayload(
 		text,
 		final,
 		deliveryId,
+		...(noChildFallback ? { noChildFallback } : {}),
 		...(replyToMessageId ? { replyToMessageId } : {}),
 	};
 }
@@ -65,7 +68,15 @@ export class DeliveryService {
 		deliveryId: string = crypto.randomUUID(),
 		final = true,
 	): ChatMessagePayload | undefined {
-		const payload = buildDeliveryPayload(turnId, origin, text, deliveryId, replyToMessageId, final);
+		const payload = buildDeliveryPayload(
+			turnId,
+			origin,
+			text,
+			deliveryId,
+			replyToMessageId,
+			final,
+			paneDeliveryGuard(this.#store, origin),
+		);
 		if (!payload) return undefined;
 		if (
 			!this.#store.transaction((tx) =>
@@ -84,11 +95,14 @@ export class DeliveryService {
 	persistInTransaction(tx: WriteTx, payload: ChatMessagePayload): boolean {
 		if (isSilentOutput(payload.text)) throw new Error("silent payload cannot be persisted");
 		if (!payload.deliveryId) throw new Error("delivery id is required");
+		const guarded = paneDeliveryGuard(this.#store, payload.origin)
+			? { ...payload, noChildFallback: true as const }
+			: payload;
 		return this.#store.outbox.enqueue(tx, {
 			deliveryId: payload.deliveryId,
 			turnId: payload.turnId,
 			originKey: originKey(payload.origin),
-			payloadJson: JSON.stringify(payload),
+			payloadJson: JSON.stringify(guarded),
 		});
 	}
 
@@ -129,6 +143,7 @@ export class DeliveryService {
 			text: reaction.emoji,
 			final: false,
 			deliveryId,
+			...(paneDeliveryGuard(this.#store, origin) ? { noChildFallback: true as const } : {}),
 			reaction,
 		};
 		this.createPending({ deliveryId, turnId, originKey: originKey(origin), payloadJson: JSON.stringify(payload) });
@@ -157,6 +172,7 @@ export class DeliveryService {
 			text: fileFallbackText(file),
 			final: false,
 			deliveryId,
+			...(paneDeliveryGuard(this.#store, origin) ? { noChildFallback: true as const } : {}),
 			...(replyToMessageId ? { replyToMessageId } : {}),
 			file,
 		};

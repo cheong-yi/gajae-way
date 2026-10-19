@@ -24,6 +24,8 @@ import {
 	negotiate,
 	OPS_CYCLE_DEFAULT_LIMIT,
 	OPS_CYCLE_MAX_LIMIT,
+	ORIGIN_KINDS,
+	ORIGIN_PLATFORMS,
 	OrderedFrameWriter,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
@@ -45,6 +47,11 @@ import {
 	validateOriginRef,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
+	type WorkApproveParams,
+	type WorkFirstmateAssignmentParams,
+	type WorkFirstmateCorrectionParams,
+	type WorkFirstmateRetireParams,
+	type WorkInspectResult,
 } from "@gajae-gateway/protocol";
 import { parseLaneJobRecord } from "@gajae-gateway/subsession";
 import {
@@ -115,9 +122,16 @@ import {
 	deterministicTerminalDeliveryId,
 } from "../orchestrator/tail-runner";
 import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
+import {
+	lanePaneRecorded,
+	paneDeliveryGuard,
+	paneOriginRecorded,
+	readChildPane,
+	saveChildPane,
+} from "../orchestrator/firstmate-pane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
-import type { Store } from "../store";
+import { FirstmateStore, type Store } from "../store";
 import {
 	editedOriginalId,
 	type InboundMessageRow,
@@ -126,6 +140,7 @@ import {
 } from "../store/groups/inbox";
 import type { MonitorEventStage } from "../store/groups/monitors";
 import type { ExpiredDeliveryRow } from "../store/groups/outbox";
+import type { WriteTx } from "../store/tx";
 import { deriveActivity } from "./activity";
 import { ATTACHMENT_SCOPE_NOTICE, redactHistoricalAttachments } from "./attachment-scope";
 import {
@@ -504,6 +519,10 @@ interface Runtime {
 	/** Admission cap and retirement for `work.run` lanes. */
 	readonly lanes: LaneGovernor;
 	readonly work: WorkLaneManager;
+	readonly threadOpens: Map<
+		string,
+		{ connection: Connection; resolve: (threadId: string) => void; reject: (error: Error) => void }
+	>;
 	readonly permissionPanels: PermissionPanels;
 	/** Redacts secrets from every chat-bound frame at the connection writer; not configurable from chat or config.json. */
 	readonly secretGuard: SecretGuard;
@@ -648,6 +667,76 @@ function notifyOwnerRestartCancelled(
 	if (!delivery) return;
 	runtime.delivery.markInflight(delivery.deliveryId as string);
 	broadcastDelivery(runtime, delivery);
+}
+
+function workObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function workString(value: unknown): value is string {
+	return typeof value === "string" && value.trim().length > 0;
+}
+
+function invalidWorkWire(field: string): never {
+	throw new ProtocolError("invalid_params", "invalid work parameters", { reasonCode: "invalid_work_params", field });
+}
+
+function assertFirstmateThreadWire(thread: unknown, field: string): void {
+	if (
+		!workObject(thread) ||
+		!ORIGIN_PLATFORMS.some((platform) => platform === thread.platform) ||
+		!ORIGIN_KINDS.some((kind) => kind === thread.kind) ||
+		!workString(thread.conversationId) ||
+		["parentId", "peerId"].some((key) => Object.hasOwn(thread, key) && !workString(thread[key])) ||
+		(Object.hasOwn(thread, "threadVisibility") &&
+			thread.threadVisibility !== "public" &&
+			thread.threadVisibility !== "private") ||
+		Object.keys(thread).some(
+			(key) => !["platform", "kind", "conversationId", "parentId", "peerId", "threadVisibility"].includes(key),
+		)
+	)
+		invalidWorkWire(field);
+}
+
+/** Shape only: semantic identity, mandate and Git admission remain owned by startFirstmate. */
+function assertFirstmateWire(value: unknown): asserts value is WorkFirstmateAssignmentParams {
+	if (!workObject(value)) invalidWorkWire("firstmate");
+	for (const key of ["taskId", "name", "ownerId", "messageId"]) {
+		if (!workString(value[key])) invalidWorkWire(`firstmate.${key}`);
+	}
+	if (
+		Object.keys(value).some(
+			(key) => !["taskId", "name", "ownerId", "messageId", "thread", "mandate", "worktree"].includes(key),
+		)
+	)
+		invalidWorkWire("firstmate");
+	const { thread, mandate, worktree } = value;
+	assertFirstmateThreadWire(thread, "firstmate.thread");
+	if (
+		!workObject(mandate) ||
+		!workString(mandate.id) ||
+		!workString(mandate.text) ||
+		["checkRetries", "commit", "push"].some((key) => typeof mandate[key] !== "boolean") ||
+		Object.keys(mandate).some((key) => !["id", "text", "checkRetries", "commit", "push"].includes(key))
+	)
+		invalidWorkWire("firstmate.mandate");
+	if (
+		!workObject(worktree) ||
+		["path", "commonDir", "gitDir", "branch"].some((key) => !workString(worktree[key])) ||
+		Object.keys(worktree).some((key) => !["path", "commonDir", "gitDir", "branch"].includes(key))
+	)
+		invalidWorkWire("firstmate.worktree");
+}
+
+function assertFirstmateCorrectionWire(value: unknown): asserts value is WorkFirstmateCorrectionParams {
+	if (!workObject(value)) invalidWorkWire("firstmateCorrection");
+	const fields = ["name", "taskId", "ownerId", "messageId", "mandateId", "priorOpRef", "text"];
+	if (Object.keys(value).some((key) => key !== "thread" && !fields.includes(key)))
+		invalidWorkWire("firstmateCorrection");
+	for (const key of fields) {
+		if (!workString(value[key])) invalidWorkWire(`firstmateCorrection.${key}`);
+	}
+	assertFirstmateThreadWire(value.thread, "firstmateCorrection.thread");
 }
 
 export async function startUnixServer(options: GatewayServerOptions): Promise<GatewayServer> {
@@ -1110,9 +1199,12 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 	}
 	const permissionPanels = new PermissionPanels({
 		deliver: (payload) => {
-			if (options.database.transaction((tx) => runtime.delivery.persistInTransaction(tx, payload))) {
-				if (payload.deliveryId) runtime.delivery.markInflight(payload.deliveryId);
-				broadcastDelivery(runtime, payload);
+			const guarded = paneDeliveryGuard(options.database, payload.origin)
+				? { ...payload, noChildFallback: true as const }
+				: payload;
+			if (options.database.transaction((tx) => runtime.delivery.persistInTransaction(tx, guarded))) {
+				if (guarded.deliveryId) runtime.delivery.markInflight(guarded.deliveryId);
+				broadcastDelivery(runtime, guarded);
 			}
 		},
 	});
@@ -1348,6 +1440,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		requests: new Set(),
 		restartDrainOwners,
 		restartTerminalDeliveryIds,
+		threadOpens: new Map(),
 		permissionPanels,
 		memoryOps: new Map(),
 		memoryOperationTasks: new Set(),
@@ -1755,18 +1848,82 @@ async function handleRequest(
 			});
 			return;
 		}
-		case "work.start":
+		case "work.start": {
+			const params = request.params;
+			if (workObject(params) && Object.hasOwn(params, "firstmateCorrection")) {
+				if (Object.keys(params).some((key) => key !== "firstmateCorrection")) invalidWorkWire("firstmateCorrection");
+				assertFirstmateCorrectionWire(params.firstmateCorrection);
+				const result = await runtime.work.startFirstmateCorrection(params.firstmateCorrection);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+				return;
+			}
+			if (workObject(params) && Object.hasOwn(params, "firstmate")) {
+				if (Object.keys(params).some((key) => key !== "firstmate")) invalidWorkWire("firstmate");
+				assertFirstmateWire(params.firstmate);
+				const existed = new FirstmateStore(options.database.core).assignment(params.firstmate.name) !== undefined;
+				const result = await runtime.work.startFirstmate(params.firstmate);
+				if (result.started && !existed) await openFirstmatePane(runtime, options.database, params.firstmate);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+				return;
+			}
+			if (!workObject(params)) invalidWorkWire("params");
+			const result = await runtime.work.start(params);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "discord.thread.opened": {
+			const params = request.params;
+			if (!workObject(params) || !workString(params.requestId)) invalidWorkWire("thread_opened");
+			const pending = runtime.threadOpens.get(params.requestId);
+			if (!pending || pending.connection !== connection)
+				throw new ProtocolError("invalid_params", "unknown thread request");
+			if (workString(params.threadId)) pending.resolve(params.threadId);
+			else pending.reject(new Error(workString(params.error) ? params.error : "Discord thread creation failed"));
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { received: true } });
+			return;
+		}
+		case "work.approve": {
+			// The manager validates the exact explicit envelope and returns held on
+			// invalid authority/evidence. Never infer identity or recover execution here.
+			const result = await runtime.work.approveFirstmate(request.params as WorkApproveParams);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "work.inspect": {
+			const params = request.params;
+			if (
+				!workObject(params) ||
+				Object.keys(params).some((key) => !["name", "taskId", "opRef", "approvalId", "native"].includes(key)) ||
+				!workString(params.name) ||
+				!workString(params.taskId) ||
+				!workString(params.opRef) ||
+				(Object.hasOwn(params, "approvalId") && !workString(params.approvalId)) ||
+				(Object.hasOwn(params, "native") && typeof params.native !== "boolean")
+			)
+				invalidWorkWire("inspect");
+			const result: WorkInspectResult = await runtime.work.inspectFirstmate({
+				name: params.name,
+				taskId: params.taskId,
+				opRef: params.opRef,
+				...(workString(params.approvalId) ? { approvalId: params.approvalId } : {}),
+				...(typeof params.native === "boolean" ? { native: params.native } : {}),
+			});
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
 		case "work.run":
 		case "work.status":
 		case "work.steer": {
+			if (workObject(request.params)) {
+				if (Object.hasOwn(request.params, "firstmate")) invalidWorkWire("firstmate");
+				if (Object.hasOwn(request.params, "firstmateCorrection")) invalidWorkWire("firstmateCorrection");
+			}
 			const result =
-				request.verb === "work.start"
-					? await runtime.work.start(request.params)
-					: request.verb === "work.run"
-						? await runtime.work.run(request.params, connection)
-						: request.verb === "work.status"
-							? await runtime.work.status(request.params)
-							: await runtime.work.steer(request.params);
+				request.verb === "work.run"
+					? await runtime.work.run(request.params, connection)
+					: request.verb === "work.status"
+						? await runtime.work.status(request.params)
+						: await runtime.work.steer(request.params);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
@@ -1846,6 +2003,11 @@ async function handleRequest(
 			return;
 		}
 		case "work.retire": {
+			if (workObject(request.params) && Object.hasOwn(request.params, "firstmate")) {
+				const result = await runtime.work.retireFirstmate(request.params as unknown as WorkFirstmateRetireParams);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+				return;
+			}
 			const params = request.params as { name?: unknown; force?: unknown; allDead?: unknown } | undefined;
 			const force = params?.force === true;
 			const allDead = params?.allDead === true;
@@ -2478,6 +2640,138 @@ async function handleRequest(
 function isInternalReportMessageId(messageId: string): boolean {
 	return messageId.startsWith("lane-report-") || messageId.startsWith(MONITOR_REPORT_MESSAGE_ID_PREFIX);
 }
+
+function claimInboundWatches(
+	store: Store,
+	tx: WriteTx,
+	origin: OriginRef,
+	messageId: string,
+	sourceAt?: string,
+	engagement?: {
+		authorId?: string;
+		authorName?: unknown;
+		authorHandle?: string;
+		authorServerTag?: string;
+		channelLabel?: string;
+		serverLabel?: string;
+	},
+) {
+	const key = originKey(origin);
+	const matchedAt = new Date().toISOString();
+	const watchSender = composeSpeakerLabel({
+		authorId: engagement?.authorId,
+		authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
+		authorHandle: engagement?.authorHandle,
+		authorServerTag: engagement?.authorServerTag,
+	});
+	const watchWakeOrigins: string[] = [];
+	const memoryIntentIds: string[] = [];
+	for (const watch of store.inbox.claimWatchesForOrigin(tx, key, messageId, matchedAt)) {
+		const watcherOrigin = validateOriginRef(JSON.parse(watch.watcher_origin_ref_json) as OriginRef);
+		if (originKey(watcherOrigin) !== watch.watcher_origin_key)
+			throw new Error(`watch ${watch.watch_id} origin key does not match its origin reference`);
+		const chain = JSON.parse(watch.handoff_chain_json) as unknown;
+		if (!Array.isArray(chain) || !chain.every((entry) => typeof entry === "string"))
+			throw new Error(`watch ${watch.watch_id} has invalid handoff provenance`);
+		const provenance: HandoffProvenance = {
+			chain: chain as string[],
+			sourceOriginKey: key,
+			sourceMessageId: messageId,
+			...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
+			...(watchSender ? { requesterName: watchSender } : {}),
+			at: sourceAt ?? matchedAt,
+		};
+		const wakeId = watchWakeMessageId(watch.watch_id, messageId);
+		const accepted = store.inbox.enqueue(tx, {
+			messageId: wakeId,
+			originKey: watch.watcher_origin_key,
+			originRefJson: watch.watcher_origin_ref_json,
+			body: renderWatchedInputTurn({
+				provenance,
+				sourcePlace:
+					[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
+					`${origin.platform} ${origin.kind} ${origin.conversationId}`,
+				sender: watchSender ?? "unknown sender",
+			}),
+			engagementJson: JSON.stringify({ mentioned: false, group: watcherOrigin.kind !== "dm", handoff: provenance }),
+			receivedAt: matchedAt,
+		});
+		if (!accepted) throw new Error(`watch wake ${wakeId} already exists before watch ${watch.watch_id} fired`);
+		const intentId = `watch-audit:fired:${watch.watch_id}`;
+		store.memory.createIntent(tx, {
+			id: intentId,
+			kind: "daily_capture",
+			payloadJson: JSON.stringify({
+				kind: "daily_capture",
+				originRefJson: JSON.stringify(origin),
+				userText: `Cross-session watch ${watch.watch_id} matched msg:${messageId} from ${watchSender ?? "unknown sender"}`,
+				replyText: `An information-only wake was enqueued for ${watch.watcher_origin_key}. Message text, attachments, watch reason, and secrets were omitted.`,
+			}),
+		});
+		watchWakeOrigins.push(watch.watcher_origin_key);
+		memoryIntentIds.push(intentId);
+	}
+	return { watchWakeOrigins, memoryIntentIds };
+}
+
+/** A timed-out creation is held, never silently repeated against Discord. */
+async function openFirstmatePane(
+	runtime: Runtime,
+	store: Store,
+	assignment: WorkFirstmateAssignmentParams,
+): Promise<void> {
+	if (assignment.thread.platform !== "discord" || !["channel", "thread"].includes(assignment.thread.kind)) return;
+	if (lanePaneRecorded(store, assignment.name)) return;
+	const adapter = [...runtime.connections].find(
+		(connection) => connection.negotiated && connection.client?.name === "adapter-discord",
+	);
+	if (!adapter) return;
+	const intentKey = `firstmate-pane/open/${assignment.name}`;
+	if (store.core.metaGet(intentKey) !== undefined) return;
+	const requestId = crypto.randomUUID();
+	store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "requested" }));
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		const threadId = await new Promise<string>((resolve, reject) => {
+			runtime.threadOpens.set(requestId, { connection: adapter, resolve, reject });
+			timer = setTimeout(() => reject(new Error("Discord thread creation acceptance uncertain")), 10_000);
+			adapter.write({
+				v: PROFILE_VERSION,
+				type: "event",
+				event: "discord.thread.open",
+				payload: {
+					requestId,
+					parent: assignment.thread,
+					messageId: assignment.messageId,
+					name: `FirstMate ${assignment.name}`,
+				},
+			});
+		});
+		const childOrigin: OriginRef = {
+			platform: "discord",
+			kind: "thread",
+			conversationId: threadId,
+			parentId: assignment.thread.kind === "thread" ? assignment.thread.parentId : assignment.thread.conversationId,
+			threadVisibility: "public",
+		};
+		saveChildPane(store, {
+			parentOrigin: assignment.thread,
+			childOrigin,
+			taskId: assignment.taskId,
+			laneName: assignment.name,
+			personaOriginKey: originKey(assignment.thread),
+			createdByGateway: store.instanceId,
+		});
+		store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "recorded" }));
+		await runtime.personaSessions.bindChildPane(childOrigin);
+	} catch (error) {
+		// Pane failure never tears down or relaunches its headless lane.
+		console.error(`firstmate_pane_unavailable name=${assignment.name} reason=${diagnostic(error)}`);
+	} finally {
+		if (timer) clearTimeout(timer);
+		runtime.threadOpens.delete(requestId);
+	}
+}
 async function sendChat(
 	connection: Connection,
 	request: RequestFrame,
@@ -2506,6 +2800,51 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
 	const key = originKey(origin);
+	if (paneOriginRecorded(options.database, origin)) {
+		const pane = readChildPane(options.database, origin);
+		const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
+		if (
+			!pane ||
+			authorIsBot ||
+			typeof params.engagement?.authorId !== "string" ||
+			typeof params.messageId !== "string"
+		) {
+			connection.write({
+				v: PROFILE_VERSION,
+				type: "response",
+				id: request.id,
+				result: { turnId: null, engaged: false },
+			});
+			return;
+		}
+		const result = await runtime.work.steerFirstmateChild({
+			origin: pane.childOrigin,
+			messageId: params.messageId,
+			text: userText,
+			authorIsBot,
+		});
+		if (result.steered) {
+			const watches = options.database.transaction((tx) =>
+				claimInboundWatches(
+					options.database,
+					tx,
+					pane.childOrigin,
+					params.messageId as string,
+					undefined,
+					params.engagement as { authorId?: string },
+				),
+			);
+			for (const id of watches.memoryIntentIds) runtime.memory.enqueueExistingId(id);
+			for (const watched of watches.watchWakeOrigins) void runtime.personaSessions.notifyInbound(watched);
+		}
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: result.steered ? result.clientRef : null, engaged: result.steered },
+		});
+		return;
+	}
 	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
 	// `/model` is a privileged control path. Apply the same direct-message and
 	// group authorisation policy as ordinary engagement before inspecting or
@@ -2879,62 +3218,7 @@ async function sendChat(
 			if (!accepted || !nonLoopback || authorIsBot)
 				return { accepted, watchWakeOrigins: [] as string[], memoryIntentIds: [] as string[] };
 
-			const matchedAt = new Date().toISOString();
-			const sourceAt = receivedAt ?? matchedAt;
-			const watchSender = composeSpeakerLabel({
-				authorId: engagement?.authorId,
-				authorName: typeof engagement?.authorName === "string" ? engagement.authorName : undefined,
-				authorHandle: engagement?.authorHandle,
-				authorServerTag: engagement?.authorServerTag,
-			});
-			const watchWakeOrigins: string[] = [];
-			const memoryIntentIds: string[] = [];
-			for (const watch of options.database.inbox.claimWatchesForOrigin(tx, key, messageId, matchedAt)) {
-				const watcherOrigin = validateOriginRef(JSON.parse(watch.watcher_origin_ref_json) as OriginRef);
-				if (originKey(watcherOrigin) !== watch.watcher_origin_key)
-					throw new Error(`watch ${watch.watch_id} origin key does not match its origin reference`);
-				const chain = JSON.parse(watch.handoff_chain_json) as unknown;
-				if (!Array.isArray(chain) || !chain.every((entry) => typeof entry === "string"))
-					throw new Error(`watch ${watch.watch_id} has invalid handoff provenance`);
-				const provenance: HandoffProvenance = {
-					chain: chain as string[],
-					sourceOriginKey: key,
-					sourceMessageId: messageId,
-					...(engagement?.authorId ? { requesterId: engagement.authorId } : {}),
-					...(watchSender ? { requesterName: watchSender } : {}),
-					at: sourceAt,
-				};
-				const wakeId = watchWakeMessageId(watch.watch_id, messageId);
-				const wakeAccepted = options.database.inbox.enqueue(tx, {
-					messageId: wakeId,
-					originKey: watch.watcher_origin_key,
-					originRefJson: watch.watcher_origin_ref_json,
-					body: renderWatchedInputTurn({
-						provenance,
-						sourcePlace:
-							[engagement?.channelLabel, engagement?.serverLabel].filter(Boolean).join(" | ") ||
-							`${origin.platform} ${origin.kind} ${origin.conversationId}`,
-						sender: watchSender ?? "unknown sender",
-					}),
-					engagementJson: JSON.stringify({ mentioned: false, group: watcherOrigin.kind !== "dm", handoff: provenance }),
-					receivedAt: matchedAt,
-				});
-				if (!wakeAccepted) throw new Error(`watch wake ${wakeId} already exists before watch ${watch.watch_id} fired`);
-				const intentId = `watch-audit:fired:${watch.watch_id}`;
-				options.database.memory.createIntent(tx, {
-					id: intentId,
-					kind: "daily_capture",
-					payloadJson: JSON.stringify({
-						kind: "daily_capture",
-						originRefJson: JSON.stringify(origin),
-						userText: `Cross-session watch ${watch.watch_id} matched msg:${messageId} from ${watchSender ?? "unknown sender"}`,
-						replyText: `An information-only wake was enqueued for ${watch.watcher_origin_key}. Message text, attachments, watch reason, and secrets were omitted.`,
-					}),
-				});
-				watchWakeOrigins.push(watch.watcher_origin_key);
-				memoryIntentIds.push(intentId);
-			}
-			return { accepted, watchWakeOrigins, memoryIntentIds };
+			return { accepted, ...claimInboundWatches(options.database, tx, origin, messageId, receivedAt, engagement) };
 		}),
 	);
 	if (!admission.accepted) {
@@ -3315,8 +3599,19 @@ async function createInboundTurnLifecycle(
 	 * a pointer. Anything that cannot be handed off is said here, and nothing runs.
 	 */
 	/** The target and hop for a relay out of this conversation, or the refusal reason. */
-	const planRelay = (target: string) => {
+	const directiveTarget = (target: string, allowPane: boolean) => {
 		const resolved = resolveHandoffTarget(target, runtime.config);
+		if (!resolved.ok) return resolved;
+		if (resolved.origin.kind === "thread" && allowPane) {
+			const paneTarget = resolvePostTarget(resolved.originKey, origin, runtime.config, options.database);
+			return paneTarget.ok ? { ok: true as const, origin: paneTarget.target, originKey: paneTarget.key } : paneTarget;
+		}
+		if (!allowPane && paneOriginRecorded(options.database, resolved.origin))
+			return { ok: false as const, reason: "not_a_channel" };
+		return resolved;
+	};
+	const planRelay = (target: string, allowPane = false) => {
+		const resolved = directiveTarget(target, allowPane);
 		if (!resolved.ok) return resolved;
 		const hop = extendHandoffChain(incomingHandoff?.chain ?? [], key, resolved.originKey);
 		return hop.ok ? { ...resolved, chain: hop.chain } : hop;
@@ -3401,7 +3696,7 @@ async function createInboundTurnLifecycle(
 	 * reply and gets no pointer; only a refused wake is said here.
 	 */
 	const wake = (line: WakeLine) => {
-		const relay = planRelay(line.target);
+		const relay = planRelay(line.target, true);
 		if (!relay.ok) {
 			console.error(`gateway wake refused origin=${key} target=${safeDiagnosticField(line.target)}: ${relay.reason}`);
 			deliverTerminalLine(renderWakeFailure(line.target, relay.reason), deliveredParts.length);
@@ -3441,7 +3736,7 @@ async function createInboundTurnLifecycle(
 	};
 	/** A one-shot [WATCH:] directive waits for the next human input at another origin. */
 	const watch = (line: WatchLine) => {
-		const relay = resolveHandoffTarget(line.target, runtime.config);
+		const relay = directiveTarget(line.target, true);
 		if (!relay.ok) {
 			deliverTerminalLine(renderWatchFailure(line.target, relay.reason), deliveredParts.length);
 			return;
@@ -3739,7 +4034,7 @@ async function createInboundTurnLifecycle(
 			const postMatch = rawPart.match(POST_TOKEN);
 			if (postMatch) {
 				part = rawPart.slice(postMatch[0].length);
-				const resolved = resolvePostTarget(postMatch[1] ?? "", origin, runtime.config);
+				const resolved = resolvePostTarget(postMatch[1] ?? "", origin, runtime.config, options.database);
 				if (resolved.ok) post = { origin: resolved.target, key: resolved.key };
 				else refused(postMatch[1] ?? "", resolved.reason);
 			}
@@ -4604,12 +4899,21 @@ function spelledConversation(
 	return bareTarget ? { target: bareTarget, bare: true } : undefined;
 }
 
-function resolveSpelledPost(target: OriginRef, origin: OriginRef, config: GatewayConfig): PostTargetResolution {
+function resolveSpelledPost(
+	target: OriginRef,
+	origin: OriginRef,
+	config: GatewayConfig,
+	store?: Store,
+): PostTargetResolution {
 	const key = originKey(target);
 	if (key === originKey(origin)) return { ok: false, reason: "current_conversation" };
 	if (target.platform !== origin.platform || !isChatPlatform(target.platform))
 		return { ok: false, reason: "other_platform" };
-	if (target.kind !== "channel") return { ok: false, reason: "not_a_channel" };
+	if (target.kind !== "channel") {
+		const pane = target.kind === "thread" && store ? readChildPane(store, target) : undefined;
+		if (pane?.personaOriginKey === originKey(origin)) return { ok: true, target: pane.childOrigin, key };
+		return { ok: false, reason: "not_a_channel" };
+	}
 	if (!resolveChannelPolicy(target, config)) return { ok: false, reason: "unconfigured_channel" };
 	return { ok: true, target, key };
 }
@@ -4620,9 +4924,16 @@ function resolveSpelledPost(target: OriginRef, origin: OriginRef, config: Gatewa
  * other platforms and unlisted rooms are refused so a persona cannot write
  * into a conversation nobody configured.
  */
-export function resolvePostTarget(raw: string, origin: OriginRef, config: GatewayConfig): PostTargetResolution {
+export function resolvePostTarget(
+	raw: string,
+	origin: OriginRef,
+	config: GatewayConfig,
+	store?: Store,
+): PostTargetResolution {
 	const spelled = spelledConversation(raw, origin, config);
-	return spelled ? resolveSpelledPost(spelled.target, origin, config) : { ok: false, reason: "invalid_origin_key" };
+	return spelled
+		? resolveSpelledPost(spelled.target, origin, config, store)
+		: { ok: false, reason: "invalid_origin_key" };
 }
 
 /**
@@ -4718,6 +5029,9 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// A conversation turn is the owner's line to the persona; it must not be
 		// spent waiting. Waits are backgrounded or handed to a lane that reports to its parent.
 		"## Staying responsive while you work",
+		"FirstMate panes are gateway-created child threads with durable task and owning-persona provenance, not ordinary session bindings. Only that owning persona may POST, WAKE or WATCH its recorded pane. Human messages in the pane steer an already-running attempt; bots, ended attempts and unavailable provenance cannot steer it. A pane message never approves an outcome or silently resumes a dead lane: explicit correction and approval retain their existing exact task/session/epoch requirements. Running transcript stays in the pane; the parent receives one gateway-authored state-and-pointers outcome per terminal event, and preserving release waits for that specific outcome's confirmed delivery.",
+		"Explicit trusted-local outcome decisions use `gajaeway work approve --firstmate APPROVAL_JSON_FILE`: provide the exact WorkApproveParams identity, owner/message/thread/mandate, scope, decision and inspected evidence including reasons. Complete or partial evidence can be accepted with its exact limits; unavailable evidence permits acknowledgement only, never outcome approval. Native success alone is not approval. A recorded receipt neither releases the session nor grants publication or deletion authority. Scoped FirstMate release is not available through this approval command.",
+		"Trusted local FirstMate submission: `gajaeway work start --firstmate ASSIGNMENT_JSON_FILE` transports an explicit immutable owner/message/thread/mandate and registered worktree assignment; it does not infer authority or map chat automatically. Save the name/taskId/opRef association. Use `gajaeway work inspect NAME --task TASK_ID --op OP_REF [--native]` for exact evidence, not latest status. Preserve complete/partial/unavailable labels, provenance and reasons; lifecycle is separate and execution is not evaluated. Native reads are opt-in and best-effort, with no original-output guarantee above 16KiB or after release. Ordinary `work status` is a lane observation, not exact result inspection; `work steer` does not correct mapped tasks. Explicit trusted-local correction uses `gajaeway work start --firstmate-correction CORRECTION_JSON_FILE` with name, taskId, ownerId, a new messageId, the same thread, mandateId, the exact latest completed priorOpRef, and text within the unchanged mandate. It preserves the task/worktree/session and appends an independent attempt; a result or native done state is not owner approval. Exact duplicates return the original accepted correction or hold unproven acceptance without replay. Never bypass a hold with a new message, invent correction authority, or treat correction as approval, publication or closeout.",
 		'Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or delegate to a lane with `gajaeway work start <name> --cwd "$PWD" "<task>"` from the target checkout, or use `--repo <path-or-url>` to create an isolated repository worktree. Its result returns here as an internal report, not a chat post. Say what you started and end the turn.',
 		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");
