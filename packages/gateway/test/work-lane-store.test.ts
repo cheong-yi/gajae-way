@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtemp, realpath, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -21,7 +21,9 @@ import {
 	reopenCompletedJob,
 	transitionToAwaitingChecks,
 } from "@gajae-gateway/subsession";
+import { bootGateway } from "../src/boot";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
+import { readPinnedGjcVersion } from "../src/orchestrator/broker";
 import { DatabaseStartupError, type FirstmateAssignment, type FirstmatePrepare, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
@@ -1583,6 +1585,63 @@ describe("FirstMate immutable store attribution", () => {
 		f.raw.exec("DROP TRIGGER replay_fault");
 		expect(f.database.replayJournal()).toEqual({ attempts: 1, laneJobs: 1, deliveries: 1 });
 		expect(prepareState(f)).toEqual(live);
+	});
+});
+
+describe("work attempt boot reconciliation", () => {
+	test("boot heals a torn work-history settlement before normal recovery starts", async () => {
+		const f = await fixture();
+		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
+		f.database.transaction((tx) =>
+			f.database.work.putLaneJob(tx, {
+				...f.closed,
+				laneKey: f.runtime.laneKey,
+				json: JSON.stringify(f.closed),
+			}),
+		);
+		await mkdir(f.authority.canonicalAgentDir, { recursive: true });
+		await Bun.write(
+			join(f.directory, "config.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				dbPath: f.path,
+				gjc: { agentDir: f.authority.canonicalAgentDir },
+			}),
+		);
+		const server = await bootGateway({
+			home: f.directory,
+			broker: {
+				executable: "/test-only/gjc",
+				command: async (args) => ({
+					exitCode: 0,
+					stdout:
+						args[0] === "--version"
+							? `gjc/${readPinnedGjcVersion()}\n`
+							: JSON.stringify({ ok: true, result: { sessions: [] } }),
+					stderr: "",
+				}),
+				healthProbe: async () => true,
+				discovery: async () => ({
+					pid: 1,
+					url: "ws://127.0.0.1:1",
+					token: "test-only",
+					heartbeatAt: Date.now(),
+				}),
+				healthIntervalMs: 60_000,
+				log: () => {},
+			},
+		});
+		try {
+			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
+				decision: "recovery_indeterminate",
+				settledAt: END,
+				terminal: { reasonCode: "recovery_indeterminate" },
+			});
+			expect(f.database.work.workAttemptOpen()).toEqual([]);
+			expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(END);
+		} finally {
+			await server.stop("test shutdown");
+		}
 	});
 });
 

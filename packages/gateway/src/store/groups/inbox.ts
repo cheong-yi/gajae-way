@@ -181,8 +181,9 @@ export class InboxGroup {
 			.get(originKey, messageId) as InboundMessageRow | null;
 		if (!row) return undefined;
 		const quarantined =
-			this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?").get(messageId) !==
-			null;
+			this.#db
+				.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?")
+				.get(messageId) !== null;
 		return { message: row, quarantined };
 	}
 

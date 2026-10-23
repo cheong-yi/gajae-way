@@ -163,7 +163,15 @@ test("a corrupt record is exported as invalid before settlement refuses it", asy
 test("administrative cutover refuses a non-latest schema without migrating it", async () => {
 	const f = await fixture();
 	const raw = new Database(f.layout.db);
-	raw.exec(`DELETE FROM schema_migrations WHERE version = ${LATEST_SCHEMA_VERSION}`);
+	// Drop children before attribution; SQLite also removes each table's immutable triggers.
+	raw.exec(`
+		DROP TABLE firstmate_release_receipts;
+		DROP TABLE firstmate_release_intents;
+		DROP TABLE firstmate_approvals;
+		DROP TABLE firstmate_attempts;
+		DROP TABLE firstmate_assignments;
+		DELETE FROM schema_migrations WHERE version = ${LATEST_SCHEMA_VERSION};
+	`);
 	raw.close();
 	const before = await readSnapshot(f.layout.db);
 	expect(await runCutover({ config: f.config, agentDir: f.targetAgent })).toBe(1);

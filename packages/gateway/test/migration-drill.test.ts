@@ -13,6 +13,11 @@ function dropFirstmateApprovalSchema(database: Database): void {
 	);
 }
 
+function dropFirstmateSchema(database: Database): void {
+	dropFirstmateApprovalSchema(database);
+	database.exec("DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments;");
+}
+
 /** Remove broker-authority and v22-v24 schema objects before replaying historical DDL; missing objects are fixture errors. */
 function dropBrokerAuthoritySchema(database: Database): void {
 	dropFirstmateApprovalSchema(database);
@@ -87,6 +92,7 @@ test("migration 40 preserves existing monitors with unset context roll tokens an
 		});
 		initial.close();
 		const legacy = new Database(path);
+		dropFirstmateSchema(legacy);
 		legacy.exec(
 			"ALTER TABLE monitors DROP COLUMN context_roll_tokens; DELETE FROM schema_migrations WHERE version >= 40",
 		);
@@ -120,6 +126,7 @@ test("migration 40 is idempotent when context roll tokens already exist", async 
 		});
 		initial.close();
 		const partial = new Database(path);
+		dropFirstmateSchema(partial);
 		partial.exec("DELETE FROM schema_migrations WHERE version >= 40");
 		partial.close();
 		const upgraded = await Store.open(path);
@@ -141,6 +148,7 @@ test("migration 38 is idempotent when a partially upgraded database already has 
 		initial.close();
 
 		const partial = new Database(path);
+		dropFirstmateSchema(partial);
 		partial.exec("DELETE FROM schema_migrations WHERE version >= 38");
 		partial.close();
 
