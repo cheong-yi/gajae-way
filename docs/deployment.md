@@ -25,7 +25,7 @@ Then send your bot a DM and start chatting. For details on environment variables
 If you prefer a local installation, build the binaries and use the one-command `up` workflow:
 
 ```sh
-# Requirements: Bun ≥1.4.0, gjc ≥0.16.0 on PATH
+# Requirements: Bun ≥1.4.2, gjc ≥0.16.0 on PATH
 git clone https://github.com/Yeachan-Heo/gajae-way.git
 cd gajae-way
 
