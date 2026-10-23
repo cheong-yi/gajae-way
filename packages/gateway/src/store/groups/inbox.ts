@@ -170,6 +170,22 @@ export class InboxGroup {
 		stmt.run(tx, threadOriginKey);
 	}
 
+	/** Exact persisted disposition, including quarantine; absence never means fulfilled. */
+	messageDisposition(
+		originKey: string,
+		messageId: string,
+	): { readonly message: InboundMessageRow; readonly quarantined: boolean } | undefined {
+		const row = this.#db
+			.prepare(`SELECT ${INBOUND_COLUMNS} FROM inbound_messages WHERE origin_key = ? AND message_id = ?`)
+			.get(originKey, messageId) as InboundMessageRow | null;
+		if (!row) return undefined;
+		const quarantined =
+			this.#db
+				.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'inbound' AND subject_id = ?")
+				.get(messageId) !== null;
+		return { message: row, quarantined };
+	}
+
 	stateCounts(): Array<{ state: string; n: number }> {
 		return this.#db.prepare("SELECT state, COUNT(*) AS n FROM inbound_messages GROUP BY state").all() as Array<{
 			state: string;

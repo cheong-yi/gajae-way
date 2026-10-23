@@ -1,6 +1,11 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import {
 	type ChatMessagePayload,
+	type FirstmateApproval,
+	type FirstmateDecisionBinding,
+	type FirstmateReleaseIntent,
+	type FirstmateReleaseReceipt,
 	isSilentOutput,
 	type OriginRef,
 	originKey,
@@ -17,9 +22,676 @@ import {
 import { buildDeliveryPayload } from "../../delivery/delivery";
 import type { GroupDb, StoreCore } from "../core";
 import { BrokerAuthorityError } from "../errors";
+import {
+	assertCause,
+	assertFirstmateWorktree,
+	assignmentJson,
+	type FirstmateAssignment,
+	type FirstmateAttempt,
+	type FirstmateCause,
+	type FirstmateCloseoutReaders,
+	type FirstmatePrepare,
+	firstmateAssert,
+	identityText,
+} from "../firstmate";
 import type { OpenWorkRows, OpenWorkScope } from "../open-work";
 import type { WriteTx } from "../tx";
 import { JOURNAL_PROJECTIONS, JournalGroup, type JournalRows, staleJournalKeys } from "./journal";
+
+/** Compare JSON values without treating object insertion order as request content. */
+function receiptJson(value: unknown): string {
+	return JSON.stringify(value, (_key, item: unknown) =>
+		item && typeof item === "object" && !Array.isArray(item)
+			? Object.fromEntries(Object.entries(item).sort(([a], [b]) => a.localeCompare(b)))
+			: item,
+	);
+}
+
+function approvalRequest(approval: FirstmateApproval) {
+	const { approvalId: _id, recordedAt: _at, ...request } = approval;
+	return request;
+}
+
+/** Immutable policy/evidence stays under the existing work table owner, outside journal replay. */
+export class FirstmateStore implements FirstmateCloseoutReaders {
+	readonly #db: GroupDb;
+
+	constructor(core: StoreCore) {
+		this.#db = core.groupDb("work");
+	}
+
+	approval(approvalId: string): FirstmateApproval | undefined {
+		const row = this.#db
+			.prepare("SELECT record_json FROM firstmate_approvals WHERE approval_id = ?")
+			.get(approvalId) as {
+			record_json: string;
+		} | null;
+		return row ? (JSON.parse(row.record_json) as FirstmateApproval) : undefined;
+	}
+
+	approvalForMessage(ownerId: string, messageId: string): FirstmateApproval | undefined {
+		const row = this.#db
+			.prepare("SELECT approval_id FROM firstmate_approvals WHERE owner_id = ? AND message_id = ?")
+			.get(ownerId, messageId) as { approval_id: string } | null;
+		return row ? this.approval(row.approval_id) : undefined;
+	}
+
+	/** Freshness only; acknowledgement remains incapable of authorizing release. */
+	approvalCurrent(approvalId: string): boolean {
+		const approval = this.approval(approvalId);
+		if (!approval) return false;
+		const row = this.#db
+			.prepare("SELECT op_ref FROM firstmate_attempts WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1")
+			.get(approval.identity.taskId) as { op_ref: string } | null;
+		return row?.op_ref === approval.identity.opRef;
+	}
+
+	#assertDecisionBinding(binding: FirstmateDecisionBinding): FirstmateAssignment {
+		firstmateAssert(
+			binding &&
+				[binding.name, binding.ownerId, binding.messageId, binding.mandateId].every(identityText) &&
+				typeof binding.scope === "string" &&
+				binding.scope.trim().length > 0,
+			"decision_binding_invalid",
+		);
+		validateOriginRef(binding.thread);
+		const assignment = this.assignment(binding.name);
+		firstmateAssert(
+			assignment &&
+				assignment.ownerId === binding.ownerId &&
+				assignment.mandate.id === binding.mandateId &&
+				receiptJson(assignment.thread) === receiptJson(binding.thread),
+			"decision_authority_mismatch",
+		);
+		const identity = binding.identity;
+		firstmateAssert(identity && identity.taskId === assignment.taskId, "decision_task_mismatch");
+		const attempt = this.attempt(identity.opRef);
+		firstmateAssert(
+			attempt &&
+				attempt.taskId === identity.taskId &&
+				attempt.jobId === identity.jobId &&
+				attempt.opRef === identity.opRef &&
+				attempt.ordinal === identity.ordinal &&
+				attempt.sessionId === identity.sessionId &&
+				attempt.epoch === identity.epoch,
+			"decision_attempt_mismatch",
+		);
+		firstmateAssert(binding.messageId !== assignment.messageId, "decision_message_reused");
+		const attempts = this.#db
+			.prepare("SELECT record_json FROM firstmate_attempts WHERE task_id = ?")
+			.all(identity.taskId) as { record_json: string }[];
+		for (const row of attempts) {
+			const cause = (JSON.parse(row.record_json) as FirstmateAttempt).cause;
+			firstmateAssert(cause.kind !== "correction" || cause.messageId !== binding.messageId, "decision_message_reused");
+		}
+		return assignment;
+	}
+
+	#assertSettled(binding: FirstmateDecisionBinding): void {
+		const assignment = this.#assertDecisionBinding(binding);
+		const identity = binding.identity;
+		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = ?").get(identity.jobId))
+			throw new BrokerAuthorityError("quarantined");
+		const latest = this.#db
+			.prepare("SELECT op_ref FROM firstmate_attempts WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1")
+			.get(identity.taskId) as { op_ref: string } | null;
+		firstmateAssert(latest?.op_ref === identity.opRef, "decision_not_current");
+		const row = this.#db.prepare("SELECT record_json FROM lane_jobs WHERE job_id = ?").get(identity.jobId) as {
+			record_json: string;
+		} | null;
+		const native = row ? parseLaneJobRecord(row.record_json) : undefined;
+		const runtimeRow = this.#db
+			.prepare("SELECT record_json FROM work_attempt_runtime WHERE op_ref = ?")
+			.get(identity.opRef) as { record_json: string } | null;
+		const runtime = runtimeRow ? (JSON.parse(runtimeRow.record_json) as WorkAttemptRuntime) : undefined;
+		const attempt = native?.attempts[identity.ordinal];
+		firstmateAssert(
+			native &&
+				(native.state === "done" || native.state === "attempt_ended") &&
+				native.awaitingChecks === undefined &&
+				native.jobId === identity.jobId &&
+				native.lane.branch === assignment.worktree.branch &&
+				native.lane.worktreePath === assignment.worktree.path &&
+				native.attempts.length === identity.ordinal + 1 &&
+				native.attempts.every((item) => item.endedAt !== undefined) &&
+				attempt?.opRef === identity.opRef &&
+				attempt.sessionId === identity.sessionId &&
+				attempt.endState === "completed",
+			"decision_execution_unsettled",
+		);
+		firstmateAssert(
+			runtime &&
+				runtime.opRef === identity.opRef &&
+				runtime.jobId === identity.jobId &&
+				runtime.sessionId === identity.sessionId &&
+				runtime.epoch === identity.epoch &&
+				runtime.sessionKey === `work/task/${binding.name}` &&
+				runtime.laneKey === `work-${binding.name}` &&
+				runtime.cwd === assignment.worktree.path &&
+				runtime.mode !== "historical" &&
+				runtime.parent?.kind === "persona" &&
+				runtime.parent.originKey === originKey(assignment.thread) &&
+				receiptJson(runtime.parent.origin) === receiptJson(assignment.thread) &&
+				runtime.startedAt === attempt.startedAt &&
+				this.attempt(identity.opRef)?.preparedAt === attempt.startedAt &&
+				runtime.settledAt === attempt.endedAt &&
+				runtime.settledAt !== null &&
+				workAccepted(runtime) &&
+				runtime.terminal?.reasonCode === "end_turn" &&
+				runtime.output.disposition !== "pending" &&
+				!["undecided", "wake_unaccepted", "recovery_indeterminate"].includes(runtime.decision),
+			"decision_runtime_unsettled",
+		);
+	}
+
+	#assertLiveBinding(binding: FirstmateDecisionBinding): void {
+		const row = this.#db
+			.prepare("SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?")
+			.get(`work/task/${binding.name}`) as { gjc_session_id: string; epoch: number } | null;
+		firstmateAssert(
+			row?.gjc_session_id === binding.identity.sessionId && row.epoch === binding.identity.epoch,
+			"decision_binding_stale",
+		);
+	}
+
+	/**
+	 * Manager must authenticate the owner and validate the exact observed snapshot under
+	 * the native lock. This owner checks durable attribution, shape and settlement only.
+	 */
+	recordApproval(tx: WriteTx, approval: FirstmateApproval): void {
+		firstmateAssert(
+			identityText(approval.approvalId) && identityText(approval.recordedAt),
+			"approval_identity_invalid",
+		);
+		this.#assertDecisionBinding(approval);
+		const evidence = approval.evidence;
+		firstmateAssert(
+			evidence && Array.isArray(evidence.reasons) && evidence.reasons.every(identityText),
+			"approval_evidence_invalid",
+		);
+		if (approval.decision === "acknowledge_unavailable") {
+			firstmateAssert(
+				evidence.completeness === "unavailable" &&
+					evidence.text === undefined &&
+					evidence.source === undefined &&
+					evidence.provenance === undefined &&
+					evidence.reasons.length > 0,
+				"approval_acknowledgement_invalid",
+			);
+		} else {
+			firstmateAssert(
+				approval.decision === "accept_outcome" &&
+					(evidence.completeness === "complete" || evidence.completeness === "partial") &&
+					typeof evidence.text === "string" &&
+					(evidence.source === "retained" || evidence.source === "native"),
+				"approval_evidence_unsupported",
+			);
+			// No logs reconstruction service or caller-asserted reconstructed evidence admission.
+			const provenance = evidence.provenance;
+			firstmateAssert(
+				provenance &&
+					provenance.source === "turn.result" &&
+					provenance.opRef === approval.identity.opRef &&
+					provenance.sessionId === approval.identity.sessionId &&
+					provenance.clientRef === approval.identity.opRef &&
+					provenance.repo === this.assignment(approval.name)!.worktree.path &&
+					provenance.contentVersion === 1 &&
+					Number.isFinite(provenance.terminalAt) &&
+					Number.isSafeInteger(provenance.byteLength) &&
+					provenance.byteLength >= Buffer.byteLength(evidence.text) &&
+					(provenance.fullness === "original" || provenance.fullness === "partial") &&
+					(!("epoch" in provenance) || provenance.epoch === approval.identity.epoch) &&
+					(evidence.completeness !== "partial" || evidence.reasons.length > 0) &&
+					(evidence.completeness !== "complete" ||
+						(provenance.fullness === "original" && provenance.byteLength === Buffer.byteLength(evidence.text))),
+				"approval_provenance_invalid",
+			);
+		}
+		const previous = this.approvalForMessage(approval.ownerId, approval.messageId);
+		if (previous) {
+			firstmateAssert(
+				receiptJson(approvalRequest(previous)) === receiptJson(approvalRequest(approval)),
+				"approval_conflict",
+			);
+			return;
+		}
+		firstmateAssert(!this.approval(approval.approvalId), "approval_conflict");
+		firstmateAssert(!this.releaseForMessage(approval.ownerId, approval.messageId), "decision_message_reused");
+		this.#assertSettled(approval);
+		this.#assertLiveBinding(approval);
+		this.#db
+			.prepare(
+				"INSERT INTO firstmate_approvals (approval_id, task_id, op_ref, owner_id, message_id, record_json) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				tx,
+				approval.approvalId,
+				approval.identity.taskId,
+				approval.identity.opRef,
+				approval.ownerId,
+				approval.messageId,
+				receiptJson(approval),
+			);
+	}
+
+	releaseIntent(releaseId: string): FirstmateReleaseIntent | undefined {
+		const row = this.#db
+			.prepare("SELECT record_json FROM firstmate_release_intents WHERE release_id = ?")
+			.get(releaseId) as { record_json: string } | null;
+		return row ? (JSON.parse(row.record_json) as FirstmateReleaseIntent) : undefined;
+	}
+
+	releaseReceipt(releaseId: string): FirstmateReleaseReceipt | undefined {
+		const row = this.#db
+			.prepare("SELECT record_json FROM firstmate_release_receipts WHERE release_id = ?")
+			.get(releaseId) as { record_json: string } | null;
+		return row ? (JSON.parse(row.record_json) as FirstmateReleaseReceipt) : undefined;
+	}
+
+	releaseForMessage(ownerId: string, messageId: string): FirstmateReleaseIntent | undefined {
+		const row = this.#db
+			.prepare("SELECT release_id FROM firstmate_release_intents WHERE owner_id = ? AND message_id = ?")
+			.get(ownerId, messageId) as { release_id: string } | null;
+		return row ? this.releaseIntent(row.release_id) : undefined;
+	}
+
+	releaseForAttempt(opRef: string): FirstmateReleaseIntent | undefined {
+		const row = this.#db.prepare("SELECT release_id FROM firstmate_release_intents WHERE op_ref = ?").get(opRef) as {
+			release_id: string;
+		} | null;
+		return row ? this.releaseIntent(row.release_id) : undefined;
+	}
+
+	completedReleaseForSession(
+		taskId: string,
+		sessionId: string,
+		epoch: number,
+	): FirstmateReleaseReceipt | undefined {
+		const rows = this.#db
+			.prepare(
+				"SELECT r.record_json FROM firstmate_release_receipts r JOIN firstmate_release_intents i ON i.release_id = r.release_id JOIN firstmate_attempts a ON a.op_ref = i.op_ref WHERE a.task_id = ? ORDER BY a.ordinal",
+			)
+			.all(taskId) as { record_json: string }[];
+		for (const row of rows) {
+			const receipt = JSON.parse(row.record_json) as FirstmateReleaseReceipt;
+			const identity = receipt.request.identity;
+			if (identity.taskId === taskId && identity.sessionId === sessionId && identity.epoch === epoch) return receipt;
+		}
+		return undefined;
+	}
+
+	#assertRelease(intent: FirstmateReleaseIntent): void {
+		const request = intent.request;
+		firstmateAssert(identityText(intent.releaseId) && identityText(intent.requestedAt), "release_identity_invalid");
+		this.#assertDecisionBinding(request);
+		const approval = this.approval(request.approvalId);
+		firstmateAssert(
+			request.action === "release_session_preserve_work" &&
+				approval?.decision === "accept_outcome" &&
+				approval.name === request.name &&
+				receiptJson(approval.identity) === receiptJson(request.identity) &&
+				approval.ownerId === request.ownerId &&
+				approval.mandateId === request.mandateId &&
+				receiptJson(approval.thread) === receiptJson(request.thread) &&
+				approval.scope === request.scope &&
+				approval.messageId !== request.messageId,
+			"release_approval_mismatch",
+		);
+	}
+
+	/** Intent is not confirmation and never closes a session. Obligations remain manager-owned. */
+	recordReleaseIntent(tx: WriteTx, intent: FirstmateReleaseIntent): void {
+		this.#assertRelease(intent);
+		const request = intent.request;
+		const previous = this.releaseForMessage(request.ownerId, request.messageId);
+		if (previous) {
+			firstmateAssert(receiptJson(previous.request) === receiptJson(request), "release_conflict");
+			return;
+		}
+		firstmateAssert(
+			!this.releaseIntent(intent.releaseId) &&
+				!this.releaseForAttempt(request.identity.opRef) &&
+				!this.approvalForMessage(request.ownerId, request.messageId),
+			"release_conflict",
+		);
+		this.#assertSettled(request);
+		this.#assertLiveBinding(request);
+		firstmateAssert(this.approvalCurrent(request.approvalId), "release_approval_stale");
+		this.#db
+			.prepare(
+				"INSERT INTO firstmate_release_intents (release_id, approval_id, op_ref, owner_id, message_id, record_json) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				tx,
+				intent.releaseId,
+				request.approvalId,
+				request.identity.opRef,
+				request.ownerId,
+				request.messageId,
+				receiptJson(intent),
+			);
+	}
+
+	/** Caller supplies confirmed native close, atomically with its binding update. No close inference. */
+	recordReleaseReceipt(tx: WriteTx, receipt: FirstmateReleaseReceipt): void {
+		const intent = this.releaseIntent(receipt.releaseId);
+		firstmateAssert(
+			intent &&
+				receipt.requestedAt === intent.requestedAt &&
+				receiptJson(receipt.request) === receiptJson(intent.request) &&
+				identityText(receipt.releasedAt) &&
+				receipt.preserved === true &&
+				receipt.sessionKey === `work/task/${intent.request.name}`,
+			"release_receipt_mismatch",
+		);
+		const previous = this.releaseReceipt(receipt.releaseId);
+		if (previous) {
+			firstmateAssert(receiptJson(previous) === receiptJson(receipt), "release_receipt_conflict");
+			return;
+		}
+		this.#assertRelease(intent);
+		this.#assertSettled(intent.request);
+		firstmateAssert(this.approvalCurrent(intent.request.approvalId), "release_approval_stale");
+		this.#db
+			.prepare("INSERT INTO firstmate_release_receipts (release_id, record_json) VALUES (?, ?)")
+			.run(tx, receipt.releaseId, receiptJson(receipt));
+	}
+
+	assignment(name: string): FirstmateAssignment | undefined {
+		const row = this.#db
+			.prepare("SELECT task_id, assignment_json FROM firstmate_assignments WHERE lane_name = ?")
+			.get(name) as { task_id: string; assignment_json: string } | null;
+		if (!row) {
+			firstmateAssert(
+				!this.#db.prepare("SELECT op_ref FROM firstmate_attempts WHERE lane_name = ? LIMIT 1").get(name),
+				"assignment_missing",
+			);
+			return undefined;
+		}
+		const assignment = JSON.parse(row.assignment_json) as FirstmateAssignment;
+		assignmentJson(assignment);
+		firstmateAssert(assignment.name === name && assignment.taskId === row.task_id, "assignment_corrupt");
+		return assignment;
+	}
+
+	attempt(opRef: string): FirstmateAttempt | undefined {
+		const row = this.#db
+			.prepare("SELECT task_id, lane_name, ordinal, record_json FROM firstmate_attempts WHERE op_ref = ?")
+			.get(opRef) as { task_id: string; lane_name: string; ordinal: number; record_json: string } | null;
+		if (!row) return undefined;
+		const attempt = JSON.parse(row.record_json) as FirstmateAttempt;
+		firstmateAssert(
+			attempt.opRef === opRef &&
+				attempt.taskId === row.task_id &&
+				attempt.ordinal === row.ordinal &&
+				Number.isSafeInteger(attempt.ordinal) &&
+				attempt.ordinal >= 0 &&
+				identityText(attempt.jobId) &&
+				identityText(attempt.sessionId) &&
+				Number.isSafeInteger(attempt.epoch) &&
+				attempt.epoch >= 0 &&
+				typeof attempt.text === "string" &&
+				attempt.text.length > 0 &&
+				identityText(attempt.preparedAt),
+			"attempt_corrupt",
+		);
+		const assignment = this.assignment(row.lane_name);
+		firstmateAssert(assignment?.taskId === attempt.taskId, "assignment_missing");
+		assertCause(attempt.cause, assignment);
+		return attempt;
+	}
+
+	/** All immutable preparations, including uncertain and superseded attempts. */
+	attemptsForTask(taskId: string): readonly FirstmateAttempt[] {
+		const rows = this.#db
+			.prepare("SELECT op_ref FROM firstmate_attempts WHERE task_id = ? ORDER BY ordinal")
+			.all(taskId) as { op_ref: string }[];
+		return rows.map((row) => this.attempt(row.op_ref)!);
+	}
+
+	/** Exact task/message replay lookup; changed attribution or text is never a new correction. */
+	correction(
+		taskId: string,
+		cause: Extract<FirstmateCause, { kind: "correction" }>,
+		text: string,
+	): FirstmateAttempt | undefined {
+		const row = this.#db.prepare("SELECT lane_name FROM firstmate_assignments WHERE task_id = ?").get(taskId) as {
+			lane_name: string;
+		} | null;
+		const assignment = row ? this.assignment(row.lane_name) : undefined;
+		firstmateAssert(assignment, "initial_attribution_missing");
+		firstmateAssert(cause.kind === "correction", "correction_cause_invalid");
+		assertCause(cause, assignment);
+		firstmateAssert(typeof text === "string" && text.length > 0, "input_missing");
+		const rows = this.#db
+			.prepare("SELECT op_ref FROM firstmate_attempts WHERE task_id = ? ORDER BY ordinal")
+			.all(taskId) as { op_ref: string }[];
+		let match: FirstmateAttempt | undefined;
+		for (const row of rows) {
+			const attempt = this.attempt(row.op_ref)!;
+			const persisted = attempt.cause;
+			if (persisted.kind !== "correction" || persisted.messageId !== cause.messageId) continue;
+			firstmateAssert(
+				!match &&
+					persisted.priorOpRef === cause.priorOpRef &&
+					persisted.ownerId === cause.ownerId &&
+					persisted.mandateId === cause.mandateId &&
+					attempt.text === text,
+				"correction_conflict",
+			);
+			match = attempt;
+		}
+		return match;
+	}
+
+	initial(taskId: string): FirstmateAttempt | undefined {
+		const row = this.#db
+			.prepare("SELECT op_ref FROM firstmate_attempts WHERE task_id = ? AND ordinal = 0")
+			.get(taskId) as { op_ref: string } | null;
+		const attempt = row ? this.attempt(row.op_ref) : undefined;
+		firstmateAssert(
+			!attempt || (attempt.taskId === taskId && attempt.ordinal === 0 && attempt.cause.kind === "assignment"),
+			"initial_attribution_mismatch",
+		);
+		return attempt;
+	}
+
+	/** Repeated immutable policy may match; conflicting reservations never authorize adoption. */
+	assertAssignment(assignment: FirstmateAssignment): void {
+		const json = assignmentJson(assignment);
+		const rows = this.#db
+			.prepare(
+				"SELECT assignment_json FROM firstmate_assignments WHERE task_id = ? OR lane_name = ? OR worktree_path = ? OR git_dir = ? OR thread_key = ? OR (owner_id = ? AND message_id = ?)",
+			)
+			.all(
+				assignment.taskId,
+				assignment.name,
+				assignment.worktree.path,
+				assignment.worktree.gitDir,
+				originKey(assignment.thread),
+				assignment.ownerId,
+				assignment.messageId,
+			) as { assignment_json: string }[];
+		for (const row of rows) {
+			firstmateAssert(
+				assignmentJson(JSON.parse(row.assignment_json) as FirstmateAssignment) === json,
+				"immutable_assignment_conflict",
+			);
+		}
+		assertFirstmateWorktree(assignment);
+	}
+
+	assertUnmapped(name: string, cwd?: string): void {
+		firstmateAssert(!this.assignment(name), "mapped_lane_requires_owner_admission");
+		if (cwd === undefined) return;
+		let path = cwd;
+		try {
+			path = realpathSync(cwd);
+		} catch {
+			// Native cwd validation still owns missing unmapped paths.
+		}
+		firstmateAssert(
+			!this.#db.prepare("SELECT task_id FROM firstmate_assignments WHERE worktree_path = ?").get(path),
+			"worktree_already_assigned",
+		);
+	}
+
+	/** Called only by native prepare, on its same synchronous WriteTx, before native/journal writes. */
+	recordPrepare(tx: WriteTx, runtime: WorkAttemptRuntime, record: LaneJobRecord, evidence: FirstmatePrepare): void {
+		const { assignment, cause, text } = evidence;
+		this.assertAssignment(assignment);
+		assertCause(cause, assignment);
+		firstmateAssert(typeof text === "string" && text.length > 0, "input_missing");
+		// Intent survives restart and remains after completion. Neither state admits fresh work.
+		firstmateAssert(
+			!this.#db
+				.prepare(
+					"SELECT 1 FROM firstmate_release_intents i JOIN firstmate_attempts a ON a.op_ref = i.op_ref WHERE a.task_id = ? LIMIT 1",
+				)
+				.get(assignment.taskId),
+			"task_release_pending_or_completed",
+		);
+		firstmateAssert(
+			runtime.mode !== "historical" &&
+				runtime.sessionKey === `work/task/${assignment.name}` &&
+				runtime.cwd === assignment.worktree.path,
+			"attempt_binding_mismatch",
+		);
+		firstmateAssert(
+			record.lane.branch === assignment.worktree.branch &&
+				record.lane.worktreePath === assignment.worktree.path &&
+				record.lane.repository === undefined &&
+				record.lane.repositoryPath === undefined,
+			"lane_binding_mismatch",
+		);
+		firstmateAssert(
+			runtime.parent?.kind === "persona" && runtime.parent.originKey === originKey(assignment.thread),
+			"thread_binding_mismatch",
+		);
+		const assigned = this.assignment(assignment.name);
+		let ordinal = 0;
+		if (cause.kind === "assignment") {
+			firstmateAssert(
+				record.attempts.length === 1 &&
+					!assigned &&
+					!this.initial(assignment.taskId) &&
+					text === assignment.mandate.text,
+				"assignment_already_attempted",
+			);
+		} else {
+			const prior = record.attempts.at(-2);
+			const previous = this.attempt(cause.priorOpRef);
+			firstmateAssert(assigned && this.initial(assignment.taskId), "initial_attribution_missing");
+			firstmateAssert(
+				prior?.opRef === cause.priorOpRef && previous?.taskId === assignment.taskId && prior.endedAt !== undefined,
+				"retry_lineage_mismatch",
+			);
+			firstmateAssert(
+				previous.jobId === runtime.jobId &&
+					previous.sessionId === prior.sessionId &&
+					previous.ordinal === record.attempts.length - 2,
+				"retry_attempt_mismatch",
+			);
+			if (cause.kind === "checks") {
+				firstmateAssert(assignment.mandate.checkRetries, "retry_lineage_mismatch");
+				firstmateAssert(
+					record.awaitingChecks?.retries === cause.retryOrdinal &&
+						record.awaitingChecks.prNumber === cause.prNumber &&
+						record.awaitingChecks.headSha === cause.headSha,
+					"retry_cycle_mismatch",
+				);
+			} else {
+				firstmateAssert(!this.correction(assignment.taskId, cause, text), "correction_already_attempted");
+				const nativeRow = this.#db.prepare("SELECT record_json FROM lane_jobs WHERE job_id = ?").get(runtime.jobId) as {
+					record_json: string;
+				} | null;
+				const native = nativeRow ? parseLaneJobRecord(nativeRow.record_json) : undefined;
+				const runtimeRow = this.#db
+					.prepare("SELECT record_json FROM work_attempt_runtime WHERE op_ref = ?")
+					.get(cause.priorOpRef) as {
+					record_json: string;
+				} | null;
+				const priorRuntime = runtimeRow ? (JSON.parse(runtimeRow.record_json) as WorkAttemptRuntime) : undefined;
+				firstmateAssert(
+					(native?.state === "done" || native?.state === "attempt_ended") &&
+						native.awaitingChecks === undefined &&
+						native.attempts.at(-1)?.opRef === cause.priorOpRef &&
+						native.attempts.every((attempt) => attempt.endedAt !== undefined) &&
+						prior.endState === "completed" &&
+						JSON.stringify(native.attempts) === JSON.stringify(record.attempts.slice(0, -1)) &&
+						record.state === "running" &&
+						record.awaitingChecks === undefined,
+					"correction_lineage_mismatch",
+				);
+				firstmateAssert(
+					JSON.stringify(parseLaneJobRecord(JSON.stringify(record))) ===
+						JSON.stringify(
+							parseLaneJobRecord(
+								JSON.stringify({
+									...native,
+									state: "running",
+									attempts: record.attempts,
+									updatedAt: runtime.startedAt,
+								}),
+							),
+						),
+					"correction_native_history_changed",
+				);
+				firstmateAssert(
+					priorRuntime?.opRef === cause.priorOpRef &&
+						priorRuntime.jobId === runtime.jobId &&
+						priorRuntime.sessionId === previous.sessionId &&
+						priorRuntime.epoch === previous.epoch &&
+						priorRuntime.sessionKey === runtime.sessionKey &&
+						priorRuntime.laneKey === runtime.laneKey &&
+						priorRuntime.cwd === runtime.cwd &&
+						priorRuntime.startedAt === prior.startedAt &&
+						previous.preparedAt === prior.startedAt &&
+						priorRuntime.settledAt === prior.endedAt &&
+						workAccepted(priorRuntime) &&
+						priorRuntime.terminal?.reasonCode === "end_turn" &&
+						runtime.sessionId === previous.sessionId &&
+						runtime.epoch === previous.epoch,
+					"correction_predecessor_mismatch",
+				);
+			}
+			ordinal = previous.ordinal + 1;
+		}
+		if (!assigned) {
+			this.#db
+				.prepare(
+					"INSERT INTO firstmate_assignments (task_id, lane_name, owner_id, message_id, thread_key, worktree_path, git_dir, assignment_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+				)
+				.run(
+					tx,
+					assignment.taskId,
+					assignment.name,
+					assignment.ownerId,
+					assignment.messageId,
+					originKey(assignment.thread),
+					assignment.worktree.path,
+					assignment.worktree.gitDir,
+					assignmentJson(assignment),
+				);
+		}
+		const attempt: FirstmateAttempt = {
+			opRef: runtime.opRef,
+			taskId: assignment.taskId,
+			jobId: runtime.jobId,
+			sessionId: runtime.sessionId,
+			epoch: runtime.epoch,
+			ordinal,
+			cause,
+			text,
+			preparedAt: runtime.startedAt,
+		};
+		this.#db
+			.prepare(
+				"INSERT INTO firstmate_attempts (op_ref, task_id, lane_name, ordinal, record_json) VALUES (?, ?, ?, ?, ?)",
+			)
+			.run(tx, runtime.opRef, assignment.taskId, assignment.name, ordinal, JSON.stringify(attempt));
+	}
+}
 
 export type WorkAttemptMode = "start" | "run" | "historical";
 export type WorkAttemptDecision =
@@ -639,7 +1311,13 @@ export class WorkGroup {
 		}>;
 	}
 
-	workAttemptPrepare(tx: WriteTx, runtime: WorkAttemptRuntime, record: LaneJobRecord, bindingMatches = true): void {
+	workAttemptPrepare(
+		tx: WriteTx,
+		runtime: WorkAttemptRuntime,
+		record: LaneJobRecord,
+		bindingMatches = true,
+		firstmate?: FirstmatePrepare,
+	): void {
 		this.#assertNotQuarantined(runtime.jobId);
 		validateWorkRuntime(runtime, this.instanceId);
 		workAssert(runtime.version === 0 && runtime.decision === "undecided" && runtime.terminal === null);
@@ -667,6 +1345,9 @@ export class WorkGroup {
 			workAssert(record.attempts.length === (previous?.attempts.length ?? 0) + 1);
 			workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous?.attempts ?? []));
 		}
+		const owner = new FirstmateStore(this.#core);
+		if (firstmate) owner.recordPrepare(tx, runtime, record, firstmate);
+		else owner.assertUnmapped(runtime.sessionKey.slice("work/task/".length), runtime.cwd);
 		this.#workPutHistory(tx, runtime, record);
 		this.#db
 			.prepare(

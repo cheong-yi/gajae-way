@@ -131,12 +131,17 @@ INSERT INTO work_attempt_runtime (op_ref, job_id, lane_key, session_id, version,
 INSERT INTO deliveries (delivery_id, turn_id, origin_key, payload_json, state, attempts, created_at, updated_at, last_error)
 	VALUES ('delivery-j', 'turn', 'loopback/dm/j', '{"text":"j"}', 'failed_ambiguous', 2, '${OLD}', '${OLD}', 'network');
 DROP TABLE work_journal;
+DROP TABLE firstmate_release_receipts;
+DROP TABLE firstmate_release_intents;
+DROP TABLE firstmate_approvals;
+DROP TABLE firstmate_attempts;
+DROP TABLE firstmate_assignments;
 DELETE FROM schema_migrations WHERE version >= 36;
 `);
 		database.close();
 		const migrated = await Store.open(path);
 		try {
-			expect(migrated.schemaVersion).toBe(39);
+			expect(migrated.schemaVersion).toBe(41);
 			expect(events(raw, "lane_job", "lanejob-6a")).toEqual(["baseline"]);
 			expect(events(raw, "attempt", "gw-j-abababababab")).toEqual(["baseline"]);
 			expect(events(raw, "delivery", "delivery-j")).toEqual(["baseline"]);
@@ -144,6 +149,52 @@ DELETE FROM schema_migrations WHERE version >= 36;
 			expect(live.laneJobs[0]).toMatchObject({ state: "awaiting_checks", record_json: record });
 			expect(live.attempts[0]).toMatchObject({ version: 3, settled_at: null });
 			expect(live.deliveries[0]).toMatchObject({ attempts: 2, last_error: "network" });
+		} finally {
+			migrated.close();
+		}
+	});
+});
+
+test("native v36 to latest adds empty attribution and receipts without rewriting journal history or projections", async () => {
+	await withDb(async (path, database, raw) => {
+		enqueue(database, "native36");
+		database.transaction((tx) => database.outbox.markInflight(tx, "native36"));
+		// Remove additive v38 then v37 tables (and their triggers): this is native journal36, not a draft FirstMate36 database.
+		raw.exec(
+			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments; DELETE FROM schema_migrations WHERE version >= 37;",
+		);
+		expect(database.schemaVersion).toBe(36);
+		const journal = raw.query("SELECT * FROM work_journal ORDER BY seq").all();
+		const migrations = raw.query("SELECT * FROM schema_migrations ORDER BY version").all();
+		const sequence = raw.query("SELECT * FROM sqlite_sequence WHERE name = 'work_journal'").all();
+		const native = projections(database);
+		const nativeDdl = raw
+			.query("SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name")
+			.all();
+		database.close();
+		const migrated = await Store.open(path);
+		try {
+			expect(migrated.schemaVersion).toBe(40);
+			expect(raw.query("SELECT * FROM schema_migrations WHERE version <= 36 ORDER BY version").all()).toEqual(
+				migrations,
+			);
+			expect(raw.query("SELECT * FROM work_journal ORDER BY seq").all()).toEqual(journal);
+			expect(raw.query("SELECT * FROM sqlite_sequence WHERE name = 'work_journal'").all()).toEqual(sequence);
+			expect(
+				raw
+					.query(
+						"SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE 'firstmate_%' ORDER BY name",
+					)
+					.all(),
+			).toEqual(nativeDdl);
+			expect(projections(migrated)).toEqual(native);
+			expect(raw.query("SELECT * FROM firstmate_assignments").all()).toEqual([]);
+			expect(raw.query("SELECT * FROM firstmate_attempts").all()).toEqual([]);
+			expect(raw.query("SELECT * FROM firstmate_approvals").all()).toEqual([]);
+			expect(raw.query("SELECT * FROM firstmate_release_intents").all()).toEqual([]);
+			expect(raw.query("SELECT * FROM firstmate_release_receipts").all()).toEqual([]);
+			expect(migrated.replayJournal()).toEqual({ attempts: 0, laneJobs: 0, deliveries: 0 });
+			expect(raw.query("SELECT * FROM work_journal ORDER BY seq").all()).toEqual(journal);
 		} finally {
 			migrated.close();
 		}
