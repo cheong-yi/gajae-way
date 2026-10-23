@@ -145,6 +145,7 @@ const REQUIRED_PARTIALS = [Partials.Message, Partials.Channel, Partials.Reaction
 
 export interface GatewayClientLike {
 	request<T = unknown>(verb: string, params?: unknown): Promise<T>;
+	on?(event: string, handler: (payload: unknown) => void): () => void;
 	onChatMessage(handler: (message: ChatMessagePayload) => void): () => void;
 	onChatProgress?(handler: (progress: ChatProgressPayload) => void): () => void;
 	close?(): Promise<void>;
@@ -925,7 +926,12 @@ export async function settleDiscordDelivery(
 		return;
 	}
 	try {
-		const { channel, notice } = await resolveDeliveryChannel(discord, message.origin, deliveryId);
+		const { channel, notice } = await resolveDeliveryChannel(
+			discord,
+			message.origin,
+			deliveryId,
+			message.noChildFallback,
+		);
 		const parsed = parseDiscordMedia(message.text);
 		const body = message.duplicateWarning ? `[recovered - may be a duplicate] ${parsed.text}` : parsed.text;
 		const text = notice ? `${notice}\n${body}` : body;
@@ -1046,11 +1052,13 @@ async function resolveDeliveryChannel(
 	discord: DiscordClientLike,
 	origin: ChatMessagePayload["origin"],
 	deliveryId: string,
+	noChildFallback?: true,
 ): Promise<{ readonly channel: DiscordTextChannelLike; readonly notice?: string }> {
 	let channel: DiscordTextChannelLike;
 	try {
 		channel = await fetchTextChannel(discord, origin.conversationId);
 	} catch (error) {
+		if (noChildFallback) throw error;
 		const syntheticThread = isSyntheticDiscordThreadId(origin.conversationId);
 		if (
 			origin.kind !== "thread" ||
@@ -1075,7 +1083,7 @@ async function resolveDeliveryChannel(
 		await channel.setArchived(false);
 		return { channel };
 	} catch (error) {
-		if (origin.threadVisibility !== "public") throw error;
+		if (noChildFallback || origin.threadVisibility !== "public") throw error;
 		const reason = `thread ${origin.conversationId} is archived and could not be unarchived (${errorMessage(error)})`;
 		const parent = await fetchTextChannel(discord, origin.parentId);
 		console.error(`Discord delivery ${deliveryId}: ${reason}; delivered to parent channel ${origin.parentId} instead.`);
@@ -1089,6 +1097,42 @@ async function resolveDeliveryChannel(
 /** Synthetic work/handoff ids name internal origins, not Discord thread snowflakes. */
 function isSyntheticDiscordThreadId(conversationId: string): boolean {
 	return /^handoff:[0-9a-f]{32}$/.test(conversationId) || /^lane-report-[0-9a-f]{64}$/.test(conversationId);
+}
+
+/** Explicit gateway request; never the inbound mention path and never gateway meta. */
+export async function openDiscordPane(
+	discord: DiscordClientLike,
+	request: { parent: OriginRef; name: string },
+): Promise<string> {
+	const parent = request.parent;
+	if (parent.platform !== "discord" || (parent.kind !== "channel" && parent.kind !== "thread"))
+		throw new Error("invalid pane parent");
+	const channel = await fetchTextChannel(discord, parent.kind === "thread" ? parent.parentId! : parent.conversationId);
+	// Discord cannot nest threads. A fresh channel anchor also avoids reusing a
+	// source message that already owns a mention-created thread.
+	const anchor = await channel.send(request.name);
+	if (!anchor || typeof anchor !== "object" || !("startThread" in anchor) || typeof anchor.startThread !== "function")
+		throw new Error("Discord pane anchor cannot start a thread");
+	const thread = (await anchor.startThread({ name: request.name, autoArchiveDuration: 1440 })) as { id: string };
+	if (typeof thread.id !== "string" || !thread.id) throw new Error("Discord pane thread id missing");
+	return thread.id;
+}
+
+export function subscribeDiscordPaneRequests(gateway: GatewayClientLike, discord: DiscordClientLike): () => void {
+	return (
+		gateway.on?.("discord.thread.open", (value) => {
+			const request = value as { requestId: string; parent: OriginRef; name: string };
+			void (async () => {
+				let result: { requestId: string; threadId?: string; error?: string };
+				try {
+					result = { requestId: request.requestId, threadId: await openDiscordPane(discord, request) };
+				} catch (error) {
+					result = { requestId: request.requestId, error: errorMessage(error) };
+				}
+				await gateway.request("discord.thread.opened", result);
+			})().catch((error) => console.error(`Discord pane response failed: ${errorMessage(error)}`));
+		}) ?? (() => {})
+	);
 }
 
 /**
@@ -1534,6 +1578,7 @@ export class ReconnectingGateway {
 	#attempt = 0;
 	#deliveryOff: (() => void) | undefined;
 	#progressOff: (() => void) | undefined;
+	#paneOff: (() => void) | undefined;
 	readonly #inbound = new RecoveryGate();
 	#cursors: RecoveryCursorState | undefined;
 	#cursorLoads: Promise<void> | undefined;
@@ -1606,6 +1651,8 @@ export class ReconnectingGateway {
 			);
 			this.#progressOff?.();
 			this.#progressOff = this.status ? subscribeDiscordProgress(client, this.status, console, this.typing) : undefined;
+			this.#paneOff?.();
+			this.#paneOff = subscribeDiscordPaneRequests(client, this.discord);
 			console.log("Discord adapter connected to gateway.");
 			this.monitor(client);
 			// Queued edits first: a backfilled message must not overtake an edit
@@ -2254,6 +2301,7 @@ export class ReconnectingGateway {
 		this.#reconnecting = true;
 		this.#client = undefined;
 		this.#deliveryOff?.();
+		this.#paneOff?.();
 		void this.downAlarm?.down();
 		const delay = Math.min(30_000, 500 * 2 ** Math.min(this.#attempt++, 6));
 		const jitter = Math.floor(Math.random() * Math.max(1, delay / 4));
