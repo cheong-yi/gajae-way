@@ -49,11 +49,11 @@ async function fixture() {
 	return { home, path, config: await loadConfig({ home }) };
 }
 
-test("census is a read-only v38 view and reports quarantined invalid work by cutover id", async () => {
+test("census is a read-only latest view and reports quarantined invalid work by cutover id", async () => {
 	const f = await fixture();
 	const before = await readFile(f.path);
 	const report = await runCensus(f.config);
-	expect(report.schemaVersion).toBe(39);
+	expect(report.schemaVersion).toBe(41);
 	expect(report.authority).toEqual({
 		canonicalAgentDir: join(f.home, "agent"),
 		identity: `gjc:${join(f.home, "agent")}`,
@@ -118,6 +118,7 @@ test("main wires the census verb to the offline command", async () => {
 	]);
 	expect(stderr).toBe("");
 	expect(exitCode).toBe(0);
+	expect(stdout).toContain('"schemaVersion": 38');
 	expect(stdout).toContain('"schemaVersion": 39');
 });
 

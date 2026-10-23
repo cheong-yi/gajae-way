@@ -7,6 +7,14 @@ export {
 } from "./core";
 export { BrokerAuthorityError, DatabaseStartupError } from "./errors";
 export {
+	assertFirstmateWorktree,
+	type FirstmateAssignment,
+	type FirstmateAttempt,
+	type FirstmateCause,
+	type FirstmatePrepare,
+	firstmateAssert,
+} from "./firstmate";
+export {
 	BindingsGroup,
 	type BrokerAuthority,
 	type BrokerQuarantineKind,
