@@ -1151,6 +1151,7 @@ describe("work operator commands", () => {
 		});
 		const previousExit = process.exitCode;
 		try {
+			process.exitCode = 0;
 			await main(["--socket", "/test/work.sock", "work", ...args]);
 			return {
 				requests,
@@ -1158,6 +1159,7 @@ describe("work operator commands", () => {
 				errors,
 				closed,
 				connections: connect.mock.calls.length,
+				socket: connect.mock.calls[0]?.[0],
 				exitCode: process.exitCode,
 				connectOptions: connect.mock.calls[0]?.[1],
 			};
@@ -1169,6 +1171,546 @@ describe("work operator commands", () => {
 			if (previousSessionId === undefined) delete process.env.GJC_SESSION_ID;
 			else process.env.GJC_SESSION_ID = previousSessionId;
 		}
+	}
+
+	const assignment = {
+		taskId: "task-exact",
+		name: "mapped",
+		ownerId: "owner-exact",
+		messageId: "message-exact",
+		thread: { platform: "discord", kind: "thread", conversationId: "thread-exact", parentId: "parent-exact" },
+		mandate: { id: "mandate-exact", text: "Scoped task\n한글", checkRetries: true, commit: false, push: false },
+		worktree: { path: "/repo/task", commonDir: "/repo/.git", gitDir: "/repo/.git/worktrees/task", branch: "task" },
+	};
+
+	const correction = {
+		name: assignment.name,
+		taskId: assignment.taskId,
+		ownerId: assignment.ownerId,
+		messageId: "correction-message-exact",
+		thread: { ...assignment.thread, visibility: "private" },
+		mandateId: assignment.mandate.id,
+		priorOpRef: "prior-operation-exact",
+		text: "  Correct only this answer.\n한글\n--push is text, not authority.\n  ",
+	};
+
+	const approvalBinding = {
+		name: assignment.name,
+		identity: {
+			taskId: assignment.taskId,
+			jobId: "job-exact",
+			opRef: "op-exact",
+			ordinal: 2,
+			sessionId: "session-exact",
+			epoch: 3,
+		},
+		ownerId: assignment.ownerId,
+		messageId: "approval-message-exact",
+		thread: { ...assignment.thread, visibility: "private" },
+		mandateId: assignment.mandate.id,
+		scope: "  This snapshot only.\n한글; no push permission.  ",
+	};
+	const approvalProvenance = {
+		source: "turn.result",
+		fullness: "original",
+		sessionId: "session-exact",
+		repo: "/repo/task",
+		opRef: "op-exact",
+		clientRef: "client-exact",
+		commandId: "command-exact",
+		turnId: "turn-exact",
+		terminalAt: 123,
+		contentVersion: 1,
+		byteLength: 24,
+	};
+	const approvalDecisions = [
+		{
+			...approvalBinding,
+			decision: "accept_outcome",
+			evidence: {
+				completeness: "complete",
+				text: "  Exact result.\n한글  ",
+				source: "retained",
+				provenance: approvalProvenance,
+				reasons: [],
+			},
+		},
+		{
+			...approvalBinding,
+			decision: "accept_outcome",
+			evidence: {
+				completeness: "partial",
+				text: "  Partial result.\n한글  ",
+				source: "native",
+				provenance: { ...approvalProvenance, fullness: "partial" },
+				reasons: ["output incomplete", "retrieval limit"],
+			},
+		},
+		{
+			...approvalBinding,
+			decision: "acknowledge_unavailable",
+			evidence: { completeness: "unavailable", reasons: ["native result unavailable"] },
+		},
+	];
+
+	test("help and global parser expose exact approval file syntax", () => {
+		expect(CLI_USAGE).toContain("work approve --firstmate APPROVAL_JSON_FILE");
+		expect(parseArgs(["--socket", "/exact.sock", "work", "approve", "--firstmate", "approval.json"])).toEqual({
+			socket: "/exact.sock",
+			command: "work",
+			rest: ["approve", "--firstmate", "approval.json"],
+		});
+	});
+
+	for (const decision of approvalDecisions) {
+		for (const recorded of [true, false]) {
+			test(`approval forwards exact ${decision.evidence.completeness} envelope recorded=${recorded}`, async () => {
+				const root = await mkdtemp(join(tmpdir(), "firstmate-approve-"));
+				try {
+					const file = join(root, "approval.json");
+					await writeFile(file, JSON.stringify(decision));
+					const result = recorded
+						? {
+								recorded: true,
+								approval: { ...decision, approvalId: "receipt-exact", recordedAt: "2026-10-14T12:00:00Z" },
+							}
+						: { recorded: false, held: true, reason: "exact evidence mismatch" };
+					const output = await run(["approve", "--firstmate", file], result, "must-not-infer-session");
+					expect(output.requests).toEqual([{ verb: "work.approve", params: decision }]);
+					expect(output.socket).toBe("/test/work.sock");
+					expect(output.connections).toBe(1);
+					expect(output.connectOptions).toEqual({ deadlineMs: 30_000 });
+					expect(output.lines).toEqual([JSON.stringify(result)]);
+					expect(output.errors).toEqual([]);
+					expect(output.closed).toBe(true);
+					expect(output.exitCode).toBe(recorded ? 0 : 1);
+					if (decision.decision === "acknowledge_unavailable") {
+						expect(output.lines.join("\n")).not.toContain("accept_outcome");
+						expect(output.lines.join("\n")).not.toContain("accepted");
+					}
+				} finally {
+					await rm(root, { recursive: true, force: true });
+				}
+			});
+		}
+	}
+
+	for (const extra of [
+		["mapped"],
+		["task text"],
+		["--force"],
+		["--all-dead"],
+		["--native"],
+		["--task", "latest"],
+		["--op", "latest"],
+		["--ownerId", "owner"],
+		["--messageId", "message"],
+		["--thread", "thread"],
+		["--mandateId", "mandate"],
+		["--scope", "all"],
+		["--evidence", "{}"],
+		["--resume"],
+		["--push"],
+		["--commit"],
+		["--firstmate", "other.json"],
+		["--firstmate-correction", "correction.json"],
+	]) {
+		test(`approval refuses mixed arguments ${extra.join(" ")} before connection`, async () => {
+			for (const args of [
+				["approve", "--firstmate", "/unread.json", ...extra],
+				["approve", ...extra, "--firstmate", "/unread.json"],
+			]) {
+				const output = await run(args, {});
+				expect(output.connections).toBe(0);
+				expect(output.requests).toEqual([]);
+				expect(output.errors[0]).toContain("approve --firstmate APPROVAL_JSON_FILE");
+				expect(output.exitCode).toBe(1);
+			}
+		});
+	}
+
+	test("approval refuses absent paths, unreadable files, malformed JSON and unsupported retire syntax", async () => {
+		const root = await mkdtemp(join(tmpdir(), "firstmate-approve-invalid-"));
+		try {
+			const file = join(root, "malformed.json");
+			await writeFile(file, "{broken");
+			for (const args of [
+				["approve"],
+				["approve", "mapped"],
+				["approve", "--firstmate"],
+				["approve", "--firstmate", ""],
+				["approve", "--firstmate", "  "],
+				["approve", "--firstmate", "--force"],
+				["approve", "--firstmate", join(root, "missing.json")],
+				["approve", "--firstmate", root],
+				["approve", "--firstmate", file],
+				["approve", "--firstmate-correction", file],
+				["retire", "--firstmate", file],
+			]) {
+				const output = await run(args, {});
+				expect(output.connections).toBe(0);
+				expect(output.requests).toEqual([]);
+				expect(output.errors.length).toBeGreaterThan(0);
+				expect(output.exitCode).toBe(1);
+			}
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("approval preserves unsupported or invalid JSON envelopes for gateway refusal without repair or replay", async () => {
+		const root = await mkdtemp(join(tmpdir(), "firstmate-approve-held-"));
+		try {
+			const file = join(root, "approval.json");
+			for (const params of [
+				null,
+				{},
+				{ ...approvalDecisions[0], force: true, allDead: true },
+				{ ...approvalDecisions[2], decision: "accept_outcome" },
+				{
+					...approvalBinding,
+					decision: "accept_outcome",
+					evidence: {
+						completeness: "partial",
+						text: "log reconstruction",
+						source: "reconstructed",
+						provenance: { source: "logs", fullness: "reconstructed" },
+						reasons: ["not original"],
+					},
+				},
+			]) {
+				await writeFile(file, JSON.stringify(params));
+				const result = { recorded: false, held: true, reason: "unsupported decision envelope" };
+				const output = await run(["approve", "--firstmate", file], result);
+				expect(output.requests).toEqual([{ verb: "work.approve", params }]);
+				expect(output.lines).toEqual([JSON.stringify(result)]);
+				expect(output.exitCode).toBe(1);
+				expect(output.closed).toBe(true);
+			}
+			await writeFile(file, JSON.stringify(approvalDecisions[0]));
+			const output = await run(["approve", "--firstmate", file], new Error("approval refused"));
+			expect(output.requests).toEqual([{ verb: "work.approve", params: approvalDecisions[0] }]);
+			expect(output.connections).toBe(1);
+			expect(output.lines).toEqual([]);
+			expect(output.errors).toEqual(["approval refused"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("help and global parser expose correction with an explicit socket", () => {
+		expect(CLI_USAGE).toContain("work start --firstmate-correction CORRECTION_JSON_FILE");
+		expect(
+			parseArgs(["--socket", "/exact.sock", "work", "start", "--firstmate-correction", "correction.json"]),
+		).toEqual({
+			socket: "/exact.sock",
+			command: "work",
+			rest: ["start", "--firstmate-correction", "correction.json"],
+		});
+	});
+
+	for (const result of [
+		{
+			started: true,
+			jobId: "job-exact",
+			opRef: "correction-op",
+			sessionKey: "work-mapped",
+			sessionId: "session-exact",
+		},
+		{ started: false, held: true, jobId: "job-exact", state: "awaiting_operator", reason: "uncertain: correction-op" },
+	]) {
+		test(`correction forwards exact payload without defaults or authority and prints JSON started=${result.started}`, async () => {
+			const root = await mkdtemp(join(tmpdir(), "correction-start-"));
+			try {
+				const file = join(root, "correction.json");
+				await writeFile(file, JSON.stringify(correction));
+				const output = await run(["start", "--firstmate-correction", file], result, "must-not-infer-parent");
+				expect(output.requests).toEqual([{ verb: "work.start", params: { firstmateCorrection: correction } }]);
+				expect(output.socket).toBe("/test/work.sock");
+				expect(output.connections).toBe(1);
+				expect(output.connectOptions).toEqual({ requestTimeoutMs: 120_000, deadlineMs: 30_000 });
+				expect(output.lines).toEqual([JSON.stringify(result)]);
+				expect(output.errors).toEqual([]);
+				expect(output.closed).toBe(true);
+				expect(output.exitCode).toBe(result.started ? 0 : 1);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const extra of [
+		["ordinary-name"],
+		["ordinary task text"],
+		["--text", "task"],
+		["--cwd", "/repo"],
+		["--repo", "/repo"],
+		["--base", "dev"],
+		["--resume"],
+		["--model", "model"],
+		["--preset", "preset"],
+		["--callerSessionId", "caller"],
+		["--notify", "origin"],
+		["--commit"],
+		["--push"],
+		["--unknown", "value"],
+		["--firstmate", "assignment.json"],
+		["--firstmate-correction", "other.json"],
+	]) {
+		test(`correction rejects competing arguments ${extra.join(" ")} before connection`, async () => {
+			for (const args of [
+				["start", "--firstmate-correction", "/unread.json", ...extra],
+				["start", ...extra, "--firstmate-correction", "/unread.json"],
+			]) {
+				const output = await run(args, {});
+				expect(output.connections).toBe(0);
+				expect(output.requests).toEqual([]);
+				expect(output.errors[0]).toContain("start --firstmate-correction CORRECTION_JSON_FILE");
+				expect(output.exitCode).toBe(1);
+			}
+		});
+	}
+
+	test("correction rejects missing paths, file failures, malformed JSON and adjacent verbs before connection", async () => {
+		const root = await mkdtemp(join(tmpdir(), "correction-invalid-"));
+		try {
+			const malformed = join(root, "malformed.json");
+			await writeFile(malformed, "{broken");
+			for (const args of [
+				["start", "--firstmate-correction"],
+				["start", "--firstmate-correction", ""],
+				["start", "--firstmate-correction", "  "],
+				["start", "--firstmate-correction", "--resume"],
+				["start", "--firstmate-correction", join(root, "missing.json")],
+				["start", "--firstmate-correction", root],
+				["start", "--firstmate-correction", malformed],
+				["run", "--firstmate-correction", malformed],
+				["run", "mapped", "--firstmate-correction", malformed],
+				["steer", "mapped", "--firstmate-correction", malformed],
+				["status", "mapped", "--firstmate-correction", malformed],
+			]) {
+				const output = await run(args, {});
+				expect(output.connections).toBe(0);
+				expect(output.requests).toEqual([]);
+				expect(output.errors.length).toBeGreaterThan(0);
+				expect(output.exitCode).toBe(1);
+			}
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("correction validation or transport refusal is reported without replay", async () => {
+		const root = await mkdtemp(join(tmpdir(), "correction-refused-"));
+		try {
+			const file = join(root, "correction.json");
+			await writeFile(file, JSON.stringify(correction));
+			const output = await run(["start", "--firstmate-correction", file], new Error("correction refused"));
+			expect(output.requests).toEqual([{ verb: "work.start", params: { firstmateCorrection: correction } }]);
+			expect(output.connections).toBe(1);
+			expect(output.lines).toEqual([]);
+			expect(output.errors).toEqual(["correction refused"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const result of [
+		{ started: true, jobId: "job-exact", opRef: "op-exact", sessionKey: "work-mapped", sessionId: "session-exact" },
+		{ started: false, held: true, jobId: "job-exact", state: "awaiting_operator", reason: "acceptance_uncertain" },
+	]) {
+		test(`mapped start forwards only the assignment and prints full JSON started=${result.started}`, async () => {
+			const root = await mkdtemp(join(tmpdir(), "mapped-start-"));
+			try {
+				const file = join(root, "assignment.json");
+				await writeFile(file, JSON.stringify(assignment));
+				const output = await run(["start", "--firstmate", file], result, "must-not-infer-parent");
+				expect(output.requests).toEqual([{ verb: "work.start", params: { firstmate: assignment } }]);
+				expect(output.lines).toEqual([JSON.stringify(result)]);
+				expect(output.errors).toEqual([]);
+				expect(output.closed).toBe(true);
+				expect(output.exitCode).toBe(result.started ? 0 : 1);
+			} finally {
+				await rm(root, { recursive: true, force: true });
+			}
+		});
+	}
+
+	for (const extra of [
+		["ordinary-name"],
+		["--text", "task"],
+		["--cwd", "/repo"],
+		["--repo", "/repo"],
+		["--base", "dev"],
+		["--resume"],
+		["--model", "model"],
+		["--preset", "preset"],
+		["--callerSessionId", "caller"],
+		["--notify", "origin"],
+		["--firstmate", "other.json"],
+	]) {
+		test(`mapped start rejects competing arguments ${extra.join(" ")}`, async () => {
+			for (const args of [
+				["start", "--firstmate", "/unread.json", ...extra],
+				["start", ...extra, "--firstmate", "/unread.json"],
+			]) {
+				const output = await run(args, {});
+				expect(output.connections).toBe(0);
+				expect(output.requests).toEqual([]);
+				expect(output.exitCode).toBe(1);
+			}
+		});
+	}
+
+	test("mapped start rejects missing paths, unreadable files and malformed JSON before connection", async () => {
+		const root = await mkdtemp(join(tmpdir(), "mapped-invalid-"));
+		try {
+			const malformed = join(root, "malformed.json");
+			await writeFile(malformed, "{broken");
+			for (const args of [
+				["start", "--firstmate"],
+				["start", "--firstmate", ""],
+				["start", "--firstmate", "--resume"],
+				["start", "--firstmate", join(root, "missing.json")],
+				["start", "--firstmate", root],
+				["start", "--firstmate", malformed],
+				["run", "--firstmate", malformed],
+			]) {
+				const output = await run(args, {});
+				expect(output.connections).toBe(0);
+				expect(output.requests).toEqual([]);
+				expect(output.errors.length).toBeGreaterThan(0);
+				expect(output.exitCode).toBe(1);
+			}
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test("mapped start reports validation or transport refusal without replay", async () => {
+		const root = await mkdtemp(join(tmpdir(), "mapped-refused-"));
+		try {
+			const file = join(root, "assignment.json");
+			await writeFile(file, JSON.stringify(assignment));
+			const output = await run(["start", "--firstmate", file], new Error("assignment refused"));
+			expect(output.requests).toEqual([{ verb: "work.start", params: { firstmate: assignment } }]);
+			expect(output.lines).toEqual([]);
+			expect(output.errors).toEqual(["assignment refused"]);
+			expect(output.exitCode).toBe(1);
+			expect(output.closed).toBe(true);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	for (const completeness of ["complete", "partial", "unavailable"]) {
+		for (const native of [false, true]) {
+			test(`inspect preserves ${completeness} evidence with native=${native}`, async () => {
+				const result = {
+					identity: {
+						taskId: "task-exact",
+						jobId: "job-exact",
+						ordinal: 2,
+						opRef: "op-exact",
+						sessionKey: "work-mapped",
+						sessionId: "session-exact",
+						epoch: 3,
+					},
+					lifecycle: {
+						jobState: "attempt_ended",
+						sendPhase: "accepted",
+						terminal: { kind: "local", observedAt: "2026-10-14T00:00:00Z", reasonCode: "endpoint_stale" },
+						settledAt: null,
+					},
+					evidence: {
+						completeness,
+						text: "한글\n".repeat(5000),
+						source: "retained",
+						provenance: {
+							source: "turn.result",
+							fullness: "original",
+							sessionId: "session-exact",
+							repo: "/repo/task",
+							opRef: "op-exact",
+							clientRef: "client-exact",
+							commandId: "command-exact",
+							turnId: "turn-exact",
+							terminalAt: 10,
+							contentVersion: 1,
+							byteLength: 35000,
+							epoch: 3,
+							observedAtMs: 9,
+							attribution: "operation_ref",
+						},
+					},
+					execution: "not_evaluated",
+					reasons: ["endpoint_stale", "original_unavailable"],
+				};
+				const output = await run(
+					["inspect", "mapped", "--task", "task-exact", "--op", "op-exact", ...(native ? ["--native"] : [])],
+					result,
+				);
+				expect(output.requests).toEqual([
+					{
+						verb: "work.inspect",
+						params: { name: "mapped", taskId: "task-exact", opRef: "op-exact", ...(native ? { native: true } : {}) },
+					},
+				]);
+				expect(output.lines).toEqual([JSON.stringify(result)]);
+				expect(output.errors).toEqual([]);
+				expect(output.exitCode ?? 0).toBe(0);
+				expect(output.closed).toBe(true);
+			});
+		}
+	}
+
+	test("inspect preserves unavailable null identity and reports transport errors without retry", async () => {
+		const args = ["inspect", "mapped", "--op", "op-exact", "--native", "--task", "task-exact"];
+		const result = {
+			identity: null,
+			lifecycle: null,
+			evidence: { completeness: "unavailable" },
+			execution: "not_evaluated",
+			reasons: ["task_mismatch"],
+		};
+		const output = await run(args, result);
+		expect(output.lines).toEqual([JSON.stringify(result)]);
+		expect(output.exitCode ?? 0).toBe(0);
+		const failed = await run(args, new Error("inspection unavailable"));
+		expect(failed.errors).toEqual(["inspection unavailable"]);
+		expect(failed.requests).toHaveLength(1);
+		expect(failed.exitCode).toBe(1);
+		expect(failed.closed).toBe(true);
+	});
+
+	for (const args of [
+		[],
+		["mapped"],
+		["--task", "t", "--op", "o"],
+		["mapped", "--task", "t"],
+		["mapped", "--op", "o"],
+		["mapped", "--task", "--op", "o"],
+		["mapped", "--task", "t", "--op"],
+		["mapped", "--task", "", "--op", "o"],
+		["mapped", "--task", "t", "--op", " "],
+		["mapped", "--task", "t", "--op", "o", "--task", "t"],
+		["mapped", "--task", "t", "--op", "o", "--op", "o"],
+		["mapped", "--task", "t", "--op", "o", "--native", "--native"],
+		["mapped", "--task", "t", "--op", "o", "--native", "false"],
+		["mapped", "--task", "t", "--op", "o", "--native=true"],
+		["mapped", "--task", "t", "--op", "o", "--unknown"],
+		["mapped", "--task", "t", "--op", "o", "extra"],
+	]) {
+		test(`inspect rejects invalid selectors before connecting: ${JSON.stringify(args)}`, async () => {
+			const output = await run(["inspect", ...args], {});
+			expect(output.requests).toEqual([]);
+			expect(output.connections).toBe(0);
+			expect(output.exitCode).toBe(1);
+		});
 	}
 
 	for (const [flag, value, model] of [

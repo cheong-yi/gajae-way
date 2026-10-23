@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bunx biome ci packages/
       - run: bunx tsc --noEmit -p tsconfig.json
@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       # npm >= 11.5.1 authenticates to the registry with this job's GitHub
       # OIDC token (trusted publishing, configured per package on npmjs.com)
       # and attaches provenance. No NPM_TOKEN or .npmrc is involved; do not
@@ -92,7 +92,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.0
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run build
       - name: Package binaries
