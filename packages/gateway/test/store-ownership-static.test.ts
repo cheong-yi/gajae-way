@@ -51,6 +51,7 @@ function rawCallViolation(file: string, receiver: string, method: string): boole
 	if (file === "orchestrator/rebind.ts" && receiver === "open") return false;
 	if (file === "orchestrator/session-port.ts" && (receiver === "relay" || receiver === "input.relay")) return false;
 	if (file === "server/server.ts" && receiver === "runtime.delivery") return false;
+	if (file === "orchestrator/lane-governor.ts" && receiver === "policy" && method === "prepare") return false;
 	return true;
 }
 
@@ -114,4 +115,5 @@ test("positive fixtures identify misplaced writes and raw SQLite access", () => 
 	expect(rawCallViolation("server/server.ts", "runtime.delivery", "prepare")).toBe(false);
 	expect(rawCallViolation("orchestrator/session-port.ts", "input.relay", "query")).toBe(false);
 	expect(rawCallViolation("orchestrator/rebind.ts", "open", "exec")).toBe(false);
+	expect(rawCallViolation("orchestrator/lane-governor.ts", "policy", "prepare")).toBe(false);
 });
