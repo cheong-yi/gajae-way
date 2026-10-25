@@ -708,6 +708,7 @@ export interface WorkFirstmateAssignmentParams {
 	readonly worktree: {
 		readonly path: string;
 		readonly commonDir: string;
+		/** Linked Git directory identifies registration; HEAD may advance. */
 		readonly gitDir: string;
 		readonly branch: string;
 	};

@@ -1,7 +1,7 @@
 # Multi-stage build for gajae-way
 
 # Build stage: compile all binaries
-FROM oven/bun:1.4.2 AS builder
+FROM oven/bun:1.4.0 AS builder
 
 WORKDIR /build
 
@@ -15,7 +15,7 @@ RUN bun install --frozen-lockfile
 RUN bun run build
 
 # Runtime stage: minimal image with compiled binaries and gjc
-FROM oven/bun:1.4.2
+FROM oven/bun:1.4.0
 
 # Install system dependencies: curl (for gjc), procps (for healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \

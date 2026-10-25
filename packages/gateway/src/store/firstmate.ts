@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import type { FirstmateReleaseReceipt, FirstmateResultIdentity } from "@gajae-gateway/protocol";
-import { type OriginRef, originKey, ProtocolError, validateOriginRef } from "@gajae-gateway/protocol";
+import type { FirstmateResultIdentity, WorkFirstmateAssignmentParams } from "@gajae-gateway/protocol";
+import { ProtocolError, validateOriginRef } from "@gajae-gateway/protocol";
 
 export type {
 	FirstmateApproval,
@@ -12,27 +12,7 @@ export type {
 } from "@gajae-gateway/protocol";
 
 /** Trusted policy input, not public work.start authority or another task lifecycle. */
-export interface FirstmateAssignment {
-	readonly taskId: string;
-	readonly name: string;
-	readonly ownerId: string;
-	readonly messageId: string;
-	readonly thread: OriginRef;
-	readonly mandate: {
-		readonly id: string;
-		readonly text: string;
-		readonly checkRetries: boolean;
-		readonly commit: boolean;
-		readonly push: boolean;
-	};
-	readonly worktree: {
-		readonly path: string;
-		readonly commonDir: string;
-		/** Linked Git directory identifies registration; HEAD may advance. */
-		readonly gitDir: string;
-		readonly branch: string;
-	};
-}
+export type FirstmateAssignment = WorkFirstmateAssignmentParams;
 
 export type FirstmateCause =
 	| { readonly kind: "assignment" }
@@ -62,18 +42,6 @@ export interface FirstmateAttempt extends FirstmateResultIdentity {
 	readonly cause: FirstmateCause;
 	readonly text: string;
 	readonly preparedAt: string;
-}
-
-/** Narrow read contract for the existing FirstmateStore owner in groups/work.ts. */
-export interface FirstmateCloseoutReaders {
-	/** All immutable preparations for exactly this task, ordered by ascending ordinal. */
-	attemptsForTask(taskId: string): readonly FirstmateAttempt[];
-	/**
-	 * Completed receipt only, matched by all three fields against its request identity.
-	 * Covers earlier corrected attempts in the same released session; a pending intent
-	 * never supplies coverage. No live binding check or native read belongs in this reader.
-	 */
-	completedReleaseForSession(taskId: string, sessionId: string, epoch: number): FirstmateReleaseReceipt | undefined;
 }
 
 export function firstmateAssert(condition: unknown, reason: string): asserts condition {

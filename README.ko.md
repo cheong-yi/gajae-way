@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/Yeachan-Heo/gajae-way/actions/workflows/build.yml"><img alt="Build" src="https://github.com/Yeachan-Heo/gajae-way/actions/workflows/build.yml/badge.svg"></a>
   <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg"></a>
-  <img alt="Bun" src="https://img.shields.io/badge/bun-%3E%3D1.4.2-000000?logo=bun&logoColor=white">
+  <img alt="Bun" src="https://img.shields.io/badge/bun-%3E%3D1.4.0-000000?logo=bun&logoColor=white">
   <img alt="Runtime" src="https://img.shields.io/badge/runtime-TypeScript-3178C6?logo=typescript&logoColor=white">
 </p>
 
@@ -130,7 +130,7 @@ Discord / Telegram / Slack ──> gajaeway gateway ──> your persona (gjc)
 
 `gajaeway [--socket PATH] work approve --firstmate APPROVAL_JSON_FILE`은 `firstmate` 래퍼 없이 정확한 로컬 `WorkApproveParams` 객체를 제출합니다. `name`, `identity` (`taskId`, `jobId`, `opRef`, `ordinal`, `sessionId`, `epoch`), `ownerId`, 별도 결정의 `messageId`, 정확한 `thread`, `mandateId`, 명시적 `scope`를 `decision` 및 검토한 `evidence`에 결합합니다. complete/partial 보존 또는 네이티브 증거에는 명시적 `accept_outcome`을 사용할 수 있으며, partial은 `reasons`에 한계를 공개해야 합니다. unavailable에는 `acknowledge_unavailable`만 허용되며, 결과 수용이나 세션 해제 권한이 되지 않습니다. 전체 증거 형식은 [런북](docs/runbooks/gajaeway-v1.md#local-exact-result-decision-unverified)을 참조하세요.
 
-`WorkApproveResult`는 `{ recorded: true, approval }` (정확한 요청에 `approvalId`, `recordedAt` 추가) 또는 `{ recorded: false, held: true, reason }`입니다. CLI는 전체 JSON을 출력하며 보류 시 종료 코드 1을 반환합니다. 확인 기록은 결과 수용이 아닙니다. 네이티브 `done`/`attempt_ended`, 소유자의 결과 수용, 별도 보존형 마무리는 서로 다릅니다. 승인은 게시·커밋·푸시·배포·삭제·세션 해제 권한을 부여하지 않습니다. reconstructed/logs 입력은 보류되며 재구성 서비스나 자동 재실행은 없습니다. 해제 레코드/타입은 내부 준비용 저장 구조일 뿐이며 보존형 마무리 런타임/CLI는 아직 연결되지 않았습니다. 소스와 안내는 통합 검증 및 새로운 Luna/Sol 게이트웨이 검토 전까지 UNVERIFIED입니다. 자연어 Discord/모델 또는 전체 소유자 여정의 준비 완료를 주장하지 않습니다.
+`WorkApproveResult`는 `{ recorded: true, approval }` (정확한 요청에 `approvalId`, `recordedAt` 추가) 또는 `{ recorded: false, held: true, reason }`입니다. CLI는 전체 JSON을 출력하며 보류 시 종료 코드 1을 반환합니다. 확인 기록은 결과 수용이 아닙니다. 네이티브 `done`/`attempt_ended`, 소유자의 결과 수용, 별도 보존형 마무리는 서로 다릅니다. 승인은 게시·커밋·푸시·배포·삭제·세션 해제 권한을 부여하지 않습니다. reconstructed/logs 입력은 보류되며 재구성 서비스나 자동 재실행은 없습니다. 보존형 마무리는 별도의 `gajaeway work retire --firstmate RELEASE_JSON_FILE` 명령이며 현재 유효한 `accept_outcome` 승인이 필요합니다. 소스와 안내는 통합 검증 및 새로운 Luna/Sol 게이트웨이 검토 전까지 UNVERIFIED입니다. 자연어 Discord/모델 또는 전체 소유자 여정의 준비 완료를 주장하지 않습니다.
 
 일반 start/run/status는 그대로이며, 일반 steer는 매핑된 작업을 수정하는 경로가 아닙니다. partial/unavailable 증거는 실행 실패를 뜻하지 않고, 포인터는 조회 가능 여부나 16 KiB를 넘는 전체 원문 또는 해제 후 원문 보존을 보장하지 않습니다. 네이티브 내부 보고는 작업자의 직접 채팅이 아니라 주 감독자의 기존 전달 경로를 사용합니다. 조회나 커밋 권한은 작업 승인 또는 게시 권한을 부여하지 않으며, push/PR/merge/release/deploy/retire/delete에는 각각 별도의 승인이 필요합니다. 이 최선 노력 방식의 새 데이터베이스 대상 소스 범위는 마이그레이션/과거 작업 재개, 전체 소유자 여정, 실제 환경 활성화를 확립하지 않습니다. 할당 예제와 신뢰 경계는 [런북](docs/runbooks/gajaeway-v1.md)을 참고하세요.
 

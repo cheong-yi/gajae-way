@@ -840,10 +840,8 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 					CHECK(thread_origin_key LIKE 'slack/thread/%' OR thread_origin_key LIKE 'discord/thread/%')
 				);
 			`);
-		});
-		host.withTransaction(() => {
 			host.database
-				.statement("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(38, new Date().toISOString());
 		});
 	}
