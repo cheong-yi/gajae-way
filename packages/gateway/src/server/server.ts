@@ -2711,6 +2711,29 @@ function claimInboundWatches(
 	return { watchWakeOrigins, memoryIntentIds };
 }
 
+/**
+ * The persona already talks in this thread, or the gateway created it as a FirstMate pane.
+ * Authorisation is unchanged: this only spares the pane's human a mention.
+ */
+function paneOrFollowUpThread(origin: OriginRef, key: string, store: Store): boolean {
+	if (origin.kind !== "thread") return false;
+	return threadFollowUpEngaged(origin, key, store.inbox) || readChildPane(store, origin) !== undefined;
+}
+
+/** Scope and authority for the ordinary persona bound to one FirstMate pane. */
+export function firstmateChildNotice(store: Store, origin: OriginRef): string | undefined {
+	const pane = origin.kind === "thread" ? readChildPane(store, origin) : undefined;
+	const assignment = pane ? store.work.firstmate.assignment(pane.laneName) : undefined;
+	if (!pane || !assignment) return undefined;
+	const lane = assignment.name;
+	return [
+		"## FirstMate crewmate pane",
+		`This conversation is the pane for exactly one FirstMate task: task ${assignment.taskId}, lane \`${lane}\`, worktree ${assignment.worktree.path} on branch ${assignment.worktree.branch}. The lane is the worker; you drive it and never edit that worktree yourself.`,
+		`You may steer it (\`gajaeway work steer ${lane} "<input>"\`, one message per steer), inspect it (\`gajaeway work status ${lane}\`, \`gajaeway work inspect ${lane} --task ${assignment.taskId} --op <opRef>\`), and report here. Touch no other lane.`,
+		`Correction and approval stay with FirstMate in ${pane.personaOriginKey}: never run \`work start --firstmate-correction\`, \`work approve\` or \`work retire --firstmate\`, and never ask for approval here. When someone here changes the ask, do not steer it in: relay it to FirstMate with [WAKE:${pane.personaOriginKey}] <one-line summary of the changed ask>.`,
+	].join("\n");
+}
+
 /** A timed-out creation is held, never silently repeated against Discord. */
 async function openFirstmatePane(
 	runtime: Runtime,
@@ -2760,7 +2783,6 @@ async function openFirstmatePane(
 			createdByGateway: store.instanceId,
 		});
 		store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "recorded" }));
-		await runtime.personaSessions.bindChildPane(childOrigin);
 	} catch (error) {
 		// Pane failure never tears down or relaunches its headless lane.
 		console.error(`firstmate_pane_unavailable name=${assignment.name} reason=${diagnostic(error)}`);
@@ -2797,52 +2819,21 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
 	const key = originKey(origin);
-	if (paneOriginRecorded(options.database, origin)) {
-		const pane = readChildPane(options.database, origin);
-		const authorIsBot = (params.engagement as { authorIsBot?: unknown } | undefined)?.authorIsBot === true;
-		if (
-			!pane ||
-			authorIsBot ||
-			typeof params.engagement?.authorId !== "string" ||
-			typeof params.messageId !== "string"
-		) {
-			connection.write({
-				v: PROFILE_VERSION,
-				type: "response",
-				id: request.id,
-				result: { turnId: null, engaged: false },
-			});
-			return;
-		}
-		const result = await runtime.work.steerFirstmateChild({
-			origin: pane.childOrigin,
-			messageId: params.messageId,
-			text: userText,
-			authorIsBot,
-		});
-		if (result.steered) {
-			const watches = options.database.transaction((tx) =>
-				claimInboundWatches(
-					options.database,
-					tx,
-					pane.childOrigin,
-					params.messageId as string,
-					undefined,
-					params.engagement as { authorId?: string },
-				),
-			);
-			for (const id of watches.memoryIntentIds) runtime.memory.enqueueExistingId(id);
-			for (const watched of watches.watchWakeOrigins) void runtime.personaSessions.notifyInbound(watched);
-		}
+	// A recorded pane with damaged provenance has no owner to answer for it: fail closed.
+	if (
+		origin.kind === "thread" &&
+		paneOriginRecorded(options.database, origin) &&
+		!readChildPane(options.database, origin)
+	) {
 		connection.write({
 			v: PROFILE_VERSION,
 			type: "response",
 			id: request.id,
-			result: { turnId: result.steered ? result.clientRef : null, engaged: result.steered },
+			result: { turnId: null, engaged: false },
 		});
 		return;
 	}
-	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
+	const threadFollowUp = paneOrFollowUpThread(origin, key, options.database);
 	// `/model` is a privileged control path. Apply the same direct-message and
 	// group authorisation policy as ordinary engagement before inspecting or
 	// mutating the durable override.
@@ -3317,7 +3308,7 @@ async function editChat(
 	options.database.transaction((tx) =>
 		options.database.inbox.updateContextBody(tx, key, params.messageId as string, params.text as string),
 	);
-	const threadFollowUp = origin.kind === "thread" && threadFollowUpEngaged(origin, key, options.database.inbox);
+	const threadFollowUp = paneOrFollowUpThread(origin, key, options.database);
 	// A muted thread (#625) admits only a message that addresses the persona, which also unmutes it.
 	const muteKey = threadMuteKey(origin, key, params.engagement as never);
 	const mutedThread = muteKey !== undefined && options.database.inbox.isThreadMuted(muteKey);
@@ -3521,6 +3512,7 @@ async function createInboundTurnLifecycle(
 	const systemPreamble = [
 		await runtime.persona.systemPreamble(),
 		currentConversationNotice(origin),
+		...[firstmateChildNotice(options.database, origin)].filter((notice) => notice !== undefined),
 		ATTACHMENT_SCOPE_NOTICE,
 		ACTION_GUARD_SYSTEM_NOTICE,
 		SECRET_GUARD_SYSTEM_NOTICE,
@@ -3598,14 +3590,12 @@ async function createInboundTurnLifecycle(
 	/** The target and hop for a relay out of this conversation, or the refusal reason. */
 	const directiveTarget = (target: string, allowPane: boolean) => {
 		const resolved = resolveHandoffTarget(target, runtime.config);
-		if (!resolved.ok) return resolved;
-		if (resolved.origin.kind === "thread" && allowPane) {
-			const paneTarget = resolvePostTarget(resolved.originKey, origin, runtime.config, options.database);
-			return paneTarget.ok ? { ok: true as const, origin: paneTarget.target, originKey: paneTarget.key } : paneTarget;
-		}
-		if (!allowPane && paneOriginRecorded(options.database, resolved.origin))
-			return { ok: false as const, reason: "not_a_channel" };
-		return resolved;
+		if (!resolved.ok || !paneOriginRecorded(options.database, resolved.origin)) return resolved;
+		// Only the owning persona may relay into its recorded pane; any other thread stays native.
+		const pane = allowPane ? readChildPane(options.database, resolved.origin) : undefined;
+		return pane?.personaOriginKey === key
+			? { ok: true as const, origin: pane.childOrigin, originKey: originKey(pane.childOrigin) }
+			: { ok: false as const, reason: "not_a_channel" };
 	};
 	const planRelay = (target: string, allowPane = false) => {
 		const resolved = directiveTarget(target, allowPane);
@@ -5026,7 +5016,7 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// A conversation turn is the owner's line to the persona; it must not be
 		// spent waiting. Waits are backgrounded or handed to a lane that reports to its parent.
 		"## Staying responsive while you work",
-		"FirstMate panes are gateway-created child threads with durable task and owning-persona provenance, not ordinary session bindings. Only that owning persona may POST, WAKE or WATCH its recorded pane. Human messages in the pane steer an already-running attempt; bots, ended attempts and unavailable provenance cannot steer it. A pane message never approves an outcome or silently resumes a dead lane: explicit correction and approval retain their existing exact task/session/epoch requirements. Running transcript stays in the pane; the parent receives one gateway-authored state-and-pointers outcome per terminal event, and preserving release waits for that specific outcome's confirmed delivery.",
+		"FirstMate panes are gateway-created child threads with durable task and owning-persona provenance, not ordinary session bindings. Only that owning persona may POST, WAKE or WATCH its recorded pane. Each pane has its own ordinary persona session, scoped to that one task and worktree: it may steer, inspect and report on its lane, and relays a changed ask to you as a wake. A pane message never approves an outcome or silently resumes a dead lane: correction and approval stay with you, under their existing exact task/session/epoch requirements. Running transcript stays in the pane; the parent receives one gateway-authored state-and-pointers outcome per terminal event, and preserving release waits for that specific outcome's confirmed delivery.",
 		"Explicit trusted-local outcome decisions use `gajaeway work approve --firstmate APPROVAL_JSON_FILE`: provide the exact WorkApproveParams identity, owner/message/thread/mandate, scope, decision and inspected evidence including reasons. Complete or partial evidence can be accepted with its exact limits; unavailable evidence permits acknowledgement only, never outcome approval. Native success alone is not approval. A recorded receipt neither releases the session nor grants publication or deletion authority. Scoped FirstMate release is not available through this approval command.",
 		"Trusted local FirstMate submission: `gajaeway work start --firstmate ASSIGNMENT_JSON_FILE` transports an explicit immutable owner/message/thread/mandate and registered worktree assignment; it does not infer authority or map chat automatically. Save the name/taskId/opRef association. Use `gajaeway work inspect NAME --task TASK_ID --op OP_REF [--native]` for exact evidence, not latest status. Preserve complete/partial/unavailable labels, provenance and reasons; lifecycle is separate and execution is not evaluated. Native reads are opt-in and best-effort, with no original-output guarantee above 16KiB or after release. Ordinary `work status` is a lane observation, not exact result inspection; `work steer` does not correct mapped tasks. Explicit trusted-local correction uses `gajaeway work start --firstmate-correction CORRECTION_JSON_FILE` with name, taskId, ownerId, a new messageId, the same thread, mandateId, the exact latest completed priorOpRef, and text within the unchanged mandate. It preserves the task/worktree/session and appends an independent attempt; a result or native done state is not owner approval. Exact duplicates return the original accepted correction or hold unproven acceptance without replay. Never bypass a hold with a new message, invent correction authority, or treat correction as approval, publication or closeout.",
 		'Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or delegate to a lane with `gajaeway work start <name> --cwd "$PWD" "<task>"` from the target checkout, or use `--repo <path-or-url>` to create an isolated repository worktree. Its result returns here as an internal report, not a chat post. Say what you started and end the turn.',

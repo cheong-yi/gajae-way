@@ -78,7 +78,7 @@ import {
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
 import { readFailedTransportCause } from "./failed-turn-evidence";
-import { paneDeliveryGuard, readChildPane, readLanePane } from "./firstmate-pane";
+import { paneDeliveryGuard, readLanePane } from "./firstmate-pane";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
 	type LaneForceRetireReason,
@@ -2228,9 +2228,9 @@ export class WorkLaneManager {
 				: {}),
 		};
 	}
+	/** One doorbell for every lane, mapped or not; steering never corrects or reopens a task. */
 	async steer(params: unknown): Promise<WorkSteerResult> {
 		const name = parseName(params);
-		this.#db.work.firstmate.assertUnmapped(name);
 		const text = (params as { text?: unknown }).text;
 		if (typeof text !== "string" || !text) invalid("text");
 		this.#live();
@@ -2245,7 +2245,8 @@ export class WorkLaneManager {
 		this.#live();
 		return this.#port.runExclusive(workSessionKey(name), async (): Promise<WorkSteerResult> => {
 			this.#live();
-			this.#db.work.firstmate.assertUnmapped(name);
+			if (this.#options.lanes.preservingRelease(name))
+				return { steered: false, reason: "task_release_pending_or_completed" };
 			const current = this.#job(name, true)!;
 			const open = current.attempts.at(-1);
 			if (open?.opRef !== captured.opRef || open.endedAt !== undefined)
@@ -2269,82 +2270,6 @@ export class WorkLaneManager {
 				throw workError("work steer acceptance uncertain", "steer_acceptance_uncertain", runtime, clientRef);
 			}
 			return { steered: true, clientRef };
-		});
-	}
-	/** Internal child ingress, not the public mapped-task work.steer verb. */
-	async steerFirstmateChild(input: {
-		origin: OriginRef;
-		messageId: string;
-		text: string;
-		authorIsBot: boolean;
-	}): Promise<WorkSteerResult> {
-		const refuse = (reason: string): WorkSteerResult => ({ steered: false, reason });
-		if (input.authorIsBot) return refuse("bot_instruction_refused");
-		if (!input.messageId || !input.text) return refuse("invalid_child_input");
-		this.#live();
-		const pane = readChildPane(this.#db, input.origin);
-		if (!pane) return refuse("child_provenance_unavailable");
-		const captured = this.#db.work.workAttemptOpenByLane(laneJobIdentity(pane.laneName).laneKey);
-		if (!captured) return refuse("no_open_attempt");
-		return this.#port.runExclusive(workSessionKey(pane.laneName), async () => {
-			this.#live();
-			const currentPane = readChildPane(this.#db, input.origin);
-			const current = this.#db.work.workAttemptOpenByLane(captured.laneKey);
-			if (!currentPane || JSON.stringify(currentPane) !== JSON.stringify(pane))
-				return refuse("child_provenance_unavailable");
-			if (this.#options.lanes.preservingRelease(pane.laneName)) return refuse("task_release_pending_or_completed");
-			if (
-				!current ||
-				current.opRef !== captured.opRef ||
-				current.sessionId !== captured.sessionId ||
-				current.epoch !== captured.epoch ||
-				current.settledAt !== null ||
-				current.terminal ||
-				!this.#binding(current)
-			)
-				return refuse("captured_attempt_ended_or_changed");
-			const key = `firstmate-pane/steer/${createHash("sha256")
-				.update(`${originKey(input.origin)}\0${input.messageId}`)
-				.digest("hex")}`;
-			const raw = this.#db.core.metaGet(key);
-			if (raw !== undefined) {
-				try {
-					const previous = JSON.parse(raw) as { text: string; opRef: string; clientRef: string; state: string };
-					if (previous.text !== input.text || previous.opRef !== captured.opRef)
-						return refuse("child_message_conflict");
-					return previous.state === "accepted"
-						? { steered: true, clientRef: previous.clientRef }
-						: refuse("child_steer_acceptance_uncertain");
-				} catch {
-					return refuse("child_steer_record_unavailable");
-				}
-			}
-			const clientRef = `pane-steer-${createHash("sha256").update(key).digest("hex")}`;
-			const record = {
-				origin: input.origin,
-				messageId: input.messageId,
-				text: input.text,
-				taskId: pane.taskId,
-				opRef: current.opRef,
-				sessionId: current.sessionId,
-				epoch: current.epoch,
-				clientRef,
-				state: "dispatching",
-			};
-			this.#db.core.metaSet(key, JSON.stringify(record));
-			try {
-				await this.#port.steer({ sessionId: current.sessionId, repo: current.cwd, text: input.text, clientRef });
-				this.#db.core.metaSet(key, JSON.stringify({ ...record, state: "accepted" }));
-				return { steered: true, clientRef };
-			} catch (error) {
-				this.#db.core.metaSet(
-					key,
-					JSON.stringify({ ...record, state: definitiveSteerRefusal(error) ? "refused" : "uncertain" }),
-				);
-				return refuse(
-					definitiveSteerRefusal(error) ? `steer_refused:${safeRefusal(error)}` : "child_steer_acceptance_uncertain",
-				);
-			}
 		});
 	}
 

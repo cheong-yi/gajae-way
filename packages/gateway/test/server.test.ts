@@ -566,7 +566,7 @@ for (const { output, state, unavailable } of [
 			} finally {
 				inspect.mockRestore();
 			}
-			for (const verb of ["work.start", "work.run", "work.steer"]) {
+			for (const verb of ["work.start", "work.run"]) {
 				const diagnostic = `FirstMate bypass ${output.length > 100 ? "partial" : "complete"} ${verb}`;
 				let rejected = false;
 				let rejection: unknown;
@@ -589,8 +589,13 @@ for (const { output, state, unavailable } of [
 				});
 				console.info(`${diagnostic}: exact mapped admission refusal confirmed`);
 			}
+			// work.steer is the one doorbell for a mapped lane: it rings once and never starts or corrects work.
+			expect(await sdk.request("work.steer", { name: assignment.name, text: "steer only" })).toMatchObject({
+				steered: true,
+			});
 			expect(port.sends.filter((send) => send.opRef === start.opRef)).toHaveLength(1);
-			expect(port.steers).toHaveLength(0);
+			expect(port.steers).toHaveLength(1);
+			expect(port.steers[0]).toMatchObject({ sessionId: start.sessionId, text: "steer only" });
 
 			port.complete(start.opRef, output);
 			await until(() => Boolean(database.work.workAttemptGet(start.opRef)?.settledAt));

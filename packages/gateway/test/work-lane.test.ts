@@ -27,7 +27,7 @@ import {
 import type { GatewayConfig } from "../src/config";
 import { DeliveryService } from "../src/delivery/delivery";
 import { GjcCliUnavailableError } from "../src/orchestrator/broker";
-import { paneDeliveryGuard, readChildPane, readLanePane, saveChildPane } from "../src/orchestrator/firstmate-pane";
+import { paneDeliveryGuard, readLanePane, saveChildPane } from "../src/orchestrator/firstmate-pane";
 import {
 	classifyCheckRollup,
 	failedCheckLogTargets,
@@ -42,7 +42,6 @@ import {
 	managedLaneWorktreePath,
 	workSessionKey,
 } from "../src/orchestrator/lane-governor";
-import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import {
 	BrokerSessionPort,
 	parseWorkerOutputResponse,
@@ -806,24 +805,17 @@ test("pane provenance, not a binding, allow-lists only the owning persona and pe
 	expect(readLanePane(f.db, f.assignment.name)).toBeUndefined();
 	expect(() => paneDeliveryGuard(f.db, f.pane.childOrigin)).toThrow("provenance unavailable");
 	expect(resolvePostTarget(childKey, f.assignment.thread, config, f.db).ok).toBe(false);
-	expect(await f.manager.steerFirstmateChild(f.input)).toMatchObject({ steered: false });
 	expect(f.db.work.workAttemptGet(f.start.opRef)?.settledAt).toBeNull();
 });
 
-test("pane human steer is durable once, bot text is never admitted, and public mapped work.steer stays refused", async () => {
+test("mapped work.steer is the single doorbell: one native steer, no approval, no resume", async () => {
 	const f = await paneFixture();
-	const admitted = await f.manager.steerFirstmateChild(f.input);
+	const admitted = await f.manager.steer({ name: f.assignment.name, text: f.input.text });
 	expect(admitted.steered).toBe(true);
-	expect(await f.manager.steerFirstmateChild(f.input)).toEqual(admitted);
 	expect(f.port.steers).toHaveLength(1);
-	expect(f.db.core.metaKeysInRange("firstmate-pane/steer/", "firstmate-pane/steer/\uffff")).toHaveLength(1);
+	expect(f.port.steers[0]).toMatchObject({ sessionId: f.start.sessionId, text: f.input.text });
 	expect(f.db.core.groupDb("work").prepare("SELECT * FROM firstmate_approvals").all()).toEqual([]);
-	expect(await f.manager.steerFirstmateChild({ ...f.input, messageId: "other-bot", authorIsBot: true })).toEqual({
-		steered: false,
-		reason: "bot_instruction_refused",
-	});
-	expect(f.db.core.metaKeysInRange("firstmate-pane/steer/", "firstmate-pane/steer/\uffff")).toHaveLength(1);
-	await expect(f.manager.steer({ name: f.assignment.name, text: "bypass" })).rejects.toBeDefined();
+	expect(f.owner.attemptsForTask(f.assignment.taskId)).toHaveLength(1);
 	await expect(
 		f.manager.start({ name: f.assignment.name, text: "resume", cwd: f.assignment.worktree.path, resume: true }),
 	).rejects.toBeDefined();
@@ -844,29 +836,11 @@ test("pane queued steer rechecks the captured terminal attempt under the existin
 		);
 	});
 	await entered.promise;
-	const steer = f.manager.steerFirstmateChild(f.input);
+	const steer = f.manager.steer({ name: f.assignment.name, text: f.input.text });
 	release.resolve();
 	await held;
-	expect(await steer).toMatchObject({ steered: false, reason: "captured_attempt_ended_or_changed" });
+	await expect(steer).rejects.toMatchObject({ detail: { reasonCode: "steer_acceptance_uncertain" } });
 	expect(f.port.steers).toHaveLength(0);
-});
-
-test("pane uncertain native steer is retained without a blind replay", async () => {
-	const f = await paneFixture();
-	const native = spyOn(f.port, "steer").mockRejectedValue(new Error("transport torn"));
-	try {
-		expect(await f.manager.steerFirstmateChild(f.input)).toMatchObject({
-			steered: false,
-			reason: "child_steer_acceptance_uncertain",
-		});
-		expect(await f.manager.steerFirstmateChild(f.input)).toMatchObject({
-			steered: false,
-			reason: "child_steer_acceptance_uncertain",
-		});
-		expect(native).toHaveBeenCalledTimes(1);
-	} finally {
-		native.mockRestore();
-	}
 });
 
 test("pane silent terminal retains native silence evidence and still delivers one gateway outcome", async () => {
@@ -937,7 +911,7 @@ test("pane queued steer refuses a preserving release without using a persona mai
 		await release.promise;
 	});
 	await entered.promise;
-	const steer = f.manager.steerFirstmateChild(f.input);
+	const steer = f.manager.steer({ name: f.assignment.name, text: f.input.text });
 	const pending = spyOn(f.lanes, "preservingRelease").mockReturnValue(true);
 	try {
 		release.resolve();
@@ -946,37 +920,6 @@ test("pane queued steer refuses a preserving release without using a persona mai
 		expect(f.port.steers).toHaveLength(0);
 	} finally {
 		pending.mockRestore();
-	}
-});
-
-test("pane restart rebinds through the existing origin actor after durable provenance", async () => {
-	const f = await paneFixture();
-	let manager = new PersonaSessionManager({
-		database: f.db,
-		port: f.port,
-		instanceId: f.db.instanceId,
-		repo: f.directory,
-	});
-	try {
-		await manager.bindChildPane(f.pane.childOrigin);
-		const binding = f.db.bindings.getSessionRecord(originKey(f.pane.childOrigin));
-		expect(binding?.sessionId).toBeTruthy();
-		await manager.stop();
-		manager = new PersonaSessionManager({
-			database: f.db,
-			port: f.port,
-			instanceId: f.db.instanceId,
-			repo: f.directory,
-		});
-		await manager.recover();
-		expect(f.db.bindings.getSessionRecord(originKey(f.pane.childOrigin))).toEqual(binding);
-		expect(readChildPane(f.db, f.pane.childOrigin)).toEqual(f.pane);
-		f.db.core.metaSet(`firstmate-pane/child/${originKey(f.pane.childOrigin)}`, "broken");
-		const binds = f.port.binds.length;
-		await expect(manager.bindChildPane(f.pane.childOrigin)).rejects.toThrow("provenance unavailable");
-		expect(f.port.binds).toHaveLength(binds);
-	} finally {
-		await manager.stop();
 	}
 });
 
@@ -2706,7 +2649,6 @@ test("FirstMate rejects stale worktrees, conflicting policy, native adoption and
 	for (const request of [
 		() => f.manager.start({ name: "a", text: "bypass" }),
 		() => f.manager.run({ name: "a", text: "bypass" }, {}),
-		() => f.manager.steer({ name: "a", text: "bypass" }),
 	]) {
 		await withoutFirstmateEffects(f, async () => {
 			await expect(request()).rejects.toMatchObject({
@@ -2714,6 +2656,12 @@ test("FirstMate rejects stale worktrees, conflicting policy, native adoption and
 			});
 		});
 	}
+	// Steering is the one doorbell: a settled mapped lane has nothing to steer and nothing reopens.
+	await withoutFirstmateEffects(f, async () => {
+		await expect(f.manager.steer({ name: "a", text: "bypass" })).rejects.toMatchObject({
+			detail: { reasonCode: "no_open_attempt" },
+		});
+	});
 	await withoutFirstmateEffects(f, async () => {
 		await expect(
 			f.manager.start({ name: "other", text: "bypass", cwd: f.assignment.worktree.path }),

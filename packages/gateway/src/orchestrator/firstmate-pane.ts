@@ -67,12 +67,6 @@ export function readChildPane(store: Store, origin: OriginRef): FirstmatePane | 
 		: undefined;
 }
 
-export function childPanes(store: Store): FirstmatePane[] {
-	return store.core
-		.metaKeysInRange(LANE_PREFIX, `${LANE_PREFIX}\uffff`)
-		.flatMap((key) => validPane(store, store.core.metaGet(key)) ?? []);
-}
-
 export function paneOriginRecorded(store: Store, origin: OriginRef): boolean {
 	if (store.core.metaGet(CHILD_PREFIX + originKey(origin)) !== undefined) return true;
 	return store.core.metaKeysInRange(LANE_PREFIX, `${LANE_PREFIX}\uffff`).some((key) => {
