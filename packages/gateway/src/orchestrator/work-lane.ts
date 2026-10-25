@@ -1,11 +1,13 @@
-import { execSync } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { execSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, lstatSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
 	type ChatMessagePayload,
+	type FirstmateReleaseIntent,
+	type FirstmateReleaseReceipt,
 	isSilentOutput,
 	type OriginRef,
 	originKey,
@@ -20,8 +22,6 @@ import {
 	type WorkFirstmateCorrectionParams,
 	type WorkFirstmateRetireParams,
 	type WorkFirstmateRetireResult,
-	type FirstmateReleaseIntent,
-	type FirstmateReleaseReceipt,
 	type WorkInspectionReceipts,
 	type WorkStartResult,
 	type WorkStatusResult,
@@ -82,6 +82,7 @@ import {
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
 import { readFailedTransportCause } from "./failed-turn-evidence";
+import { paneDeliveryGuard, readChildPane, readLanePane } from "./firstmate-pane";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
 	type LaneForceRetireReason,
@@ -93,7 +94,6 @@ import {
 	workSessionKey,
 } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
-import { paneDeliveryGuard, readChildPane, readLanePane } from "./firstmate-pane";
 import {
 	isSessionUnavailable,
 	type SessionLiveness,

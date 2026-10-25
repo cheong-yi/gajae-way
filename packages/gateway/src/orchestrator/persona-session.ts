@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { LogLevel } from "@gajae-gateway/log";
 import type { PromptImage } from "@gajae-gateway/protocol";
+import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import {
 	assertControlAllowed,
 	assertValidOpRef,
@@ -36,10 +37,9 @@ import {
 import type { WriteTx } from "../store/tx";
 import { type BrokerLivenessProbe, type BrokerLivenessVerdict, describeBindHold } from "./broker-liveness";
 import type { FailedTurnEvidence } from "./failed-turn-evidence";
+import { childPanes, readChildPane } from "./firstmate-pane";
 import { isSessionGoneCode } from "./gjc-contract";
 import { GjcRuntimeError, sanitizeDiagnostic } from "./rebind";
-import { childPanes, readChildPane } from "./firstmate-pane";
-import { type OriginRef, originKey } from "@gajae-gateway/protocol";
 import {
 	ModelNotSelectedError,
 	type SessionBinding,
