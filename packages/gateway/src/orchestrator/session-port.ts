@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { stat } from "node:fs/promises";
 import { containsSilenceToken, isSilenceToken, type PromptImage } from "@gajae-gateway/protocol";
@@ -568,7 +567,6 @@ export class BrokerSessionPort implements SessionPort {
 	readonly #now: () => number;
 	readonly #sleep: (ms: number) => Promise<void>;
 	readonly #chains = new Map<string, Promise<void>>();
-	readonly #exclusiveOwner = new AsyncLocalStorage<string>();
 	readonly #bindings = new Map<string, Promise<SessionBinding>>();
 	readonly #signaledHosts = new Map<string, SignaledHost>();
 	readonly #authority: BrokerAuthority;
@@ -1994,11 +1992,9 @@ export class BrokerSessionPort implements SessionPort {
 	}
 
 	async runExclusive<T>(key: string, work: () => Promise<T>): Promise<T> {
-		if (this.#exclusiveOwner.getStore() === key) return work();
 		const previous = this.#chains.get(key);
-		const run = () => this.#exclusiveOwner.run(key, work);
 		if (!previous) {
-			const task = run();
+			const task = work();
 			const settled = task.then(
 				() => undefined,
 				() => undefined,
@@ -2018,7 +2014,7 @@ export class BrokerSessionPort implements SessionPort {
 		this.#chains.set(key, chain);
 		await previous.catch(() => undefined);
 		try {
-			return await run();
+			return await work();
 		} finally {
 			release();
 			if (this.#chains.get(key) === chain) this.#chains.delete(key);

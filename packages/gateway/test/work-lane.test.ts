@@ -22,7 +22,6 @@ import {
 	closeAttempt,
 	createLaneJobRecord,
 	GjcCliError,
-	newOpRef,
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import type { GatewayConfig } from "../src/config";
@@ -67,7 +66,7 @@ import {
 } from "../src/orchestrator/work-lane";
 import { resolvePostTarget } from "../src/server/server";
 import { BrokerAuthorityError, type FirstmateAssignment, FirstmateStore, Store } from "../src/store";
-import { WorkAttemptStateError } from "../src/store/groups/work";
+import { validateWorkRuntime, WorkAttemptStateError } from "../src/store/groups/work";
 import { hangingStatusRepo, hookPid, pidAlive, untilGone } from "./fixtures/git-hang";
 import {
 	createOwnedSessionFixture,
@@ -574,7 +573,7 @@ async function firstmateFixture(options: Partial<WorkLaneManagerOptions> = {}) {
 		currentManager: () => f.manager,
 		assignment,
 		git,
-		owner: new FirstmateStore(f.db.core),
+		owner: f.db.work.firstmate,
 		checkStatusClient: options.checkStatusClient,
 	};
 }
@@ -2546,9 +2545,17 @@ test("FirstMate inspection refuses wrong task, operation, binding, epoch and ret
 			{ byteLength: 3 },
 		].map((patch) => ({ output: { ...original.output, proof: { ...original.output.proof!, ...patch } } })),
 	]) {
-		const spy = spyOn(f.db.work, "workAttemptGet").mockImplementation((opRef) =>
-			opRef === start.opRef ? { ...original, ...patch } : getRuntime(opRef),
-		);
+		// A corrupted row reaches inspection only through the native validated getter.
+		const spy = spyOn(f.db.work, "workAttemptGet").mockImplementation((opRef) => {
+			if (opRef !== start.opRef) return getRuntime(opRef);
+			const runtime = { ...original, ...patch };
+			try {
+				validateWorkRuntime(runtime, f.db.instanceId);
+			} catch {
+				throw new WorkAttemptStateError(opRef, "runtime record parsing");
+			}
+			return runtime;
+		});
 		try {
 			const result = await inspectWithoutExecution(f, start.opRef, true);
 			expect(result.identity).toBeNull();

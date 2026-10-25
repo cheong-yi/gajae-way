@@ -22,15 +22,7 @@ import {
 	transitionToAwaitingChecks,
 } from "@gajae-gateway/subsession";
 import { buildDeliveryPayload, DeliveryService } from "../src/delivery/delivery";
-import { readPinnedGjcVersion } from "../src/orchestrator/broker";
-import { DatabaseStartupError, type FirstmateAssignment, type FirstmatePrepare, FirstmateStore, LATEST_SCHEMA_VERSION, Store } from "../src/store";
-import {
-	DatabaseStartupError,
-	type FirstmateAssignment,
-	type FirstmatePrepare,
-	FirstmateStore,
-	Store,
-} from "../src/store";
+import { DatabaseStartupError, type FirstmateAssignment, type FirstmatePrepare, LATEST_SCHEMA_VERSION, Store } from "../src/store";
 import {
 	resolveLaneReportOrigin,
 	terminalEvidence,
@@ -201,7 +193,7 @@ async function firstmateFixture() {
 		parent: { kind: "persona", originKey: originKey(assignment.thread), origin: assignment.thread },
 	};
 	const evidence: FirstmatePrepare = { assignment, cause: { kind: "assignment" }, text: assignment.mandate.text };
-	return { ...f, runtime, assignment, evidence, owner: new FirstmateStore(f.database.core) };
+	return { ...f, runtime, assignment, evidence, owner: f.database.work.firstmate };
 }
 
 function firstmateRows(raw: Database) {
@@ -547,7 +539,7 @@ describe("FirstMate immutable decisions and preserving-release persistence", () 
 		});
 		const reopened = await Store.open(f.path);
 		handles.push(reopened);
-		const owner = new FirstmateStore(reopened.core);
+		const owner = reopened.work.firstmate;
 		expect(owner.correction(f.assignment.taskId, c.cause, c.evidence.text)).toEqual(owner.attempt(c.runtime.opRef));
 		reopened.transaction((tx) => {
 			owner.recordApproval(tx, approval);
@@ -581,7 +573,7 @@ describe("FirstMate immutable decisions and preserving-release persistence", () 
 			handles.splice(handles.indexOf(f.database), 1);
 			const reopened = await Store.open(f.path);
 			handles.push(reopened);
-			const owner = new FirstmateStore(reopened.core);
+			const owner = reopened.work.firstmate;
 			const before = prepareState({ ...f, database: reopened });
 			const c = f.correction;
 			expect(() =>
@@ -663,7 +655,7 @@ describe("FirstMate immutable decisions and preserving-release persistence", () 
 			expect(prepareState(f)).toEqual(before);
 			const reopened = await Store.open(f.path);
 			handles.push(reopened);
-			const freshOwner = new FirstmateStore(reopened.core);
+			const freshOwner = reopened.work.firstmate;
 			expect(freshOwner.approvalForMessage(approval.ownerId, approval.messageId)).toEqual(approval);
 			// Caller cannot mutate a persisted receipt through the returned object.
 			const copy = freshOwner.approval(approval.approvalId)!;
@@ -1438,7 +1430,8 @@ describe("FirstMate immutable store attribution", () => {
 				.query("UPDATE work_attempt_runtime SET record_json = ? WHERE op_ref = ?")
 				.run(JSON.stringify(changed), f.runtime.opRef);
 			before = prepareState(f);
-			expect(() => f.correction.prepare()).toThrow("FirstMate admission refused");
+			// The native validated getter refuses a corrupt row before FirstMate policy sees it.
+			expect(() => f.correction.prepare()).toThrow(/FirstMate admission refused|work lane state unavailable/);
 			expect(prepareState(f)).toEqual(before);
 		}
 		f.raw.query("DELETE FROM work_attempt_runtime WHERE op_ref = ?").run(f.runtime.opRef);
