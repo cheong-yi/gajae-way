@@ -14,9 +14,12 @@ import {
 import { LaneGovernor, laneJobIdentity } from "../src/orchestrator/lane-governor";
 import { BrokerAuthorityError, Store } from "../src/store";
 import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
+
 function deferred<T = void>() {
 	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((done) => { resolve = done; });
+	const promise = new Promise<T>((done) => {
+		resolve = done;
+	});
 	return { promise, resolve };
 }
 
@@ -88,19 +91,33 @@ test("preserving governor owns exactly one lane lock, skips recovery, and tracks
 	persistJob("a", "done");
 	const port = new ScriptedSessionPort();
 	const governor = new LaneGovernor({ database, sessionPort: port });
-	governor.setRecoveryGate(async () => { throw new Error("preserving release must not recover"); });
+	governor.setRecoveryGate(async () => {
+		throw new Error("preserving release must not recover");
+	});
 	const exclusive = port.runExclusive.bind(port);
 	const keys: string[] = [];
-	port.runExclusive = (key, action) => { keys.push(key); return exclusive(key, action); };
+	port.runExclusive = (key, action) => {
+		keys.push(key);
+		return exclusive(key, action);
+	};
 	const events: string[] = [];
 	const close = port.close.bind(port);
-	port.close = async (input) => { events.push("close"); await close(input); };
+	port.close = async (input) => {
+		events.push("close");
+		await close(input);
+	};
 	const result = await governor.retirePreserving("a", {
 		held: (reason) => reason,
 		prepare: () => ({
-			sessionId: "sess-a", repo: "/tmp/worker-repo", pending: false,
-			recheck: () => { events.push("check"); },
-			persistIntent: () => { events.push("intent"); },
+			sessionId: "sess-a",
+			repo: "/tmp/worker-repo",
+			pending: false,
+			recheck: () => {
+				events.push("check");
+			},
+			persistIntent: () => {
+				events.push("intent");
+			},
 			complete: () => {
 				events.push("receipt");
 				database.transaction((tx) => database.bindings.rotateEpoch(tx, "work/task/a"));
@@ -114,15 +131,21 @@ test("preserving governor owns exactly one lane lock, skips recovery, and tracks
 	expect(events.indexOf("close")).toBeLessThan(events.indexOf("receipt"));
 	expect(events.slice(events.indexOf("close") + 1)).toContain("check");
 	await governor.stop();
-	expect(await governor.retirePreserving("a", {
-		held: (reason) => reason,
-		prepare: () => { throw new Error("stopped"); },
-	})).toBe("gateway is stopping");
+	expect(
+		await governor.retirePreserving("a", {
+			held: (reason) => reason,
+			prepare: () => {
+				throw new Error("stopped");
+			},
+		}),
+	).toBe("gateway is stopping");
 });
 
 for (const proof of [
-	{ live: false, disowned: false }, { live: undefined, disowned: true },
-	{ live: true, disowned: false }, { live: undefined, disowned: false },
+	{ live: false, disowned: false },
+	{ live: undefined, disowned: true },
+	{ live: true, disowned: false },
+	{ live: undefined, disowned: false },
 ]) {
 	test(`preserving pending intent retries native close unless already gone ${JSON.stringify(proof)}`, async () => {
 		database = await Store.open(":memory:");
@@ -130,17 +153,27 @@ for (const proof of [
 		const port = new ScriptedSessionPort();
 		const governor = new LaneGovernor({ database, sessionPort: port });
 		const queries: unknown[] = [];
-		port.liveness = async (input) => { queries.push(input); return proof; };
+		port.liveness = async (input) => {
+			queries.push(input);
+			return proof;
+		};
 		let completions = 0;
 		let intents = 0;
 		const gone = proof.live === false || proof.disowned;
 		const result = await governor.retirePreserving("a", {
 			held: () => false,
 			prepare: () => ({
-				sessionId: "exact-old-session", repo: "/exact/repo", pending: true,
+				sessionId: "exact-old-session",
+				repo: "/exact/repo",
+				pending: true,
 				recheck: () => {},
-				persistIntent: () => { intents++; },
-				complete: () => { completions++; return true; },
+				persistIntent: () => {
+					intents++;
+				},
+				complete: () => {
+					completions++;
+					return true;
+				},
 			}),
 		});
 		expect(result).toBe(true);
@@ -162,7 +195,11 @@ test("a second preserving release rejects without queueing while the first still
 	const release = deferred<void>();
 	const exclusive = port.runExclusive.bind(port);
 	let locks = 0;
-	port.runExclusive = (key, action) => exclusive(key, async () => { locks++; return action(); });
+	port.runExclusive = (key, action) =>
+		exclusive(key, async () => {
+			locks++;
+			return action();
+		});
 	port.close = async (input) => {
 		port.closes.push(input);
 		entered.resolve();
@@ -171,7 +208,9 @@ test("a second preserving release rejects without queueing while the first still
 	const policy = {
 		held: (reason: string) => reason,
 		prepare: () => ({
-			sessionId: "sess-a", repo: "/tmp/worker-repo", pending: false,
+			sessionId: "sess-a",
+			repo: "/tmp/worker-repo",
+			pending: false,
 			recheck: () => {},
 			persistIntent: () => {},
 			complete: () => "released",
@@ -182,7 +221,9 @@ test("a second preserving release rejects without queueing while the first still
 	expect(governor.preservingRelease("a")).toBe(true);
 	const second = governor.retirePreserving("a", {
 		...policy,
-		prepare: () => { throw new Error("second release must not enter the lock"); },
+		prepare: () => {
+			throw new Error("second release must not enter the lock");
+		},
 	});
 	expect(await second).toBe("task_release_pending_or_completed");
 	expect(locks).toBe(1);
@@ -199,20 +240,31 @@ test("pending release retries a failed close and keeps the lane bound while live
 	const port = new ScriptedSessionPort();
 	const logs: string[] = [];
 	const governor = new LaneGovernor({ database, sessionPort: port, log: (line) => logs.push(line) });
-	port.close = async (input) => { port.closes.push(input); throw new Error("close response lost"); };
+	port.close = async (input) => {
+		port.closes.push(input);
+		throw new Error("close response lost");
+	};
 	port.liveness = async () => ({ live: true, disowned: false });
 	const prepared = {
-		sessionId: "sess-a", repo: "/tmp/worker-repo", pending: true,
+		sessionId: "sess-a",
+		repo: "/tmp/worker-repo",
+		pending: true,
 		recheck: () => {},
-		persistIntent: () => { throw new Error("pending intent must not be rewritten"); },
+		persistIntent: () => {
+			throw new Error("pending intent must not be rewritten");
+		},
 		complete: () => true,
 	};
-	expect(await governor.retirePreserving("a", { held: (reason) => reason, prepare: () => prepared })).toMatch(/not proven gone/);
+	expect(
+		await governor.retirePreserving<string | boolean>("a", { held: (reason) => reason, prepare: () => prepared }),
+	).toMatch(/not proven gone/);
 	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
 	expect(database.bindings.getSessionRecord("work/task/a")).toEqual(before);
 	expect(logs.some((line) => line.includes("name=a") && line.endsWith("action=retained"))).toBe(true);
 	port.liveness = async () => ({ live: false, disowned: false });
-	expect(await governor.retirePreserving("a", { held: (reason) => reason, prepare: () => prepared })).toBe(true);
+	expect(
+		await governor.retirePreserving<string | boolean>("a", { held: (reason) => reason, prepare: () => prepared }),
+	).toBe(true);
 	expect(port.closes).toHaveLength(1);
 });
 
@@ -224,15 +276,23 @@ test("preserving close rechecks after awaited status before recording intent", a
 	const governor = new LaneGovernor({ database, sessionPort: port });
 	let checks = 0;
 	let intents = 0;
-	await expect(governor.retirePreserving("a", {
-		held: () => false,
-		prepare: () => ({
-			sessionId: "sess-a", repo: "/tmp/worker-repo", pending: false,
-			recheck: () => { if (++checks === 2) throw new Error("binding changed"); },
-			persistIntent: () => { intents++; },
-			complete: () => true,
+	await expect(
+		governor.retirePreserving("a", {
+			held: () => false,
+			prepare: () => ({
+				sessionId: "sess-a",
+				repo: "/tmp/worker-repo",
+				pending: false,
+				recheck: () => {
+					if (++checks === 2) throw new Error("binding changed");
+				},
+				persistIntent: () => {
+					intents++;
+				},
+				complete: () => true,
+			}),
 		}),
-	})).rejects.toThrow("binding changed");
+	).rejects.toThrow("binding changed");
 	expect(intents).toBe(0);
 	expect(port.closes).toHaveLength(0);
 });
