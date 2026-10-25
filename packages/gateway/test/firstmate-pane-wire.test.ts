@@ -16,7 +16,7 @@ async function until(predicate: () => boolean) {
 	expect(predicate()).toBe(true);
 }
 
-test("pane wire persists gateway creation before actor bind, rejects bots, steers humans once and reloads on restart", async () => {
+test("pane wire records gateway creation, binds an ordinary scoped persona on the first human message and keeps it across restart", async () => {
 	const directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-pane-wire-")));
 	const repo = join(directory, "repo");
 	await mkdir(repo);
@@ -105,12 +105,17 @@ test("pane wire persists gateway creation before actor bind, rejects bots, steer
 		const start = await client.workStart({ firstmate: assignment });
 		if (!start.started) throw new Error(start.reason);
 		expect(opens).toBe(1);
-		expect(childBinds).toBe(1);
+		// No eager host: the child persona is bound by native admission of the first child turn.
+		expect(childBinds).toBe(0);
 		expect(readLanePane(db, "pane")).toMatchObject({
 			taskId: "pane-task",
 			childOrigin: child,
 			createdByGateway: db.instanceId,
 		});
+		const childSends = () => {
+			const sessionId = db.bindings.getSessionRecord(originKey(child))?.sessionId;
+			return sessionId ? port.sendAttempts.filter((input) => input.sessionId === sessionId) : [];
+		};
 		const personaDirective = (where: OriginRef, messageId: string) =>
 			client!.request("chat.send", {
 				origin: where,
@@ -132,6 +137,9 @@ test("pane wire persists gateway creation before actor bind, rejects bots, steer
 				.every((row) => JSON.parse(row.payload_json).noChildFallback === true),
 		).toBe(true);
 		await until(() => db.inbox.pendingOldest(originKey(child)) === undefined);
+		// The owner's WAKE was the pane's first turn: native admission bound its ordinary persona.
+		await until(() => childSends().length === 1);
+		expect(childBinds).toBe(1);
 		const ordinaryThread = { ...child, conversationId: "ordinary-thread" };
 		await personaDirective(ordinaryThread, "unowned-directives");
 		await until(
@@ -146,34 +154,43 @@ test("pane wire persists gateway creation before actor bind, rejects bots, steer
 						row.origin_key === originKey(ordinaryThread) && JSON.parse(row.payload_json).text.includes("not_a_channel"),
 				),
 		).toBe(true);
-		const send = (messageId: string, authorIsBot = false) =>
+		const send = (messageId: string, text = "Do not change the public API") =>
 			client!.request<{ engaged: boolean }>("chat.send", {
 				origin: child,
 				messageId,
-				text: "Do not change the public API",
-				engagement: { mentioned: true, group: true, authorId: authorIsBot ? "other-bot" : "human", authorIsBot },
+				text,
+				engagement: { mentioned: false, group: true, authorId: "human" },
 			});
-		expect((await send("bot", true)).engaged).toBe(false);
+		// An unmentioned human line in the pane reaches its own persona through ordinary admission.
+		expect((await send("human")).engaged).toBe(true);
+		await until(() => childSends().length === 2);
+		expect(childBinds).toBe(1);
+		const preamble = childSends()[1]!.systemPreamble ?? "";
+		expect(preamble).toContain("FirstMate crewmate pane");
+		expect(preamble).toContain("task pane-task, lane `pane`");
+		expect(preamble).toContain(`[WAKE:${originKey(assignment.thread)}]`);
+		expect(preamble).toContain("never run `work start --firstmate-correction`, `work approve`");
+		// The gateway no longer turns the line into a work steer; the persona drives the lane.
 		expect(port.steers).toHaveLength(0);
-		expect(db.inbox.watchRows()[0]?.state).toBe("pending");
-		expect((await send("human")).engaged).toBe(true);
-		expect((await send("human")).engaged).toBe(true);
-		expect(port.steers).toHaveLength(1);
 		expect(db.inbox.watchRows()[0]).toMatchObject({ state: "fired", triggered_message_id: "human" });
-		expect(db.inbox.pendingOldest(originKey(child))).toBeUndefined();
+		await until(() => db.inbox.pendingOldest(originKey(child)) === undefined);
 		const binding = db.bindings.getSessionRecord(originKey(child));
+		expect(binding?.sessionId).toBeTruthy();
 		await client.close();
 		await adapter.close();
 		await server.stop();
 		server = await startUnixServer({ config, database: db, sessionPort: port });
-		await until(() => childBinds === 2);
-		expect(db.bindings.getSessionRecord(originKey(child))).toEqual(binding);
 		client = await GajaewayClient.connectSocket(config.socketPath);
 		expect(await client.workStart({ firstmate: assignment })).toEqual(start);
 		expect(opens).toBe(1);
+		expect((await send("after-restart", "Status?")).engaged).toBe(true);
+		await until(() => childSends().length === 3);
+		expect(db.bindings.getSessionRecord(originKey(child))).toEqual(binding);
+		await until(() => db.inbox.pendingOldest(originKey(child)) === undefined);
 		db.core.metaSet(`firstmate-pane/child/${originKey(child)}`, "corrupt");
 		expect((await send("after-corruption")).engaged).toBe(false);
-		expect(port.steers).toHaveLength(1);
+		expect(childSends()).toHaveLength(3);
+		expect(port.steers).toHaveLength(0);
 		expect(db.work.workAttemptGet(start.opRef)?.settledAt).toBeNull();
 		port.complete(start.opRef, "final local result");
 		await until(() => Boolean(db.work.workAttemptGet(start.opRef)?.settledAt));
