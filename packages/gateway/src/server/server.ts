@@ -24,8 +24,6 @@ import {
 	negotiate,
 	OPS_CYCLE_DEFAULT_LIMIT,
 	OPS_CYCLE_MAX_LIMIT,
-	ORIGIN_KINDS,
-	ORIGIN_PLATFORMS,
 	OrderedFrameWriter,
 	type OriginRef,
 	OUTBOUND_FILE_MAX_BYTES,
@@ -131,7 +129,7 @@ import {
 import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
-import { FirstmateStore, type Store } from "../store";
+import { type Store } from "../store";
 import {
 	editedOriginalId,
 	type InboundMessageRow,
@@ -681,21 +679,20 @@ function invalidWorkWire(field: string): never {
 	throw new ProtocolError("invalid_params", "invalid work parameters", { reasonCode: "invalid_work_params", field });
 }
 
+/** Exact wire keys; OriginRef invariants stay with the protocol's validateOriginRef. */
 function assertFirstmateThreadWire(thread: unknown, field: string): void {
 	if (
 		!workObject(thread) ||
-		!ORIGIN_PLATFORMS.some((platform) => platform === thread.platform) ||
-		!ORIGIN_KINDS.some((kind) => kind === thread.kind) ||
-		!workString(thread.conversationId) ||
-		["parentId", "peerId"].some((key) => Object.hasOwn(thread, key) && !workString(thread[key])) ||
-		(Object.hasOwn(thread, "threadVisibility") &&
-			thread.threadVisibility !== "public" &&
-			thread.threadVisibility !== "private") ||
 		Object.keys(thread).some(
 			(key) => !["platform", "kind", "conversationId", "parentId", "peerId", "threadVisibility"].includes(key),
 		)
 	)
 		invalidWorkWire(field);
+	try {
+		validateOriginRef(thread as unknown as OriginRef);
+	} catch {
+		invalidWorkWire(field);
+	}
 }
 
 /** Shape only: semantic identity, mandate and Git admission remain owned by startFirstmate. */
@@ -1860,7 +1857,7 @@ async function handleRequest(
 			if (workObject(params) && Object.hasOwn(params, "firstmate")) {
 				if (Object.keys(params).some((key) => key !== "firstmate")) invalidWorkWire("firstmate");
 				assertFirstmateWire(params.firstmate);
-				const existed = new FirstmateStore(options.database.core).assignment(params.firstmate.name) !== undefined;
+				const existed = options.database.work.firstmate.assignment(params.firstmate.name) !== undefined;
 				const result = await runtime.work.startFirstmate(params.firstmate);
 				if (result.started && !existed) await openFirstmatePane(runtime, options.database, params.firstmate);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });

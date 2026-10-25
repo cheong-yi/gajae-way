@@ -13,7 +13,6 @@ import {
 } from "@gajae-gateway/protocol";
 import {
 	assertValidOpRef,
-	closeAttempt,
 	type LaneJobRecord,
 	type LaneJobState,
 	type PromptStatusBody,
@@ -29,13 +28,13 @@ import {
 	type FirstmateAssignment,
 	type FirstmateAttempt,
 	type FirstmateCause,
-	type FirstmateCloseoutReaders,
 	type FirstmatePrepare,
 	firstmateAssert,
 	identityText,
 } from "../firstmate";
 import type { OpenWorkRows, OpenWorkScope } from "../open-work";
 import type { WriteTx } from "../tx";
+import { BindingsGroup } from "./bindings";
 import { JOURNAL_PROJECTIONS, JournalGroup, type JournalRows, staleJournalKeys } from "./journal";
 
 /** Compare JSON values without treating object insertion order as request content. */
@@ -53,11 +52,15 @@ function approvalRequest(approval: FirstmateApproval) {
 }
 
 /** Immutable policy/evidence stays under the existing work table owner, outside journal replay. */
-export class FirstmateStore implements FirstmateCloseoutReaders {
+export class FirstmateStore {
 	readonly #db: GroupDb;
+	readonly #work: WorkGroup;
+	readonly #bindings: BindingsGroup;
 
-	constructor(core: StoreCore) {
+	constructor(core: StoreCore, work: WorkGroup) {
 		this.#db = core.groupDb("work");
+		this.#work = work;
+		this.#bindings = new BindingsGroup(core);
 	}
 
 	approval(approvalId: string): FirstmateApproval | undefined {
@@ -130,20 +133,14 @@ export class FirstmateStore implements FirstmateCloseoutReaders {
 	#assertSettled(binding: FirstmateDecisionBinding): void {
 		const assignment = this.#assertDecisionBinding(binding);
 		const identity = binding.identity;
-		if (this.#db.prepare("SELECT 1 FROM broker_quarantine WHERE kind = 'work' AND subject_id = ?").get(identity.jobId))
-			throw new BrokerAuthorityError("quarantined");
+		if (this.#bindings.isQuarantined("work", identity.jobId)) throw new BrokerAuthorityError("quarantined");
 		const latest = this.#db
 			.prepare("SELECT op_ref FROM firstmate_attempts WHERE task_id = ? ORDER BY ordinal DESC LIMIT 1")
 			.get(identity.taskId) as { op_ref: string } | null;
 		firstmateAssert(latest?.op_ref === identity.opRef, "decision_not_current");
-		const row = this.#db.prepare("SELECT record_json FROM lane_jobs WHERE job_id = ?").get(identity.jobId) as {
-			record_json: string;
-		} | null;
-		const native = row ? parseLaneJobRecord(row.record_json) : undefined;
-		const runtimeRow = this.#db
-			.prepare("SELECT record_json FROM work_attempt_runtime WHERE op_ref = ?")
-			.get(identity.opRef) as { record_json: string } | null;
-		const runtime = runtimeRow ? (JSON.parse(runtimeRow.record_json) as WorkAttemptRuntime) : undefined;
+		const nativeJson = this.#work.laneJobJson(identity.jobId);
+		const native = nativeJson === undefined ? undefined : parseLaneJobRecord(nativeJson);
+		const runtime = this.#work.workAttemptGet(identity.opRef);
 		const attempt = native?.attempts[identity.ordinal];
 		firstmateAssert(
 			native &&
@@ -185,11 +182,9 @@ export class FirstmateStore implements FirstmateCloseoutReaders {
 	}
 
 	#assertLiveBinding(binding: FirstmateDecisionBinding): void {
-		const row = this.#db
-			.prepare("SELECT gjc_session_id, epoch FROM sessions WHERE origin_key = ?")
-			.get(`work/task/${binding.name}`) as { gjc_session_id: string; epoch: number } | null;
+		const row = this.#bindings.getSessionRecord(`work/task/${binding.name}`);
 		firstmateAssert(
-			row?.gjc_session_id === binding.identity.sessionId && row.epoch === binding.identity.epoch,
+			row?.sessionId === binding.identity.sessionId && row.epoch === binding.identity.epoch,
 			"decision_binding_stale",
 		);
 	}
@@ -598,16 +593,9 @@ export class FirstmateStore implements FirstmateCloseoutReaders {
 				);
 			} else {
 				firstmateAssert(!this.correction(assignment.taskId, cause, text), "correction_already_attempted");
-				const nativeRow = this.#db.prepare("SELECT record_json FROM lane_jobs WHERE job_id = ?").get(runtime.jobId) as {
-					record_json: string;
-				} | null;
-				const native = nativeRow ? parseLaneJobRecord(nativeRow.record_json) : undefined;
-				const runtimeRow = this.#db
-					.prepare("SELECT record_json FROM work_attempt_runtime WHERE op_ref = ?")
-					.get(cause.priorOpRef) as {
-					record_json: string;
-				} | null;
-				const priorRuntime = runtimeRow ? (JSON.parse(runtimeRow.record_json) as WorkAttemptRuntime) : undefined;
+				const nativeJson = this.#work.laneJobJson(runtime.jobId);
+				const native = nativeJson === undefined ? undefined : parseLaneJobRecord(nativeJson);
+				const priorRuntime = this.#work.workAttemptGet(cause.priorOpRef);
 				firstmateAssert(
 					(native?.state === "done" || native?.state === "attempt_ended") &&
 						native.awaitingChecks === undefined &&
@@ -1208,11 +1196,14 @@ export class WorkGroup {
 	readonly #core: StoreCore;
 	readonly #db: GroupDb;
 	readonly #journal: JournalGroup;
+	/** FirstMate policy evidence shares the work table owner and its native readers. */
+	readonly firstmate: FirstmateStore;
 
 	constructor(core: StoreCore) {
 		this.#core = core;
 		this.#db = core.groupDb("work");
 		this.#journal = new JournalGroup(core);
+		this.firstmate = new FirstmateStore(core, this);
 	}
 
 	get instanceId(): string {
@@ -1341,9 +1332,8 @@ export class WorkGroup {
 			workAssert(record.attempts.length === (previous?.attempts.length ?? 0) + 1);
 			workAssert(JSON.stringify(record.attempts.slice(0, -1)) === JSON.stringify(previous?.attempts ?? []));
 		}
-		const owner = new FirstmateStore(this.#core);
-		if (firstmate) owner.recordPrepare(tx, runtime, record, firstmate);
-		else owner.assertUnmapped(runtime.sessionKey.slice("work/task/".length), runtime.cwd);
+		if (firstmate) this.firstmate.recordPrepare(tx, runtime, record, firstmate);
+		else this.firstmate.assertUnmapped(runtime.sessionKey.slice("work/task/".length), runtime.cwd);
 		this.#workPutHistory(tx, runtime, record);
 		this.#db
 			.prepare(

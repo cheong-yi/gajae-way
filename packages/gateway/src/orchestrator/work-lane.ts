@@ -479,11 +479,11 @@ export class WorkLaneManager {
 		return this.#db.transaction((tx) => {
 			const current = this.#db.work.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
-			const attribution = new FirstmateStore(this.#db.core).attempt(opRef);
+			const attribution = this.#db.work.firstmate.attempt(opRef);
 			let outcome: ChatMessagePayload | undefined;
 			if (attribution) {
 				const name = current.sessionKey.slice("work/task/".length);
-				const assignment = new FirstmateStore(this.#db.core).assignment(name);
+				const assignment = this.#db.work.firstmate.assignment(name);
 				workAssert(
 					assignment?.taskId === attribution.taskId &&
 						current.parent?.kind === "persona" &&
@@ -925,7 +925,7 @@ export class WorkLaneManager {
 		const { name, taskId, opRef, native = false } = input;
 		if (!name || !taskId || !opRef) return unavailable("explicit_task_and_operation_required");
 		try {
-			const owner = new FirstmateStore(this.#db.core);
+			const owner = this.#db.work.firstmate;
 			const assignment = owner.assignment(name);
 			if (!assignment || assignment.taskId !== taskId) return unavailable("task_mismatch");
 			const attribution = owner.attempt(opRef);
@@ -982,9 +982,7 @@ export class WorkLaneManager {
 					lifecycle: { jobState: job.state, sendPhase: null, terminal: null, settledAt: attempt.endedAt ?? null },
 				};
 			if (
-				runtime.opRef !== opRef ||
 				runtime.jobId !== attribution.jobId ||
-				runtime.laneKey !== laneJobIdentity(name).laneKey ||
 				runtime.sessionKey !== sessionKey ||
 				runtime.cwd !== assignment.worktree.path ||
 				job.lane.worktreePath !== runtime.cwd ||
@@ -1015,21 +1013,9 @@ export class WorkLaneManager {
 			const { excerpt, proof } = runtime.output;
 			if (excerpt !== null && proof) {
 				const bytes = new TextEncoder().encode(excerpt).length;
+				// workAttemptGet already validated proof identity, provenance and timestamps against the runtime.
 				if (
-					proof.opRef !== opRef ||
-					proof.clientRef !== opRef ||
-					proof.sessionId !== runtime.sessionId ||
-					proof.epoch !== runtime.epoch ||
-					proof.repo !== runtime.cwd ||
-					proof.source !== "turn.result" ||
-					proof.attribution !== "operation_ref" ||
-					proof.fullness !== "original" ||
-					proof.contentVersion !== 1 ||
-					!Number.isSafeInteger(proof.byteLength) ||
 					proof.byteLength < bytes ||
-					!Number.isFinite(proof.terminalAt) ||
-					proof.terminalAt < Date.parse(runtime.startedAt) ||
-					!Number.isFinite(proof.observedAtMs) ||
 					(["commandId", "turnId"] as const).some(
 						(key) => runtime.terminal?.status?.[key] !== undefined && proof[key] !== runtime.terminal.status[key],
 					)
@@ -1161,7 +1147,7 @@ export class WorkLaneManager {
 				"release_identity_invalid",
 			);
 			validateOriginRef(request.thread);
-			const owner = new FirstmateStore(this.#db.core);
+			const owner = this.#db.work.firstmate;
 			return await this.#options.lanes.retirePreserving<WorkFirstmateRetireResult>(request.name, {
 				held,
 				prepare: () => {
@@ -1450,7 +1436,7 @@ export class WorkLaneManager {
 						: input.decision === "accept_outcome" && (evidence.source === "retained" || evidence.source === "native")),
 				"approval_evidence_unsupported",
 			);
-			const owner = new FirstmateStore(this.#db.core);
+			const owner = this.#db.work.firstmate;
 			const assignment = owner.assignment(input.name);
 			firstmateAssert(assignment, "assignment_missing");
 			return await this.#port.runExclusive(workSessionKey(input.name), async (): Promise<WorkApproveResult> => {
@@ -1533,7 +1519,7 @@ export class WorkLaneManager {
 		this.#assertFirstmateAdmission(assignment);
 		return this.#port.runExclusive(`work/firstmate/${assignment.worktree.path}`, async () => {
 			this.#assertFirstmateAdmission(assignment);
-			const duplicate = new FirstmateStore(this.#db.core).initial(assignment.taskId);
+			const duplicate = this.#db.work.firstmate.initial(assignment.taskId);
 			if (duplicate) {
 				const runtime = this.#db.work.workAttemptGet(duplicate.opRef);
 				if (runtime) {
@@ -1604,7 +1590,7 @@ export class WorkLaneManager {
 			"correction_input_invalid",
 		);
 		validateOriginRef(input.thread);
-		const owner = new FirstmateStore(this.#db.core);
+		const owner = this.#db.work.firstmate;
 		const assignment = owner.assignment(input.name);
 		firstmateAssert(
 			assignment &&
@@ -1662,10 +1648,8 @@ export class WorkLaneManager {
 						const runtime = this.#db.work.workAttemptGet(duplicate.opRef);
 						if (runtime) {
 							firstmateAssert(
-								runtime.opRef === duplicate.opRef &&
-									runtime.jobId === duplicate.jobId &&
+								runtime.jobId === duplicate.jobId &&
 									runtime.sessionKey === workSessionKey(assignment.name) &&
-									runtime.laneKey === laneJobIdentity(assignment.name).laneKey &&
 									runtime.startedAt === duplicate.preparedAt &&
 									runtime.settledAt === (attempt.endedAt ?? null) &&
 									runtime.sessionId === duplicate.sessionId &&
@@ -1712,7 +1696,7 @@ export class WorkLaneManager {
 		this.#assertFirstmateAdmission(assignment);
 		const job = this.#job(assignment.name);
 		const tail = job?.attempts.at(-1);
-		const prior = new FirstmateStore(this.#db.core).attempt(cause.priorOpRef);
+		const prior = this.#db.work.firstmate.attempt(cause.priorOpRef);
 		const runtime = this.#db.work.workAttemptGet(cause.priorOpRef);
 		firstmateAssert(
 			job &&
@@ -1725,7 +1709,6 @@ export class WorkLaneManager {
 				prior.jobId === job.jobId &&
 				prior.ordinal === job.attempts.length - 1 &&
 				runtime &&
-				runtime.opRef === cause.priorOpRef &&
 				runtime.jobId === job.jobId &&
 				hasAcceptanceEvidence(runtime) &&
 				runtime.terminal?.reasonCode === "end_turn" &&
@@ -1733,7 +1716,6 @@ export class WorkLaneManager {
 				runtime.settledAt === tail.endedAt &&
 				runtime.startedAt === tail.startedAt &&
 				prior.preparedAt === tail.startedAt &&
-				runtime.laneKey === laneJobIdentity(assignment.name).laneKey &&
 				runtime.sessionId === prior.sessionId &&
 				runtime.epoch === prior.epoch,
 			"correction_predecessor_not_settled",
@@ -1747,7 +1729,7 @@ export class WorkLaneManager {
 		return { sessionId: prior.sessionId, epoch: prior.epoch, originKey: sessionKey, repo: assignment.worktree.path };
 	}
 	#assertFirstmateAdmission(assignment: FirstmateAssignment): void {
-		const owner = new FirstmateStore(this.#db.core);
+		const owner = this.#db.work.firstmate;
 		owner.assertAssignment(assignment);
 		assertOutsideServiceDirectory(this.#options.serviceDirectory, assignment.worktree.path, assignment.name);
 		const bound = owner.assignment(assignment.name);
@@ -1833,7 +1815,7 @@ export class WorkLaneManager {
 	}
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
-		new FirstmateStore(this.#db.core).assertUnmapped(input.name, input.cwd);
+		this.#db.work.firstmate.assertUnmapped(input.name, input.cwd);
 		const parent = this.#resolveCaller(input, mode);
 		this.#job(input.name);
 		await this.recover();
@@ -1860,7 +1842,7 @@ export class WorkLaneManager {
 				"mapped_retry_context_mismatch",
 			);
 		} else {
-			new FirstmateStore(this.#db.core).assertUnmapped(input.name, input.cwd);
+			this.#db.work.firstmate.assertUnmapped(input.name, input.cwd);
 		}
 		if (input.cwd !== undefined) assertOutsideServiceDirectory(this.#options.serviceDirectory, input.cwd, input.name);
 		const sessionKey = workSessionKey(input.name);
@@ -2003,7 +1985,7 @@ export class WorkLaneManager {
 						// session this same start just bound while waiting for the broker.
 						if (!this.#heldSessionKeys.getStore()?.has(sessionKey)) {
 							if (context.firstmate) this.#assertFirstmateAdmission(context.firstmate.assignment);
-							else new FirstmateStore(this.#db.core).assertUnmapped(input.name, worktreePath);
+							else this.#db.work.firstmate.assertUnmapped(input.name, worktreePath);
 						}
 						this.#options.lanes.assertAdmission(input.name);
 						if (createdWorktree && !worktreePersisted) {
@@ -2041,10 +2023,10 @@ export class WorkLaneManager {
 						this.#live();
 						if (!this.#heldSessionKeys.getStore()?.has(sessionKey)) {
 							if (context.firstmate) this.#assertFirstmateAdmission(context.firstmate.assignment);
-							else new FirstmateStore(this.#db.core).assertUnmapped(input.name, worktreePath);
+							else this.#db.work.firstmate.assertUnmapped(input.name, worktreePath);
 						}
 						if (context.firstmate?.cause.kind === "checks") {
-							const prior = new FirstmateStore(this.#db.core).attempt(context.firstmate.cause.priorOpRef);
+							const prior = this.#db.work.firstmate.attempt(context.firstmate.cause.priorOpRef);
 							firstmateAssert(
 								prior && binding.sessionId === prior.sessionId && binding.epoch === prior.epoch,
 								"retry_session_changed",
@@ -2109,13 +2091,7 @@ export class WorkLaneManager {
 		this.#attach(observer);
 		await observer.attaching;
 		if (context.firstmate) this.#assertFirstmateAdmission(context.firstmate.assignment);
-		if (correction) {
-			const current = this.#db.bindings.getSessionRecord(runtime.sessionKey);
-			firstmateAssert(
-				current?.sessionId === runtime.sessionId && current.epoch === runtime.epoch,
-				"correction_session_changed",
-			);
-		}
+		if (correction) firstmateAssert(this.#binding(runtime), "correction_session_changed");
 		if (!this.#writeCurrent(observer)) {
 			// This invocation has not called send. That local fact survives broker
 			// revocation, but must not overwrite a concurrent acceptance or terminal.
@@ -2254,7 +2230,7 @@ export class WorkLaneManager {
 	}
 	async steer(params: unknown): Promise<WorkSteerResult> {
 		const name = parseName(params);
-		new FirstmateStore(this.#db.core).assertUnmapped(name);
+		this.#db.work.firstmate.assertUnmapped(name);
 		const text = (params as { text?: unknown }).text;
 		if (typeof text !== "string" || !text) invalid("text");
 		this.#live();
@@ -2269,7 +2245,7 @@ export class WorkLaneManager {
 		this.#live();
 		return this.#port.runExclusive(workSessionKey(name), async (): Promise<WorkSteerResult> => {
 			this.#live();
-			new FirstmateStore(this.#db.core).assertUnmapped(name);
+			this.#db.work.firstmate.assertUnmapped(name);
 			const current = this.#job(name, true)!;
 			const open = current.attempts.at(-1);
 			if (open?.opRef !== captured.opRef || open.endedAt !== undefined)
@@ -3244,7 +3220,7 @@ export class WorkLaneManager {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const assignment = new FirstmateStore(this.#db.core).assignment(name);
+		const assignment = this.#db.work.firstmate.assignment(name);
 		if (assignment) this.#assertFirstmateAdmission(assignment);
 		const facts = await collectRepoFacts(
 			observed.lane.worktreePath,
@@ -3329,7 +3305,7 @@ export class WorkLaneManager {
 	): Promise<void> {
 		const cycle = job.awaitingChecks!;
 		if (cycle.prNumber === null) throw new Error("cannot re-steer before discovering the open PR");
-		const owner = new FirstmateStore(this.#db.core);
+		const owner = this.#db.work.firstmate;
 		const assignment = owner.assignment(name);
 		const last = job.attempts.at(-1);
 		const priorRuntime = last ? this.#attemptByOpRef(last.opRef) : undefined;
@@ -3404,7 +3380,7 @@ export class WorkLaneManager {
 		const last = job.attempts.at(-1);
 		const runtime = last ? this.#attemptByOpRef(last.opRef) : undefined;
 		const parent = runtime?.output.knownSilence === null ? runtime.parent : null;
-		const assignment = new FirstmateStore(this.#db.core).assignment(name);
+		const assignment = this.#db.work.firstmate.assignment(name);
 		const checksText = checksReportText(name, cycle, outcome, facts);
 		const text = assignment
 			? utf8Prefix(
@@ -3810,7 +3786,7 @@ export class WorkLaneManager {
 				let job: LaneJobRecord | undefined;
 				try {
 					job = this.#job(name);
-					const assignment = new FirstmateStore(this.#db.core).assignment(name);
+					const assignment = this.#db.work.firstmate.assignment(name);
 					if (assignment) {
 						this.#assertFirstmateAdmission(assignment);
 						// Attribution is never recovered by synthesizing a historical prepare.
@@ -3860,9 +3836,7 @@ export class WorkLaneManager {
 			if (!rows.length && nextAfter === after) break;
 			for (const runtime of rows) {
 				try {
-					const assignment = new FirstmateStore(this.#db.core).assignment(
-						runtime.sessionKey.slice("work/task/".length),
-					);
+					const assignment = this.#db.work.firstmate.assignment(runtime.sessionKey.slice("work/task/".length));
 					if (assignment) this.#assertFirstmateAdmission(assignment);
 				} catch {
 					// A stale mapped resource must not block unrelated healthy lanes.

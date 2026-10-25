@@ -318,7 +318,7 @@ test("FirstMate work.retire dispatch requires exact outcome despite confirmed un
 		}
 		expect(port.closes).toHaveLength(0);
 		expect(database.bindings.getSessionRecord(start.sessionKey)).toEqual(before);
-		const owner = new FirstmateStore(database.core);
+		const owner = database.work.firstmate;
 		expect(owner.releaseForAttempt(start.opRef)).toBeUndefined();
 		expect(owner.approval(approved.approval.approvalId)).toEqual(approved.approval);
 		expect(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD")).toBe(assignment.worktree.branch);
@@ -484,7 +484,7 @@ for (const { output, state, unavailable } of [
 			expect(submitted.code).toBe(0);
 			const start: WorkStartResult = JSON.parse(submitted.stdout);
 			if (!start.started) throw new Error("unexpected initial hold");
-			const owner = new FirstmateStore(database.core);
+			const owner = database.work.firstmate;
 			expect(owner.assignment(assignment.name)).toEqual(assignment);
 			expect(owner.initial(assignment.taskId)).toMatchObject({
 				taskId: assignment.taskId,
@@ -1164,7 +1164,7 @@ for (const { output, state, unavailable } of [
 						lineage: approvalLineage.getStore(),
 						stack: new Error("native status observation").stack ?? "",
 						runtime: structuredClone(runtime),
-						attribution: new FirstmateStore(database.core).attempt(input.opRef),
+						attribution: database.work.firstmate.attempt(input.opRef),
 						latestOpRef: runtime
 							? parseLaneJobRecord(database.work.laneJobJson(runtime.jobId)!).attempts.at(-1)?.opRef
 							: undefined,
@@ -1422,7 +1422,7 @@ for (const { output, state, unavailable } of [
 			}
 			sdk = await GajaewayClient.connectSocket(config.socketPath);
 			expect(await approvalEffects(() => sdk.workApprove(approval), approval, "sdk", restartedPort)).toEqual(approved);
-			expect(new FirstmateStore(database.core).approval(approved.approval.approvalId)).toEqual(approved.approval);
+			expect(database.work.firstmate.approval(approved.approval.approvalId)).toEqual(approved.approval);
 			await writeFile(approvalFile, JSON.stringify(approval));
 			const restartedApproval = await approvalEffects(
 				() => cli("approve", "--firstmate", approvalFile),
@@ -1463,7 +1463,7 @@ for (const { output, state, unavailable } of [
 			await expect(sdk.workStart({ firstmate: heldAssignment })).rejects.toMatchObject({
 				detail: { reasonCode: "send_acceptance_uncertain" },
 			});
-			const heldInitial = new FirstmateStore(database.core).initial(heldAssignment.taskId)!;
+			const heldInitial = database.work.firstmate.initial(heldAssignment.taskId)!;
 			const heldFile = join(directory, "held.json");
 			await writeFile(heldFile, JSON.stringify(heldAssignment));
 			const heldCli = await cli("start", "--firstmate", heldFile);
@@ -1474,7 +1474,7 @@ for (const { output, state, unavailable } of [
 			expect(held.reason).toContain(heldInitial.opRef);
 			expect(await sdk.workStart({ firstmate: heldAssignment })).toEqual(held);
 			expect(restartedPort.sendAttempts).toHaveLength(1);
-			expect(new FirstmateStore(database.core).initial(heldAssignment.taskId)).toEqual(heldInitial);
+			expect(database.work.firstmate.initial(heldAssignment.taskId)).toEqual(heldInitial);
 			const lostCorrection = { ...correction, messageId: "lost-correction", priorOpRef: corrected.opRef };
 			const lostFile = join(directory, "lost-correction.json");
 			await writeFile(lostFile, JSON.stringify(lostCorrection));
@@ -1485,7 +1485,7 @@ for (const { output, state, unavailable } of [
 			const uncertain = job().attempts.at(-1)!;
 			expect(uncertain.opRef).not.toBe(corrected.opRef);
 			expect(database.work.workAttemptGet(uncertain.opRef)?.sendPhase).toBe("uncertain");
-			const uncertainAttribution = new FirstmateStore(database.core).attempt(uncertain.opRef);
+			const uncertainAttribution = database.work.firstmate.attempt(uncertain.opRef);
 			expect(uncertainAttribution).toMatchObject({
 				ordinal: 2,
 				cause: {
@@ -1494,7 +1494,7 @@ for (const { output, state, unavailable } of [
 					messageId: lostCorrection.messageId,
 				},
 			});
-			expect(new FirstmateStore(database.core).approvalCurrent(approved.approval.approvalId)).toBe(false);
+			expect(database.work.firstmate.approvalCurrent(approved.approval.approvalId)).toBe(false);
 			if (!uncertainAttribution) throw new Error("uncertain correction attribution missing");
 			const uncertainObservers = [
 				{ identity: heldInitial, repo: heldPath },
@@ -1577,7 +1577,7 @@ for (const { output, state, unavailable } of [
 			expect(await sdk.workStart({ firstmate: assignment })).toEqual(start);
 			expect(finalPort.sendAttempts).toHaveLength(0);
 			expect(finalPort.binds).toHaveLength(0);
-			expect(new FirstmateStore(database.core).attempt(uncertain.opRef)).toEqual(uncertainAttribution);
+			expect(database.work.firstmate.attempt(uncertain.opRef)).toEqual(uncertainAttribution);
 			expect(job().attempts).toHaveLength(3);
 			for (const [selector, answer] of [
 				[selectors, retained],

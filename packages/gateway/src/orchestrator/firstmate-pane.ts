@@ -1,6 +1,5 @@
 import { type OriginRef, originKey, validateOriginRef } from "@gajae-gateway/protocol";
 import type { Store } from "../store";
-import { FirstmateStore } from "../store/groups/work";
 
 /** Gateway creation provenance, not a session binding or a native lane session. */
 export interface FirstmatePane {
@@ -48,7 +47,7 @@ function validPane(store: Store, raw: string | undefined): FirstmatePane | undef
 	const lane = store.core.metaGet(LANE_PREFIX + pane.laneName);
 	if (child !== raw || lane !== raw) return undefined;
 	try {
-		const assignment = new FirstmateStore(store.core).assignment(pane.laneName);
+		const assignment = store.work.firstmate.assignment(pane.laneName);
 		return assignment?.taskId === pane.taskId && originKey(assignment.thread) === pane.personaOriginKey
 			? pane
 			: undefined;

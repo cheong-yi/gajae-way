@@ -4,7 +4,7 @@ import type { LogLevel } from "@gajae-gateway/log";
 import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol";
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
-import { FirstmateStore, type Store } from "../store";
+import { type Store } from "../store";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
@@ -216,7 +216,7 @@ export class LaneGovernor {
 
 	#mapped(name: string): boolean {
 		try {
-			return new FirstmateStore(this.#database.core).assignment(name) !== undefined;
+			return this.#database.work.firstmate.assignment(name) !== undefined;
 		} catch {
 			// Corrupt attribution is not permission to use a destructive bypass.
 			return true;
