@@ -11,8 +11,8 @@ import {
 	ModelNotSelectedError,
 	SessionBusyStalledError,
 	parseWorkerOutputResponse,
-	type WorkerOutputEvidence,
 	SessionRequestTimeoutError,
+	type WorkerOutputEvidence,
 } from "../src/orchestrator/session-port";
 import { type TailHandle, TailRunner } from "../src/orchestrator/tail-runner";
 import { BrokerAuthorityError, Store } from "../src/store";
@@ -27,7 +27,6 @@ import {
 
 let home = "";
 let database: Store | undefined;
-
 
 test("worker output validates exact attribution before exposing truncated original fragments", () => {
 	const input = {

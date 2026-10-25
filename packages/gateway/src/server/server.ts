@@ -92,6 +92,13 @@ import { RuntimeCycleProjector } from "../ops/cycle";
 import { OriginSilentAlerter } from "../ops/origin-silent";
 import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
+import {
+	lanePaneRecorded,
+	paneDeliveryGuard,
+	paneOriginRecorded,
+	readChildPane,
+	saveChildPane,
+} from "../orchestrator/firstmate-pane";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
 import { LaneGovernor } from "../orchestrator/lane-governor";
 import {
@@ -122,13 +129,6 @@ import {
 	deterministicTerminalDeliveryId,
 } from "../orchestrator/tail-runner";
 import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
-import {
-	lanePaneRecorded,
-	paneDeliveryGuard,
-	paneOriginRecorded,
-	readChildPane,
-	saveChildPane,
-} from "../orchestrator/firstmate-pane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
 import { FirstmateStore, type Store } from "../store";

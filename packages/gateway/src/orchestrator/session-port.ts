@@ -329,6 +329,8 @@ type SdkTransport = (
 export interface WorkerOutputEvidence {
 	readonly text: string;
 	readonly observedAtMs: number;
+	/** Correlated turn.result terminal facts, not an inferred success verdict. */
+	readonly terminal: PromptStatusBody;
 	readonly provenance: {
 		readonly source: "turn.result";
 		readonly fullness: "original";
@@ -344,7 +346,7 @@ export interface WorkerOutputEvidence {
 	};
 }
 
-export type WorkerOutputPartial = Omit<WorkerOutputEvidence, "provenance"> & {
+export type WorkerOutputPartial = Omit<WorkerOutputEvidence, "provenance" | "terminal"> & {
 	readonly provenance: Omit<WorkerOutputEvidence["provenance"], "fullness"> & { readonly fullness: "partial" };
 };
 
@@ -2394,8 +2396,8 @@ export function parseWorkerOutputResponse(
 			status: "unavailable",
 			code: "incomplete_body",
 			partial: {
-				...evidence,
 				text,
+				observedAtMs,
 				provenance: { ...evidence.provenance, fullness: "partial", byteLength: end },
 			},
 		};

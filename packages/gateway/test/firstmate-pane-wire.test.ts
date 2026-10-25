@@ -2,7 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { originKey, type OriginRef, type WorkFirstmateAssignmentParams } from "@gajae-gateway/protocol";
+import { type OriginRef, originKey, type WorkFirstmateAssignmentParams } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "../../sdk/src/client";
 import type { GatewayConfig } from "../src/config";
 import { readChildPane, readLanePane } from "../src/orchestrator/firstmate-pane";

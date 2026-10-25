@@ -73,11 +73,7 @@ export interface FirstmateCloseoutReaders {
 	 * Covers earlier corrected attempts in the same released session; a pending intent
 	 * never supplies coverage. No live binding check or native read belongs in this reader.
 	 */
-	completedReleaseForSession(
-		taskId: string,
-		sessionId: string,
-		epoch: number,
-	): FirstmateReleaseReceipt | undefined;
+	completedReleaseForSession(taskId: string, sessionId: string, epoch: number): FirstmateReleaseReceipt | undefined;
 }
 
 export function firstmateAssert(condition: unknown, reason: string): asserts condition {

@@ -169,41 +169,43 @@ export class LaneGovernor {
 	retirePreserving<T>(name: string, policy: PreservingRetirement<T>): Promise<T> {
 		if (this.#preserving.has(name)) return Promise.resolve(policy.held("task_release_pending_or_completed"));
 		this.#preserving.add(name);
-		const task = this.#port.runExclusive(workSessionKey(name), async () => {
-			if (this.#stopped) return policy.held("gateway is stopping");
-			const prepared = policy.prepare();
-			if ("result" in prepared) return prepared.result;
-			const recheck = () => {
-				if (this.#stopped) throw new Error("gateway is stopping");
-				prepared.recheck();
-			};
-			recheck();
-			if (prepared.pending) {
-				const proof = await this.#safeLiveness(prepared.sessionId, prepared.repo);
+		const task = this.#port
+			.runExclusive(workSessionKey(name), async () => {
+				if (this.#stopped) return policy.held("gateway is stopping");
+				const prepared = policy.prepare();
+				if ("result" in prepared) return prepared.result;
+				const recheck = () => {
+					if (this.#stopped) throw new Error("gateway is stopping");
+					prepared.recheck();
+				};
 				recheck();
-				if (proof.live !== false && !proof.disowned) {
-					// Same journaled close the first attempt used. Do not invent a second close path.
-					const closed = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
+				if (prepared.pending) {
+					const proof = await this.#safeLiveness(prepared.sessionId, prepared.repo);
 					recheck();
-					if (!closed.released) return policy.held(closed.reason);
+					if (proof.live !== false && !proof.disowned) {
+						// Same journaled close the first attempt used. Do not invent a second close path.
+						const closed = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
+						recheck();
+						if (!closed.released) return policy.held(closed.reason);
+					}
+				} else {
+					const job = this.#job(name);
+					if (!job || job === "corrupt") return policy.held("lane_job_unavailable");
+					const runtime = await this.#runtimeSettled(job, prepared.sessionId, prepared.repo);
+					recheck();
+					if (!runtime.settled) return policy.held(runtime.reason);
+					prepared.persistIntent();
+					recheck();
+					const proof = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
+					recheck();
+					if (!proof.released) return policy.held(proof.reason);
 				}
-			} else {
-				const job = this.#job(name);
-				if (!job || job === "corrupt") return policy.held("lane_job_unavailable");
-				const runtime = await this.#runtimeSettled(job, prepared.sessionId, prepared.repo);
-				recheck();
-				if (!runtime.settled) return policy.held(runtime.reason);
-				prepared.persistIntent();
-				recheck();
-				const proof = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
-				recheck();
-				if (!proof.released) return policy.held(proof.reason);
-			}
-			// A thrown transaction cannot undo native release. The durable intent remains.
-			return prepared.complete();
-		}).finally(() => {
-			this.#preserving.delete(name);
-		});
+				// A thrown transaction cannot undo native release. The durable intent remains.
+				return prepared.complete();
+			})
+			.finally(() => {
+				this.#preserving.delete(name);
+			});
 		this.#mutations.add(task);
 		void task.then(
 			() => this.#mutations.delete(task),
@@ -295,7 +297,11 @@ export class LaneGovernor {
 	 */
 	retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
 		if (this.#mapped(name))
-			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "firstmate_scoped_release_required" });
+			return Promise.resolve({
+				retired: false,
+				sessionKey: workSessionKey(name),
+				reason: "firstmate_scoped_release_required",
+			});
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,
@@ -428,7 +434,11 @@ export class LaneGovernor {
 	 */
 	forceRetire(name: string): Promise<LaneRetireOutcome> {
 		if (this.#mapped(name))
-			return Promise.resolve({ retired: false, sessionKey: workSessionKey(name), reason: "firstmate_scoped_release_required" });
+			return Promise.resolve({
+				retired: false,
+				sessionKey: workSessionKey(name),
+				reason: "firstmate_scoped_release_required",
+			});
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,

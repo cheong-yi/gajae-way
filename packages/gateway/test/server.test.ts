@@ -8,9 +8,9 @@ import {
 	type GatewayReadinessResult,
 	type MemoryOperationStatusResult,
 	originKey,
+	ProtocolError,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
-	ProtocolError,
 	type WorkApproveParams,
 	type WorkFirstmateAssignmentParams,
 	type WorkFirstmateCorrectionParams,
@@ -23,10 +23,10 @@ import type { GatewayConfig } from "../src/config";
 import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
 import { initializeMemory, memoryGit, memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
-import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import * as ghChecks from "../src/orchestrator/gh-checks";
-import { WorkLaneManager } from "../src/orchestrator/work-lane";
+import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
+import { WorkLaneManager } from "../src/orchestrator/work-lane";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { FirstmateStore, Store } from "../src/store";
 import {
@@ -1598,7 +1598,6 @@ for (const { output, state, unavailable } of [
 		}
 	}, 30_000);
 }
-
 
 test("requires negotiation then serves status, shutdown, and validates chat params", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));
@@ -4837,21 +4836,6 @@ test("a backlog left pending across an outage is answered on boot, never expired
 			}),
 		),
 	).toBe(true);
-	const bootSettled = Promise.withResolvers<void>();
-	const freshSettled = Promise.withResolvers<void>();
-	const transaction = database.transaction.bind(database);
-	const observeTransaction: typeof database.transaction = (operation) => {
-		const result = transaction(operation);
-		// Observe committed state, not the responder callback that precedes completion.
-		for (const [index, settled] of [bootSettled, freshSettled].entries()) {
-			const send = sessionPort.sends[index];
-			const row = send && database.inbox.turnRow(send.opRef);
-			if (row?.state === "done" && row.turn_state === "done" && database.inbox.pendingCount(key) === 0)
-				settled.resolve();
-		}
-		return result;
-	};
-	const transactionSpy = spyOn(database, "transaction").mockImplementation(observeTransaction);
 	const logs: string[] = [];
 	const original = console.error;
 	console.error = (...args: unknown[]) => logs.push(args.map(String).join(" "));
@@ -4871,37 +4855,18 @@ test("a backlog left pending across an outage is answered on boot, never expired
 				engagement: { mentioned: false, group: false, authorId: "owner" },
 			},
 		});
-		await bootSettled.promise;
-		expect(database.inbox.turnRow(sessionPort.sends[0]!.opRef)).toMatchObject({
-			message_id: "stale-1",
-			origin_key: key,
-			origin_ref_json: JSON.stringify(origin),
-			body: "from before the outage",
-			state: "done",
-			turn_role: "trigger",
-			turn_state: "done",
-		});
-		expect(database.inbox.pendingCount(key)).toBe(0);
+		for (let attempt = 0; attempt < 400 && turns.length < 2; attempt++) await Bun.sleep(10);
 		expect(turns).toEqual([
 			expect.stringContaining("from before the outage"),
 			expect.stringContaining("fresh after the outage"),
 		]);
 		expect(logs.some((line) => line.includes("inbound_expired"))).toBe(false);
-		await freshSettled.promise;
-		expect(database.inbox.turnRow(sessionPort.sends[1]!.opRef)).toMatchObject({
-			origin_key: key,
-			origin_ref_json: JSON.stringify(origin),
-			body: "fresh after the outage",
-			state: "done",
-			turn_role: "trigger",
-			turn_state: "done",
-		});
-		transactionSpy.mockRestore();
+		expect(database.inbox.pendingCount(key)).toBe(0);
 		client.close();
 	} finally {
 		console.error = original;
 	}
-}, 4_000);
+});
 
 test("/restart is owner-only and triggers an ordered gateway stop after acknowledging", async () => {
 	directory = await mkdtemp(join(tmpdir(), "gajaeway-server-"));

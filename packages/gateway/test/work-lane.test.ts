@@ -25,12 +25,10 @@ import {
 	newOpRef,
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
-import { GjcCliUnavailableError } from "../src/orchestrator/broker";
-import { DeliveryService } from "../src/delivery/delivery";
-import { readChildPane, readLanePane, saveChildPane, paneDeliveryGuard } from "../src/orchestrator/firstmate-pane";
-import { PersonaSessionManager } from "../src/orchestrator/persona-session";
-import { resolvePostTarget } from "../src/server/server";
 import type { GatewayConfig } from "../src/config";
+import { DeliveryService } from "../src/delivery/delivery";
+import { GjcCliUnavailableError } from "../src/orchestrator/broker";
+import { paneDeliveryGuard, readChildPane, readLanePane, saveChildPane } from "../src/orchestrator/firstmate-pane";
 import {
 	classifyCheckRollup,
 	failedCheckLogTargets,
@@ -45,6 +43,7 @@ import {
 	managedLaneWorktreePath,
 	workSessionKey,
 } from "../src/orchestrator/lane-governor";
+import { PersonaSessionManager } from "../src/orchestrator/persona-session";
 import {
 	BrokerSessionPort,
 	parseWorkerOutputResponse,
@@ -66,6 +65,7 @@ import {
 	WorkLaneManager,
 	type WorkLaneManagerOptions,
 } from "../src/orchestrator/work-lane";
+import { resolvePostTarget } from "../src/server/server";
 import { BrokerAuthorityError, type FirstmateAssignment, FirstmateStore, Store } from "../src/store";
 import { WorkAttemptStateError } from "../src/store/groups/work";
 import { hangingStatusRepo, hookPid, pidAlive, untilGone } from "./fixtures/git-hang";

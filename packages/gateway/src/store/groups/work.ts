@@ -302,11 +302,7 @@ export class FirstmateStore implements FirstmateCloseoutReaders {
 		return row ? this.releaseIntent(row.release_id) : undefined;
 	}
 
-	completedReleaseForSession(
-		taskId: string,
-		sessionId: string,
-		epoch: number,
-	): FirstmateReleaseReceipt | undefined {
+	completedReleaseForSession(taskId: string, sessionId: string, epoch: number): FirstmateReleaseReceipt | undefined {
 		const rows = this.#db
 			.prepare(
 				"SELECT r.record_json FROM firstmate_release_receipts r JOIN firstmate_release_intents i ON i.release_id = r.release_id JOIN firstmate_attempts a ON a.op_ref = i.op_ref WHERE a.task_id = ? ORDER BY a.ordinal",
