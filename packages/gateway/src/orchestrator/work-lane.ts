@@ -1094,6 +1094,46 @@ export class WorkLaneManager {
 			return unavailable(String(detail?.reason ?? detail?.reasonCode ?? "inspection_state_unavailable"));
 		}
 	}
+	/**
+	 * Abandonment is the preserving release with no outcome to approve. It closes
+	 * the session through the same lock a scoped release uses and records the row
+	 * that frees the reservation. The worktree stays; the assignment stays.
+	 */
+	async abandonFirstmate(name: string): Promise<{ abandoned: true; name: string } | { abandoned: false; reason: string }> {
+		const owner = this.#db.work.firstmate;
+		const assignment = owner.assignment(name);
+		if (!assignment) return { abandoned: false, reason: "unknown assignment" };
+		const runtime = this.#db.work.workAttemptGet(owner.attemptsForTask(assignment.taskId).at(-1)?.opRef ?? "");
+		if (!runtime || runtime.settledAt === null) return { abandoned: false, reason: "abandon requires a settled attempt" };
+		const held = (reason: string): { abandoned: false; reason: string } => ({ abandoned: false, reason });
+		return this.#options.lanes.retirePreserving<{ abandoned: true; name: string } | { abandoned: false; reason: string }>(name, {
+			held,
+			prepare: () => {
+				const current = owner.assignment(name);
+				if (!current) return { result: held("unknown assignment") };
+				const attempt = this.#db.work.workAttemptGet(owner.attemptsForTask(current.taskId).at(-1)?.opRef ?? "");
+				if (!attempt || attempt.settledAt === null) return { result: held("abandon requires a settled attempt") };
+				const binding = this.#db.bindings.getSessionRecord(workSessionKey(name));
+				return {
+					sessionId: binding?.sessionId ?? attempt.sessionId,
+					repo: current.worktree.path,
+					pending: binding === undefined || binding.sessionId === "",
+					recheck: () => {
+						if (!owner.assignment(name)) throw new Error("assignment disappeared during abandonment");
+					},
+					persistIntent: () => {},
+					complete: () => {
+						this.#db.transaction((tx) => {
+							owner.recordAbandonment(tx, name, "no_outcome", this.#at());
+							this.#db.bindings.rotateEpoch(tx, workSessionKey(name));
+						});
+						return { abandoned: true as const, name };
+					},
+				};
+			},
+		});
+	}
+
 	/** Separate explicit preserving release; the governor alone owns the native lane lock. */
 	async retireFirstmate(input: WorkFirstmateRetireParams): Promise<WorkFirstmateRetireResult> {
 		let obligations: { id: string; reason: string }[] = [];

@@ -2018,21 +2018,11 @@ async function handleRequest(
 				const params = request.params as { abandon?: unknown };
 				const name = typeof params.abandon === "string" ? params.abandon.trim() : "";
 				if (!name) throw new ProtocolError("invalid_params", "abandon requires a lane name");
-				const assignment = options.database.work.firstmate.assignment(name);
-				if (!assignment) throw new ProtocolError("invalid_params", "unknown assignment");
-				const runtime = options.database.work.workAttemptGet(
-					options.database.work.firstmate.attemptsForTask(assignment.taskId).at(-1)?.opRef ?? "",
-				);
-				if (!runtime || runtime.settledAt === null)
-					throw new ProtocolError("invalid_params", "abandon requires a settled attempt");
-				options.database.transaction((tx) => {
-					options.database.work.firstmate.recordAbandonment(tx, name, "no_outcome", new Date().toISOString());
-					// Release the bound session so the lane leaves activeLanes the same way a
-					// retired one does. The assignment and abandonment rows stay as evidence.
-					options.database.bindings.rotateEpoch(tx, `work/task/${name}`);
-				});
+				const result = await runtime.work.abandonFirstmate(name);
+				if (!result.abandoned)
+					throw new ProtocolError("verb_failed", result.reason, { reasonCode: "firstmate_abandon_held" });
 				console.info(`firstmate_abandoned name=${name} reason=no_outcome`);
-				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { abandoned: true, name } });
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 				return;
 			}
 			if (workObject(request.params) && Object.hasOwn(request.params, "firstmate")) {

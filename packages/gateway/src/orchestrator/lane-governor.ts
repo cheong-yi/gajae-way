@@ -618,6 +618,8 @@ export class LaneGovernor {
 	}
 
 	async #liveness(sessionId: string, repo: string): Promise<{ live: boolean | undefined; disowned: boolean }> {
+		// A retried release can arrive after its binding was already cleared.
+		if (sessionId === "") return { live: false, disowned: true };
 		if (!this.#port.liveness) return { live: undefined, disowned: false };
 		return await this.#port.liveness({ sessionId, repo });
 	}
