@@ -12,7 +12,7 @@ external_commands = "Changed subprocess or executable invocation: test arguments
 schema_version = 1
 selected_components = ["typescript"]
 test_command = "bun run gajaestack-check"
-affected_test_command = "bun run gajaestack-check --quick"
+affected_test_command = "bun run gajaestack-check --quick --reference-branch TARGET"
 ci_jobs_added = false
 pcd_is_enforcement = false
 
