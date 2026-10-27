@@ -1,0 +1,37 @@
+required = ["ts-lint"]
+advisory = []
+on_demand = []
+
+[conditional]
+input_parsing = "Changed parsing of externally supplied values: exercise valid, malformed, and boundary inputs."
+authorization_decisions = "Changed a decision about permission, eligibility, or authority: test allow and deny boundaries."
+file_writes_deletion = "Changed filesystem mutation behavior: test target confinement, refusal cases, and no partial side effects."
+external_commands = "Changed subprocess or executable invocation: test arguments, failures, and prohibited execution paths."
+
+[fact]
+schema_version = 1
+selected_components = ["typescript"]
+test_command = "bun run gajaestack-check"
+affected_test_command = "bun run gajaestack-check --quick --reference-branch TARGET"
+ci_jobs_added = false
+pcd_is_enforcement = false
+
+[typescript]
+schema_version = 1
+typecheck = false
+lint = true
+biome_config = "biome.json"
+paths = [
+	"packages/adapter-discord/src",
+	"packages/adapter-slack/src",
+	"packages/adapter-telegram/src",
+	"packages/admin/src",
+	"packages/cli/src",
+	"packages/conformance/src",
+	"packages/gateway/src",
+	"packages/home/src",
+	"packages/log/src",
+	"packages/protocol/src",
+	"packages/sdk/src",
+	"packages/subsession/src",
+]
