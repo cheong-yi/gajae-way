@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 46;
+export const LATEST_SCHEMA_VERSION = 44;
 
 export interface MigrationHost {
 	readonly database: {
@@ -413,7 +413,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 			]) {
 				for (const action of ["UPDATE", "DELETE"])
 					host.database.execute(
-						`CREATE TRIGGER ${table}_immutable_${action.toLowerCase()} BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'immutable broker provenance'); END`,
+						`CREATE TRIGGER IF NOT EXISTS ${table}_immutable_${action.toLowerCase()} BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'immutable broker provenance'); END`,
 					);
 			}
 			for (const [kind, table, column] of [
@@ -936,22 +936,25 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 		});
 	}
 	if (current < 43) {
-		// Owner evidence is independent of the mutable native journal projections.
-		// No historical FirstMate task import or reconstruction from native rows.
+		// One migration for the whole FirstMate record. Owner evidence is independent of the
+		// mutable native journal projections: no historical task import, no approval inference,
+		// no reconstruction from native rows. thread_key, worktree_path, and git_dir are not
+		// unique because an abandoned lane releases its reservation while keeping its evidence,
+		// and a later task may reuse any of them. lane_name and (owner_id, message_id) stay unique.
 		host.withTransaction(() => {
 			host.database.execute(`
-				CREATE TABLE firstmate_assignments (
+				CREATE TABLE IF NOT EXISTS firstmate_assignments (
 					task_id TEXT PRIMARY KEY,
 					lane_name TEXT NOT NULL UNIQUE,
 					owner_id TEXT NOT NULL,
 					message_id TEXT NOT NULL,
-					thread_key TEXT NOT NULL UNIQUE,
-					worktree_path TEXT NOT NULL UNIQUE,
-					git_dir TEXT NOT NULL UNIQUE,
+					thread_key TEXT NOT NULL,
+					worktree_path TEXT NOT NULL,
+					git_dir TEXT NOT NULL,
 					assignment_json TEXT NOT NULL,
 					UNIQUE(owner_id, message_id)
 				);
-				CREATE TABLE firstmate_attempts (
+				CREATE TABLE IF NOT EXISTS firstmate_attempts (
 					op_ref TEXT PRIMARY KEY,
 					task_id TEXT NOT NULL REFERENCES firstmate_assignments(task_id),
 					lane_name TEXT NOT NULL,
@@ -959,11 +962,16 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 					record_json TEXT NOT NULL,
 					UNIQUE(task_id, ordinal)
 				);
-				CREATE INDEX firstmate_attempts_lane ON firstmate_attempts(lane_name);
+				CREATE INDEX IF NOT EXISTS firstmate_attempts_lane ON firstmate_attempts(lane_name);
+				CREATE TABLE IF NOT EXISTS firstmate_abandonments (
+					lane_name TEXT PRIMARY KEY,
+					reason TEXT NOT NULL,
+					abandoned_at TEXT NOT NULL
+				);
 			`);
 			for (const table of ["firstmate_assignments", "firstmate_attempts"]) {
 				for (const action of ["UPDATE", "DELETE"]) {
-					host.database.execute(`CREATE TRIGGER ${table}_immutable_${action.toLowerCase()}
+					host.database.execute(`CREATE TRIGGER IF NOT EXISTS ${table}_immutable_${action.toLowerCase()}
 						BEFORE ${action} ON ${table}
 						BEGIN SELECT RAISE(ABORT, 'immutable FirstMate evidence'); END`);
 				}
@@ -977,7 +985,7 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 		// Fresh policy receipts only: no historical approval inference or native replay.
 		host.withTransaction(() => {
 			host.database.execute(`
-				CREATE TABLE firstmate_approvals (
+				CREATE TABLE IF NOT EXISTS firstmate_approvals (
 					approval_id TEXT PRIMARY KEY,
 					task_id TEXT NOT NULL REFERENCES firstmate_assignments(task_id),
 					op_ref TEXT NOT NULL REFERENCES firstmate_attempts(op_ref),
@@ -986,7 +994,7 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 					record_json TEXT NOT NULL CHECK(json_valid(record_json)),
 					UNIQUE(owner_id, message_id)
 				);
-				CREATE TABLE firstmate_release_intents (
+				CREATE TABLE IF NOT EXISTS firstmate_release_intents (
 					release_id TEXT PRIMARY KEY,
 					approval_id TEXT NOT NULL REFERENCES firstmate_approvals(approval_id),
 					op_ref TEXT NOT NULL UNIQUE REFERENCES firstmate_attempts(op_ref),
@@ -995,14 +1003,14 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 					record_json TEXT NOT NULL CHECK(json_valid(record_json)),
 					UNIQUE(owner_id, message_id)
 				);
-				CREATE TABLE firstmate_release_receipts (
+				CREATE TABLE IF NOT EXISTS firstmate_release_receipts (
 					release_id TEXT PRIMARY KEY REFERENCES firstmate_release_intents(release_id),
 					record_json TEXT NOT NULL CHECK(json_valid(record_json))
 				);
 			`);
 			for (const table of ["firstmate_approvals", "firstmate_release_intents", "firstmate_release_receipts"]) {
 				for (const action of ["UPDATE", "DELETE"]) {
-					host.database.execute(`CREATE TRIGGER ${table}_immutable_${action.toLowerCase()}
+					host.database.execute(`CREATE TRIGGER IF NOT EXISTS ${table}_immutable_${action.toLowerCase()}
 						BEFORE ${action} ON ${table}
 						BEGIN SELECT RAISE(ABORT, 'immutable FirstMate receipt'); END`);
 				}
@@ -1010,59 +1018,6 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(44, new Date().toISOString());
-		});
-	}
-	if (current < 45) {
-		// A settled task with no outcome can never be approved, so the outcome release can never free it.
-		// Abandonment records that the reservation ended without deleting the assignment evidence.
-		host.withTransaction(() => {
-			host.database.execute(`
-				CREATE TABLE firstmate_abandonments (
-					lane_name TEXT PRIMARY KEY,
-					reason TEXT NOT NULL,
-					abandoned_at TEXT NOT NULL
-				);
-			`);
-			host.database
-				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-				.run(45, new Date().toISOString());
-		});
-	}
-	if (current < 46) {
-		// The reservation check already ignores an abandoned lane. The table's UNIQUE
-		// constraints on thread_key, worktree_path, and git_dir do not, so a second
-		// task reusing any of them was rejected after the first was abandoned.
-		// SQLite cannot drop one column constraint, so the table is rebuilt without
-		// them and the triggers and the foreign key from firstmate_attempts are put back.
-		host.withTransaction(() => {
-			host.database.execute("PRAGMA foreign_keys = OFF;");
-			host.database.execute(`
-				CREATE TABLE firstmate_assignments_new (
-					task_id TEXT PRIMARY KEY,
-					lane_name TEXT NOT NULL UNIQUE,
-					owner_id TEXT NOT NULL,
-					message_id TEXT NOT NULL,
-					thread_key TEXT NOT NULL,
-					worktree_path TEXT NOT NULL,
-					git_dir TEXT NOT NULL,
-					assignment_json TEXT NOT NULL,
-					UNIQUE(owner_id, message_id)
-				);
-			`);
-			host.database.execute(
-				"INSERT INTO firstmate_assignments_new SELECT task_id, lane_name, owner_id, message_id, thread_key, worktree_path, git_dir, assignment_json FROM firstmate_assignments;",
-			);
-			host.database.execute("DROP TABLE firstmate_assignments;");
-			host.database.execute("ALTER TABLE firstmate_assignments_new RENAME TO firstmate_assignments;");
-			for (const action of ["UPDATE", "DELETE"]) {
-				host.database.execute(`CREATE TRIGGER firstmate_assignments_immutable_${action.toLowerCase()}
-					BEFORE ${action} ON firstmate_assignments
-					BEGIN SELECT RAISE(ABORT, 'immutable FirstMate evidence'); END`);
-			}
-			host.database.execute("PRAGMA foreign_keys = ON;");
-			host.database
-				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-				.run(46, new Date().toISOString());
 		});
 	}
 }

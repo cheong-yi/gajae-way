@@ -95,7 +95,7 @@ describe("conversation model override", () => {
 		}
 	});
 
-	test("the override survives a reopen and the schema reports 39", async () => {
+	test("the override survives a reopen and the schema reports 40", async () => {
 		const { db, path } = await openAt();
 		db.transaction((tx) => db.bindings.modelSet(tx, "discord:c1", { preset: "lunamaxxing-local" }));
 		db.close();

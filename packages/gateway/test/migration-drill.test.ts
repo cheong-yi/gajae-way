@@ -6,8 +6,17 @@ import { join } from "node:path";
 import { MonitorRegistry } from "../src/monitors/registry";
 import { LATEST_SCHEMA_VERSION, Store } from "../src/store";
 
+function dropFirstmateApprovalSchema(database: Database): void {
+	// Drop dependent receipts before attribution; SQLite also removes each table's immutable triggers.
+	database.exec(
+		"DROP TABLE firstmate_abandonments; DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals;",
+	);
+}
+
 /** Remove broker-authority and v22-v24 schema objects before replaying historical DDL; missing objects are fixture errors. */
 function dropBrokerAuthoritySchema(database: Database): void {
+	dropFirstmateApprovalSchema(database);
+	database.exec("DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments;");
 	for (const table of ["inbound_messages", "lane_jobs", "work_attempt_runtime", "monitor_events", "authored_outputs"])
 		for (const action of ["update", "delete"]) database.exec(`DROP TRIGGER ${table}_quarantine_${action}`);
 	for (const table of ["broker_owned_bindings", "broker_cutovers", "broker_quarantine", "broker_retired_sessions"])
@@ -502,7 +511,10 @@ test("upgrades schema 23 to the latest: overlap column, skipped stage, rows and 
 		(await Store.open(path)).close();
 		// Rebuild the deployed v23 shape: no overlap column, no skipped stage/skipped_by.
 		const raw = new Database(path);
+		dropFirstmateApprovalSchema(raw);
 		raw.exec(`
+DROP TABLE firstmate_attempts;
+DROP TABLE firstmate_assignments;
 DROP TABLE monitor_events;
 DROP TABLE lane_reports;
 ALTER TABLE inbound_messages DROP COLUMN source;
@@ -553,8 +565,9 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		// and `agents_md_digest` were added to it is in: the version row is
 		// recorded, the columns are missing, and no migration below 31 adds them.
 		const raw = new Database(path);
+		dropFirstmateApprovalSchema(raw);
 		raw.exec(
-			"ALTER TABLE sessions DROP COLUMN agents_md_epoch; ALTER TABLE sessions DROP COLUMN agents_md_digest; DELETE FROM schema_migrations WHERE version > 30;",
+			"DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments; ALTER TABLE sessions DROP COLUMN agents_md_epoch; ALTER TABLE sessions DROP COLUMN agents_md_digest; DELETE FROM schema_migrations WHERE version > 30;",
 		);
 		raw.close();
 
