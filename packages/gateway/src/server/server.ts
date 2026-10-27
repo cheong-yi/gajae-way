@@ -2027,6 +2027,9 @@ async function handleRequest(
 					throw new ProtocolError("invalid_params", "abandon requires a settled attempt");
 				options.database.transaction((tx) => {
 					options.database.work.firstmate.recordAbandonment(tx, name, "no_outcome", new Date().toISOString());
+					// Release the bound session so the lane leaves activeLanes the same way a
+					// retired one does. The assignment and abandonment rows stay as evidence.
+					options.database.bindings.rotateEpoch(tx, `work/task/${name}`);
 				});
 				console.info(`firstmate_abandoned name=${name} reason=no_outcome`);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { abandoned: true, name } });

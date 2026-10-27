@@ -1776,7 +1776,6 @@ export class WorkLaneManager {
 		}
 		for (const row of this.#db.work.laneJobRows(true)) {
 			if (row.job_id === job?.jobId) continue;
-			if (this.#db.work.firstmate.abandoned(row.lane_key.replace(/^work-/, ""))) continue;
 			firstmateAssert(
 				realpathOfPossiblyMissing(row.worktree_path) !== assignment.worktree.path,
 				"worktree_already_owned",
@@ -1784,7 +1783,6 @@ export class WorkLaneManager {
 		}
 		for (const row of this.#db.bindings.workLaneRows()) {
 			if (row.origin_key === workSessionKey(assignment.name)) continue;
-			if (this.#db.work.firstmate.abandoned(row.origin_key.replace(/^work\/task\//, ""))) continue;
 			const repo = this.#db.bindings.workLaneRepoBySessionId(row.gjc_session_id);
 			firstmateAssert(!repo || realpathOfPossiblyMissing(repo) !== assignment.worktree.path, "worktree_already_bound");
 		}
