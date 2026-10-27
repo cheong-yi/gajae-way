@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 41;
+export const LATEST_SCHEMA_VERSION = 43;
 
 export interface MigrationHost {
 	readonly database: {
@@ -961,6 +961,59 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(41, new Date().toISOString());
+		});
+	}
+	if (current < 42) {
+		// A settled task with no outcome can never be approved, so the outcome release can never free it.
+		// Abandonment records that the reservation ended without deleting the assignment evidence.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE firstmate_abandonments (
+					lane_name TEXT PRIMARY KEY,
+					reason TEXT NOT NULL,
+					abandoned_at TEXT NOT NULL
+				);
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(42, new Date().toISOString());
+		});
+	}
+	if (current < 43) {
+		// The reservation check already ignores an abandoned lane. The table's UNIQUE
+		// constraints on thread_key, worktree_path, and git_dir do not, so a second
+		// task reusing any of them was rejected after the first was abandoned.
+		// SQLite cannot drop one column constraint, so the table is rebuilt without
+		// them and the triggers and the foreign key from firstmate_attempts are put back.
+		host.withTransaction(() => {
+			host.database.execute("PRAGMA foreign_keys = OFF;");
+			host.database.execute(`
+				CREATE TABLE firstmate_assignments_new (
+					task_id TEXT PRIMARY KEY,
+					lane_name TEXT NOT NULL UNIQUE,
+					owner_id TEXT NOT NULL,
+					message_id TEXT NOT NULL,
+					thread_key TEXT NOT NULL,
+					worktree_path TEXT NOT NULL,
+					git_dir TEXT NOT NULL,
+					assignment_json TEXT NOT NULL,
+					UNIQUE(owner_id, message_id)
+				);
+			`);
+			host.database.execute(
+				"INSERT INTO firstmate_assignments_new SELECT task_id, lane_name, owner_id, message_id, thread_key, worktree_path, git_dir, assignment_json FROM firstmate_assignments;",
+			);
+			host.database.execute("DROP TABLE firstmate_assignments;");
+			host.database.execute("ALTER TABLE firstmate_assignments_new RENAME TO firstmate_assignments;");
+			for (const action of ["UPDATE", "DELETE"]) {
+				host.database.execute(`CREATE TRIGGER firstmate_assignments_immutable_${action.toLowerCase()}
+					BEFORE ${action} ON firstmate_assignments
+					BEGIN SELECT RAISE(ABORT, 'immutable FirstMate evidence'); END`);
+			}
+			host.database.execute("PRAGMA foreign_keys = ON;");
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(43, new Date().toISOString());
 		});
 	}
 }
