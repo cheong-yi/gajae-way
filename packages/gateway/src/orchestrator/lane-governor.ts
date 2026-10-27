@@ -216,6 +216,7 @@ export class LaneGovernor {
 
 	#mapped(name: string): boolean {
 		try {
+			if (this.#database.work.firstmate.abandoned(name)) return false;
 			return this.#database.work.firstmate.assignment(name) !== undefined;
 		} catch {
 			// Corrupt attribution is not permission to use a destructive bypass.
@@ -260,9 +261,11 @@ export class LaneGovernor {
 				name,
 			});
 		const allLanes = this.activeLanes();
-		// Filter out quarantined lanes from capacity count
+		// An abandoned lane no longer holds a reservation, so it does not hold a slot either.
 		const lanes = allLanes.filter(
-			(lane) => !this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId),
+			(lane) =>
+				!this.#database.work.firstmate.abandoned(lane.name) &&
+				!this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId),
 		);
 		if (lanes.some((lane) => lane.name === name)) return;
 		if (lanes.length < this.maxLanes) return;

@@ -28,6 +28,7 @@ export const TABLE_OWNER = {
 	firstmate_approvals: "work",
 	firstmate_release_intents: "work",
 	firstmate_release_receipts: "work",
+	firstmate_abandonments: "work",
 	monitors: "monitors",
 	monitor_events: "monitors",
 	authored_outputs: "monitors",

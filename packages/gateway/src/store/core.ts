@@ -62,6 +62,7 @@ const AUTHORITY_CENSUS_TABLES = [
 	"firstmate_approvals",
 	"firstmate_release_intents",
 	"firstmate_release_receipts",
+	"firstmate_abandonments",
 	"broker_owned_bindings",
 	"broker_tail_cursors",
 	"broker_retired_sessions",

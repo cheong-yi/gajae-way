@@ -291,6 +291,8 @@ export interface WorkLaneManagerOptions {
 	readonly brokerWait?: BrokerWaitOptions;
 	/** Test seam: one deadline for every lane git command instead of {@link GIT_TIMEOUTS}. */
 	readonly gitCommandTimeoutMs?: number;
+	/** Model applied to a lane that names none. A lane with no model falls back to a default the account may reject. */
+	readonly sessionModel?: GjcModelSelection;
 }
 /**
  * A lane bind issued while the supervisor restarts the broker waits for it to
@@ -1774,6 +1776,7 @@ export class WorkLaneManager {
 		}
 		for (const row of this.#db.work.laneJobRows(true)) {
 			if (row.job_id === job?.jobId) continue;
+			if (this.#db.work.firstmate.abandoned(row.lane_key.replace(/^work-/, ""))) continue;
 			firstmateAssert(
 				realpathOfPossiblyMissing(row.worktree_path) !== assignment.worktree.path,
 				"worktree_already_owned",
@@ -1781,6 +1784,7 @@ export class WorkLaneManager {
 		}
 		for (const row of this.#db.bindings.workLaneRows()) {
 			if (row.origin_key === workSessionKey(assignment.name)) continue;
+			if (this.#db.work.firstmate.abandoned(row.origin_key.replace(/^work\/task\//, ""))) continue;
 			const repo = this.#db.bindings.workLaneRepoBySessionId(row.gjc_session_id);
 			firstmateAssert(!repo || realpathOfPossiblyMissing(repo) !== assignment.worktree.path, "worktree_already_bound");
 		}
@@ -2013,7 +2017,9 @@ export class WorkLaneManager {
 									epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
 									repo: worktreePath,
 									codingRegister: true,
-									...(input.model ? { model: input.model } : {}),
+									...(input.model ?? this.#options.sessionModel
+										? { model: input.model ?? this.#options.sessionModel }
+										: {}),
 								});
 							}
 						} catch (error) {

@@ -404,6 +404,19 @@ export class FirstmateStore {
 		firstmateAssert(assignment.name === name && assignment.taskId === row.task_id, "assignment_corrupt");
 		return assignment;
 	}
+	abandoned(name: string): boolean {
+		return (
+			this.#db.prepare("SELECT lane_name FROM firstmate_abandonments WHERE lane_name = ?").get(name) !== null
+		);
+	}
+	recordAbandonment(tx: WriteTx, name: string, reason: string, at: string): void {
+		firstmateAssert(this.assignment(name) !== undefined, "assignment_missing");
+		this.#db
+			.prepare(
+				"INSERT INTO firstmate_abandonments (lane_name, reason, abandoned_at) VALUES (?, ?, ?) ON CONFLICT(lane_name) DO NOTHING",
+			)
+			.run(tx, name, reason, at);
+	}
 
 	attempt(opRef: string): FirstmateAttempt | undefined {
 		const row = this.#db
@@ -487,12 +500,12 @@ export class FirstmateStore {
 		return attempt;
 	}
 
-	/** Repeated immutable policy may match; conflicting reservations never authorize adoption. */
+	/** Repeated immutable policy may match; conflicting reservations never authorize adoption. An abandoned lane no longer reserves. */
 	assertAssignment(assignment: FirstmateAssignment): void {
 		const json = assignmentJson(assignment);
 		const rows = this.#db
 			.prepare(
-				"SELECT assignment_json FROM firstmate_assignments WHERE task_id = ? OR lane_name = ? OR worktree_path = ? OR git_dir = ? OR thread_key = ? OR (owner_id = ? AND message_id = ?)",
+				"SELECT assignment_json FROM firstmate_assignments WHERE lane_name NOT IN (SELECT lane_name FROM firstmate_abandonments) AND (task_id = ? OR lane_name = ? OR worktree_path = ? OR git_dir = ? OR thread_key = ? OR (owner_id = ? AND message_id = ?))",
 			)
 			.all(
 				assignment.taskId,

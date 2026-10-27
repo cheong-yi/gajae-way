@@ -1122,12 +1122,15 @@ export function subscribeDiscordPaneRequests(gateway: GatewayClientLike, discord
 	return (
 		gateway.on?.("discord.thread.open", (value) => {
 			const request = value as { requestId: string; parent: OriginRef; name: string };
+			console.info(`discord_pane_open_received requestId=${(value as { requestId?: string }).requestId}`);
 			void (async () => {
 				let result: { requestId: string; threadId?: string; error?: string };
 				try {
 					result = { requestId: request.requestId, threadId: await openDiscordPane(discord, request) };
+					console.info(`discord_pane_open_done requestId=${request.requestId} threadId=${result.threadId}`);
 				} catch (error) {
 					result = { requestId: request.requestId, error: errorMessage(error) };
+					console.error(`discord_pane_open_failed requestId=${request.requestId} error=${result.error}`);
 				}
 				await gateway.request("discord.thread.opened", result);
 			})().catch((error) => console.error(`Discord pane response failed: ${errorMessage(error)}`));
