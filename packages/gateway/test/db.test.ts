@@ -11,7 +11,7 @@ test("migrates the sessions foundation", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-db-"));
 	try {
 		const database = await Store.open(join(directory, "gateway.db"));
-		expect(database.schemaVersion).toBe(41);
+		expect(database.schemaVersion).toBe(40);
 		const counts = database.core.tableRowCounts();
 		expect(counts.firstmate_assignments).toBe(0);
 		expect(counts.firstmate_attempts).toBe(0);
@@ -165,12 +165,12 @@ test("adds quarantine diagnostics to existing memory intents", async () => {
 
 		const legacy = new Database(path);
 		legacy.exec(
-			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts; ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 23",
+			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; ALTER TABLE memory_intents DROP COLUMN quarantine_reason; ALTER TABLE memory_intents DROP COLUMN attempts; ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 23",
 		);
 		legacy.close();
 
 		const migrated = await Store.open(path);
-		expect(migrated.schemaVersion).toBe(41);
+		expect(migrated.schemaVersion).toBe(40);
 		expect(migrated.memory.rows()[0]).toMatchObject({
 			id: "legacy-intent",
 			state: "queued",
@@ -242,7 +242,7 @@ test("adds last_error to existing deliveries without touching their state (#171)
 
 		const legacy = new Database(path);
 		legacy.exec(
-			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments; ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 26",
+			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments; ALTER TABLE deliveries DROP COLUMN last_error; DELETE FROM schema_migrations WHERE version >= 26",
 		);
 		legacy.close();
 

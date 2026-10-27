@@ -8,7 +8,7 @@ import { Store } from "../src/store";
 function dropFirstmateApprovalSchema(database: Database): void {
 	// Drop dependent receipts before attribution; SQLite also removes each table's immutable triggers.
 	database.exec(
-		"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals;",
+		"DROP TABLE firstmate_abandonments; DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals;",
 	);
 }
 
@@ -45,7 +45,7 @@ test("migrates a migration-001 database to the latest schema", async () => {
 		legacy.close();
 
 		const database = await Store.open(path);
-		expect(database.schemaVersion).toBe(41);
+		expect(database.schemaVersion).toBe(40);
 		database.close();
 
 		const migrated = new Database(path, { readonly: true });
@@ -88,7 +88,7 @@ test("migration 38 is idempotent when a partially upgraded database already has 
 		partial.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(41);
+		expect(upgraded.schemaVersion).toBe(40);
 		expect(upgraded.inbox.isThreadMuted(threadKey)).toBe(true);
 		const verified = new Database(path, { readonly: true });
 		expect(
@@ -98,7 +98,7 @@ test("migration 38 is idempotent when a partially upgraded database already has 
 		upgraded.close();
 
 		const reopened = await Store.open(path);
-		expect(reopened.schemaVersion).toBe(41);
+		expect(reopened.schemaVersion).toBe(40);
 		expect(reopened.inbox.isThreadMuted(threadKey)).toBe(true);
 		reopened.close();
 	} finally {
@@ -142,7 +142,7 @@ DELETE FROM schema_migrations WHERE version > 10;
 		v10.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(41);
+		expect(upgraded.schemaVersion).toBe(40);
 
 		expect(upgraded.work.laneJobJson("lanejob-test")).toBe('{"schemaVersion":1}');
 		const tables = new Set(
@@ -192,7 +192,7 @@ DELETE FROM schema_migrations WHERE version > 12;
 		v12.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(41);
+		expect(upgraded.schemaVersion).toBe(40);
 
 		expect(upgraded.work.laneJobJson("lanejob-v12")).toBe('{"schemaVersion":1}');
 		expect(upgraded.core.metaGet("rebind_budget:discord/channel/c1")).toBe('{"used":2,"lifetime":7}');
@@ -239,7 +239,7 @@ DELETE FROM schema_migrations WHERE version > 14;
 		v14.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(41);
+		expect(upgraded.schemaVersion).toBe(40);
 
 		const rows = upgraded.monitors.rows();
 		expect(rows).toHaveLength(1);
@@ -295,7 +295,7 @@ DELETE FROM schema_migrations WHERE version > 15;
 	v15.close();
 
 	const upgraded = await Store.open(path);
-	expect(upgraded.schemaVersion).toBe(41);
+	expect(upgraded.schemaVersion).toBe(40);
 
 	upgraded.transaction((tx) => upgraded.bindings.modelSet(tx, "discord:c1", { preset: "gpt-heavy" }, "owner"));
 	expect(upgraded.bindings.modelGet("discord:c1")?.selection).toEqual({ preset: "gpt-heavy" });
@@ -307,7 +307,7 @@ test("migration 19 rebuilds a genuine schema-18 batch table as turns: bound/acce
 	const path = join(directory, "gateway.db");
 	try {
 		const latest = await Store.open(path);
-		expect(latest.schemaVersion).toBe(41);
+		expect(latest.schemaVersion).toBe(40);
 		latest.close();
 		// Rebuild a deployed schema-18 database from its real DDL (v16 base + the
 		// v17 ALTERs + the v18 ALTERs), then seed the shapes an upgrade meets.
@@ -346,7 +346,7 @@ INSERT INTO inbound_messages (message_id, origin_key, origin_ref_json, body, eng
 		raw.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(41);
+		expect(upgraded.schemaVersion).toBe(40);
 
 		const after = new Database(path, { readonly: true });
 		const columns = after
@@ -471,7 +471,7 @@ DELETE FROM schema_migrations WHERE version > 23;
 `);
 		raw.close();
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(41);
+		expect(upgraded.schemaVersion).toBe(40);
 
 		expect(upgraded.monitors.rows()[0]).toMatchObject({ monitor_id: "m1", overlap: "queue" });
 		expect(upgraded.monitors.eventRows("m1")[0]).toMatchObject({
@@ -515,7 +515,7 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		raw.close();
 
 		const upgraded = await Store.open(path);
-		expect(upgraded.schemaVersion).toBe(41);
+		expect(upgraded.schemaVersion).toBe(40);
 		upgraded.close();
 
 		const after = new Database(path, { readonly: true });

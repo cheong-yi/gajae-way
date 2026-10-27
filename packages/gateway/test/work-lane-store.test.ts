@@ -2239,12 +2239,12 @@ describe("work attempt durable transactions", () => {
 			BEGIN SELECT RAISE(ABORT, 'broker authority: quarantined'); END;
 		`);
 		f.raw.exec(
-			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
+			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
 		);
 
 		const migrated = await Store.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(41);
+		expect(migrated.schemaVersion).toBe(40);
 		expect(migrated.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
 			decision: "fallback",
 			parent: { kind: "persona", origin: LOOPBACK_ORIGIN, originKey: originKey(LOOPBACK_ORIGIN) },
@@ -2269,7 +2269,7 @@ describe("work attempt durable transactions", () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 		f.raw.exec(
-			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
+			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments; DROP TABLE lane_reports; ALTER TABLE inbound_messages DROP COLUMN source; DELETE FROM schema_migrations WHERE version >= 24",
 		);
 		f.raw.query("UPDATE work_attempt_runtime SET record_json = '{' WHERE op_ref = ?").run(f.runtime.opRef);
 		await expect(Store.open(f.path)).rejects.toBeInstanceOf(DatabaseStartupError);
@@ -2312,13 +2312,13 @@ DROP TABLE firstmate_release_receipts;
 DROP TABLE firstmate_release_intents;
 DROP TABLE firstmate_approvals;
 DROP TABLE firstmate_attempts;
-DROP TABLE firstmate_assignments;
+DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments;
 DELETE FROM schema_migrations WHERE version > 34;
 `);
 
 		const migrated = await Store.open(f.path);
 		handles.push(migrated);
-		expect(migrated.schemaVersion).toBe(41);
+		expect(migrated.schemaVersion).toBe(40);
 		expect(migrated.work.laneJobJson(f.record.jobId)).toBe(JSON.stringify(f.record));
 		expect(() =>
 			f.raw.query("UPDATE lane_jobs SET updated_at = ? WHERE job_id = ?").run(END, f.record.jobId),
@@ -2381,7 +2381,7 @@ DROP TABLE firstmate_release_receipts;
 DROP TABLE firstmate_release_intents;
 DROP TABLE firstmate_approvals;
 DROP TABLE firstmate_attempts;
-DROP TABLE firstmate_assignments;
+DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments;
 DELETE FROM schema_migrations WHERE version >= 21;
 `);
 		const migrated = await Store.open(f.path);
@@ -2395,7 +2395,7 @@ DELETE FROM schema_migrations WHERE version >= 21;
 			originKey: f.runtime.sessionKey,
 			epoch: f.runtime.epoch,
 		});
-		expect(migrated.schemaVersion).toBe(41);
+		expect(migrated.schemaVersion).toBe(40);
 		expect(migrated.work.laneJobJson(f.runtime.jobId)).toBe(JSON.stringify(f.record));
 		const historical = { ...f.runtime, mode: "historical" as const, sendPhase: "uncertain" as const, parent: null };
 		migrated.transaction((tx) => prepareAttempt(migrated, tx, historical, f.record));
