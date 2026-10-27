@@ -2017,7 +2017,7 @@ export class WorkLaneManager {
 									epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
 									repo: worktreePath,
 									codingRegister: true,
-									...(input.model ?? this.#options.sessionModel
+									...((input.model ?? this.#options.sessionModel)
 										? { model: input.model ?? this.#options.sessionModel }
 										: {}),
 								});

@@ -159,7 +159,7 @@ test("native v36 to latest adds empty attribution and receipts without rewriting
 	await withDb(async (path, database, raw) => {
 		enqueue(database, "native36");
 		database.transaction((tx) => database.outbox.markInflight(tx, "native36"));
-		// Remove additive v38 then v37 tables (and their triggers): this is native journal36, not a draft FirstMate36 database.
+		// Remove the additive FirstMate tables (and their triggers) and rewind to v36: this is native journal36.
 		raw.exec(
 			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments; DELETE FROM schema_migrations WHERE version >= 37;",
 		);

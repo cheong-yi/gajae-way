@@ -413,7 +413,7 @@ ALTER TABLE monitor_slots ADD COLUMN event_id TEXT;`,
 			]) {
 				for (const action of ["UPDATE", "DELETE"])
 					host.database.execute(
-						`CREATE TRIGGER IF NOT EXISTS ${table}_immutable_${action.toLowerCase()} BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'immutable broker provenance'); END`,
+						`CREATE TRIGGER ${table}_immutable_${action.toLowerCase()} BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT, 'immutable broker provenance'); END`,
 					);
 			}
 			for (const [kind, table, column] of [

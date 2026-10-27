@@ -405,9 +405,7 @@ export class FirstmateStore {
 		return assignment;
 	}
 	abandoned(name: string): boolean {
-		return (
-			this.#db.prepare("SELECT lane_name FROM firstmate_abandonments WHERE lane_name = ?").get(name) !== null
-		);
+		return this.#db.prepare("SELECT lane_name FROM firstmate_abandonments WHERE lane_name = ?").get(name) !== null;
 	}
 	recordAbandonment(tx: WriteTx, name: string, reason: string, at: string): void {
 		firstmateAssert(this.assignment(name) !== undefined, "assignment_missing");

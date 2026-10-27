@@ -2014,24 +2014,24 @@ async function handleRequest(
 			return;
 		}
 		case "work.retire": {
-		if (workObject(request.params) && Object.hasOwn(request.params, "abandon")) {
-			const params = request.params as { abandon?: unknown };
-			const name = typeof params.abandon === "string" ? params.abandon.trim() : "";
-			if (!name) throw new ProtocolError("invalid_params", "abandon requires a lane name");
-			const assignment = options.database.work.firstmate.assignment(name);
-			if (!assignment) throw new ProtocolError("invalid_params", "unknown assignment");
-			const runtime = options.database.work.workAttemptGet(
-				options.database.work.firstmate.attemptsForTask(assignment.taskId).at(-1)?.opRef ?? "",
-			);
-			if (!runtime || runtime.settledAt === null)
-				throw new ProtocolError("invalid_params", "abandon requires a settled attempt");
-			options.database.transaction((tx) => {
-				options.database.work.firstmate.recordAbandonment(tx, name, "no_outcome", new Date().toISOString());
-			});
-			console.info(`firstmate_abandoned name=${name} reason=no_outcome`);
-			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { abandoned: true, name } });
-			return;
-		}
+			if (workObject(request.params) && Object.hasOwn(request.params, "abandon")) {
+				const params = request.params as { abandon?: unknown };
+				const name = typeof params.abandon === "string" ? params.abandon.trim() : "";
+				if (!name) throw new ProtocolError("invalid_params", "abandon requires a lane name");
+				const assignment = options.database.work.firstmate.assignment(name);
+				if (!assignment) throw new ProtocolError("invalid_params", "unknown assignment");
+				const runtime = options.database.work.workAttemptGet(
+					options.database.work.firstmate.attemptsForTask(assignment.taskId).at(-1)?.opRef ?? "",
+				);
+				if (!runtime || runtime.settledAt === null)
+					throw new ProtocolError("invalid_params", "abandon requires a settled attempt");
+				options.database.transaction((tx) => {
+					options.database.work.firstmate.recordAbandonment(tx, name, "no_outcome", new Date().toISOString());
+				});
+				console.info(`firstmate_abandoned name=${name} reason=no_outcome`);
+				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { abandoned: true, name } });
+				return;
+			}
 			if (workObject(request.params) && Object.hasOwn(request.params, "firstmate")) {
 				const result = await runtime.work.retireFirstmate(request.params as unknown as WorkFirstmateRetireParams);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
