@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 44;
+export const LATEST_SCHEMA_VERSION = 43;
 
 export interface MigrationHost {
 	readonly database: {
@@ -968,6 +968,28 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 					reason TEXT NOT NULL,
 					abandoned_at TEXT NOT NULL
 				);
+			CREATE TABLE IF NOT EXISTS firstmate_approvals (
+				approval_id TEXT PRIMARY KEY,
+				task_id TEXT NOT NULL REFERENCES firstmate_assignments(task_id),
+				op_ref TEXT NOT NULL REFERENCES firstmate_attempts(op_ref),
+				owner_id TEXT NOT NULL,
+				message_id TEXT NOT NULL,
+				record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+				UNIQUE(owner_id, message_id)
+			);
+			CREATE TABLE IF NOT EXISTS firstmate_release_intents (
+				release_id TEXT PRIMARY KEY,
+				approval_id TEXT NOT NULL REFERENCES firstmate_approvals(approval_id),
+				op_ref TEXT NOT NULL UNIQUE REFERENCES firstmate_attempts(op_ref),
+				owner_id TEXT NOT NULL,
+				message_id TEXT NOT NULL,
+				record_json TEXT NOT NULL CHECK(json_valid(record_json)),
+				UNIQUE(owner_id, message_id)
+			);
+			CREATE TABLE IF NOT EXISTS firstmate_release_receipts (
+				release_id TEXT PRIMARY KEY REFERENCES firstmate_release_intents(release_id),
+				record_json TEXT NOT NULL CHECK(json_valid(record_json))
+			);
 			`);
 			for (const table of ["firstmate_assignments", "firstmate_attempts"]) {
 				for (const action of ["UPDATE", "DELETE"]) {
@@ -976,38 +998,6 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 						BEGIN SELECT RAISE(ABORT, 'immutable FirstMate evidence'); END`);
 				}
 			}
-			host.database
-				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-				.run(43, new Date().toISOString());
-		});
-	}
-	if (current < 44) {
-		// Fresh policy receipts only: no historical approval inference or native replay.
-		host.withTransaction(() => {
-			host.database.execute(`
-				CREATE TABLE IF NOT EXISTS firstmate_approvals (
-					approval_id TEXT PRIMARY KEY,
-					task_id TEXT NOT NULL REFERENCES firstmate_assignments(task_id),
-					op_ref TEXT NOT NULL REFERENCES firstmate_attempts(op_ref),
-					owner_id TEXT NOT NULL,
-					message_id TEXT NOT NULL,
-					record_json TEXT NOT NULL CHECK(json_valid(record_json)),
-					UNIQUE(owner_id, message_id)
-				);
-				CREATE TABLE IF NOT EXISTS firstmate_release_intents (
-					release_id TEXT PRIMARY KEY,
-					approval_id TEXT NOT NULL REFERENCES firstmate_approvals(approval_id),
-					op_ref TEXT NOT NULL UNIQUE REFERENCES firstmate_attempts(op_ref),
-					owner_id TEXT NOT NULL,
-					message_id TEXT NOT NULL,
-					record_json TEXT NOT NULL CHECK(json_valid(record_json)),
-					UNIQUE(owner_id, message_id)
-				);
-				CREATE TABLE IF NOT EXISTS firstmate_release_receipts (
-					release_id TEXT PRIMARY KEY REFERENCES firstmate_release_intents(release_id),
-					record_json TEXT NOT NULL CHECK(json_valid(record_json))
-				);
-			`);
 			for (const table of ["firstmate_approvals", "firstmate_release_intents", "firstmate_release_receipts"]) {
 				for (const action of ["UPDATE", "DELETE"]) {
 					host.database.execute(`CREATE TRIGGER IF NOT EXISTS ${table}_immutable_${action.toLowerCase()}
@@ -1017,7 +1007,7 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			}
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-				.run(44, new Date().toISOString());
+				.run(43, new Date().toISOString());
 		});
 	}
 }

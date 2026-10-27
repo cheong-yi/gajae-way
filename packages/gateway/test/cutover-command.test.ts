@@ -169,6 +169,7 @@ test("administrative cutover refuses a non-latest schema without migrating it", 
 		DROP TABLE firstmate_release_intents;
 		DROP TABLE firstmate_approvals;
 		DROP TABLE firstmate_attempts;
+		DROP TABLE firstmate_abandonments;
 		DROP TABLE firstmate_assignments;
 		DELETE FROM schema_migrations WHERE version = ${LATEST_SCHEMA_VERSION};
 	`);
