@@ -60,7 +60,7 @@ test("cutover backs up, exports open work, then quarantines under one lease", as
 	const backupDb = await Store.openReadonly(backup);
 	try {
 		expect(backupDb.core.quickCheckDetail()).toBe("ok");
-		expect(backupDb.schemaVersion).toBe(41);
+		expect(backupDb.schemaVersion).toBe(40);
 	} finally {
 		backupDb.close();
 	}
@@ -169,7 +169,7 @@ test("administrative cutover refuses a non-latest schema without migrating it", 
 		DROP TABLE firstmate_release_intents;
 		DROP TABLE firstmate_approvals;
 		DROP TABLE firstmate_attempts;
-		DROP TABLE firstmate_assignments;
+		DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments;
 		DELETE FROM schema_migrations WHERE version > 38;
 	`);
 	raw.close();

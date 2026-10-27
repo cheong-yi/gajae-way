@@ -135,13 +135,13 @@ DROP TABLE firstmate_release_receipts;
 DROP TABLE firstmate_release_intents;
 DROP TABLE firstmate_approvals;
 DROP TABLE firstmate_attempts;
-DROP TABLE firstmate_assignments;
+DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments;
 DELETE FROM schema_migrations WHERE version >= 36;
 `);
 		database.close();
 		const migrated = await Store.open(path);
 		try {
-			expect(migrated.schemaVersion).toBe(41);
+			expect(migrated.schemaVersion).toBe(40);
 			expect(events(raw, "lane_job", "lanejob-6a")).toEqual(["baseline"]);
 			expect(events(raw, "attempt", "gw-j-abababababab")).toEqual(["baseline"]);
 			expect(events(raw, "delivery", "delivery-j")).toEqual(["baseline"]);
@@ -161,7 +161,7 @@ test("native v36 to latest adds empty attribution and receipts without rewriting
 		database.transaction((tx) => database.outbox.markInflight(tx, "native36"));
 		// Remove additive v38 then v37 tables (and their triggers): this is native journal36, not a draft FirstMate36 database.
 		raw.exec(
-			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_assignments; DELETE FROM schema_migrations WHERE version >= 37;",
+			"DROP TABLE firstmate_release_receipts; DROP TABLE firstmate_release_intents; DROP TABLE firstmate_approvals; DROP TABLE firstmate_attempts; DROP TABLE firstmate_abandonments; DROP TABLE firstmate_assignments; DELETE FROM schema_migrations WHERE version >= 37;",
 		);
 		expect(database.schemaVersion).toBe(36);
 		const journal = raw.query("SELECT * FROM work_journal ORDER BY seq").all();
