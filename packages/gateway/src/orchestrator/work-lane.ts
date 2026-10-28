@@ -2111,13 +2111,12 @@ export class WorkLaneManager {
 								binding = this.#assertCorrectionPredecessor(correction);
 								const session = await this.#port.inspect({ sessionId: binding.sessionId, repo: worktreePath });
 								firstmateAssert(
-									session?.sessionId === binding.sessionId &&
-										session.repo === worktreePath &&
-										session.live === true &&
-										session.deleted !== true,
+									session?.sessionId === binding.sessionId && session.repo === worktreePath && session.deleted !== true,
 									"correction_session_unavailable",
 								);
-								// Inspect proves existing native ownership; never bind/resume a correction.
+								// Resume only the existing owned session; never bind a replacement.
+								binding = this.#assertCorrectionPredecessor(correction);
+								if (!session.live) await this.#port.resume(binding);
 								binding = this.#assertCorrectionPredecessor(correction);
 							} else {
 								binding = await this.#port.bind({
