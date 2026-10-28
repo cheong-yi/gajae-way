@@ -17,6 +17,7 @@ import {
 	validateOriginRef,
 	type WorkApproveParams,
 	type WorkApproveDecisionParams,
+	type WorkCloseoutDecisionParams,
 	type WorkApproveResult,
 	type WorkDirective,
 	type WorkDirectiveResult,
@@ -1635,6 +1636,28 @@ export class WorkLaneManager {
 			decision: input.decision,
 			evidence,
 		} as WorkApproveParams);
+	}
+	/** Closes out the approval the owner's message already recorded. */
+	async closeoutFirstmateDecision(input: WorkCloseoutDecisionParams): Promise<WorkFirstmateRetireResult> {
+		const assignment = this.#db.work.firstmate.assignment(input.name);
+		const message = this.#db.inbox.decisionMessage(input.messageId);
+		const closeout = this.#db.inbox.decisionMessage(input.closeoutMessageId);
+		const approval = assignment ? this.#db.work.firstmate.approvalForMessage(assignment.ownerId, input.messageId) : undefined;
+		if (!assignment || !message || !closeout || closeout.authorId !== assignment.ownerId || message.authorId !== assignment.ownerId || !approval)
+			return { retired: false, held: true, reason: "release_approval_missing" };
+		return this.retireFirstmate({
+			firstmate: {
+				name: input.name,
+				identity: approval.identity,
+				ownerId: assignment.ownerId,
+				messageId: input.closeoutMessageId,
+				thread: assignment.thread,
+				mandateId: assignment.mandate.id,
+				scope: approval.scope,
+				approvalId: approval.approvalId,
+				action: "release_session_preserve_work",
+			},
+		});
 	}
 	/** Trusted local protocol composition; not Discord author ingress. */
 	async startFirstmate(assignment: FirstmateAssignment): Promise<WorkStartResult> {

@@ -1070,6 +1070,23 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					}
 					break;
 				}
+				if (command === "retire" && args[0] === "--decision") {
+					const [, name, messageId, closeoutMessageId] = args;
+					if (args.length !== 4 || !name || !messageId?.trim() || !closeoutMessageId?.trim()) throw new Error(usage);
+					const client = await connectGatewaySocket(parsed.socket, { requestTimeoutMs: 120_000 });
+					try {
+						const result = await client.request<WorkFirstmateRetireResult>("work.retire.decision", {
+							name,
+							messageId,
+							closeoutMessageId,
+						});
+						console.log(JSON.stringify(result));
+						if (!result.retired) process.exitCode = 1;
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (command === "approve" && args[0] === "--decision") {
 					const [, name, messageId, decision, ...rest] = args;
 					const scope = rest.join(" ").trim();

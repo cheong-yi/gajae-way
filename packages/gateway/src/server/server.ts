@@ -49,6 +49,7 @@ import {
 	WORK_JOBS_MAX_LIMIT,
 	type WorkApproveParams,
 	type WorkApproveDecisionParams,
+	type WorkCloseoutDecisionParams,
 	type WorkFirstmateAssignmentParams,
 	type WorkFirstmateCorrectionParams,
 	type WorkFirstmateRetireParams,
@@ -1957,6 +1958,16 @@ async function handleRequest(
 			)
 				invalidWorkWire("decision");
 			const result = await runtime.work.approveFirstmateDecision(params as WorkApproveDecisionParams);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "work.retire.decision": {
+			const params = request.params;
+			const fields = ["name", "messageId", "closeoutMessageId"];
+			if (!workObject(params) || Object.keys(params).some((key) => !fields.includes(key)) || fields.some((key) => !workString(params[key])))
+				invalidWorkWire("closeout");
+			const result = await runtime.work.closeoutFirstmateDecision(params as WorkCloseoutDecisionParams);
+			if (result.retired) await closeFirstmatePane(runtime, options.database, (params as WorkCloseoutDecisionParams).name);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
