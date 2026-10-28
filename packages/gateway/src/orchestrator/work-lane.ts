@@ -1628,7 +1628,7 @@ export class WorkLaneManager {
 			name: input.name,
 			identity,
 			ownerId: assignment.ownerId,
-			messageId: message.messageId,
+			messageId: input.messageId,
 			thread: assignment.thread,
 			mandateId: assignment.mandate.id,
 			scope,
