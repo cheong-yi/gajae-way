@@ -230,6 +230,18 @@ describe("cli arguments", () => {
 	test("resolves home and socket override", () => {
 		expect(socketPath("/tmp/gajae")).toBe("/tmp/gajae/gateway.sock");
 		expect(parseArgs(["--socket", "/tmp/x", "status"])).toEqual({ command: "status", rest: [], socket: "/tmp/x" });
+		const previousSocket = process.env.GAJAEWAY_SOCKET;
+		const previousPath = process.env.GAJAEWAY_SOCKET_PATH;
+		process.env.GAJAEWAY_SOCKET = "/from-socket";
+		delete process.env.GAJAEWAY_SOCKET_PATH;
+		expect(parseArgs(["status"]).socket).toBe("/from-socket");
+		delete process.env.GAJAEWAY_SOCKET;
+		process.env.GAJAEWAY_SOCKET_PATH = "/from-path";
+		expect(parseArgs(["status"]).socket).toBe("/from-path");
+		if (previousSocket === undefined) delete process.env.GAJAEWAY_SOCKET;
+		else process.env.GAJAEWAY_SOCKET = previousSocket;
+		if (previousPath === undefined) delete process.env.GAJAEWAY_SOCKET_PATH;
+		else process.env.GAJAEWAY_SOCKET_PATH = previousPath;
 	});
 
 	test("--version prints the package version without requiring a gateway", async () => {

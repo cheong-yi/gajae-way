@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { type OriginRef, originKey, type WorkFirstmateAssignmentParams } from "@gajae-gateway/protocol";
 import { GajaewayClient } from "../../sdk/src/client";
 import type { GatewayConfig } from "../src/config";
-import { readChildPane, readLanePane } from "../src/orchestrator/firstmate-pane";
+import { paneClosed, readChildPane, readLanePane } from "../src/orchestrator/firstmate-pane";
 import * as ghChecks from "../src/orchestrator/gh-checks";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
@@ -16,7 +16,7 @@ async function until(predicate: () => boolean) {
 	expect(predicate()).toBe(true);
 }
 
-test("pane wire records gateway creation, kicks off the child persona with one kickoff inbound, keeps it across restart, and closes it on retirement and abandonment", async () => {
+test("pane wire records gateway creation, kicks off the child persona once, and keeps that persona closed after retirement", async () => {
 	const directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-pane-wire-")));
 	const repo = join(directory, "repo");
 	await mkdir(repo);
@@ -281,35 +281,19 @@ test("pane wire records gateway creation, kicks off the child persona with one k
 		// Retirement closed the child's ordinary persona session and unbound it.
 		expect(port.closes.filter((close) => close.sessionId === childSessionId)).toHaveLength(1);
 		expect(db.bindings.getSessionRecord(originKey(child))?.sessionId).toBeFalsy();
-		// A later child conversation binds normally; abandonment also waits for its active turn.
-		heldChildOpRef = undefined;
-		holdChildTurn = true;
-		expect((await send("hold-before-abandon")).engaged).toBe(true);
-		await until(() => heldChildOpRef !== undefined);
-		const reboundSessionId = db.bindings.getSessionRecord(originKey(child))?.sessionId;
-		expect(reboundSessionId).toBeTruthy();
-		expect(reboundSessionId).not.toBe(childSessionId);
-		let abandonReturned = false;
-		const abandoning = client.request("work.retire", { abandon: assignment.name }).then((result) => {
-			abandonReturned = true;
-			return result;
-		});
-		await Bun.sleep(100);
-		expect(abandonReturned).toBe(false);
-		expect(port.closes.filter((close) => close.sessionId === reboundSessionId)).toHaveLength(0);
-		port.complete(heldChildOpRef!, "[SILENT]");
-		expect(await abandoning).toEqual({ abandoned: true, name: assignment.name });
-		expect(port.closes.filter((close) => close.sessionId === reboundSessionId)).toHaveLength(1);
+		expect(paneClosed(db, child)).toBe(true);
+		// A message after close does not start another persona.
+		expect((await send("after-retire")).engaged).toBe(false);
 		expect(db.bindings.getSessionRecord(originKey(child))?.sessionId).toBeFalsy();
-		// A missing child session succeeds without a second close.
-		expect(
-			await client.request<{ abandoned: boolean; name: string }>("work.retire", { abandon: assignment.name }),
-		).toEqual({ abandoned: true, name: assignment.name });
+		expect(childTurns()).toBe(5);
+		// Abandonment of an already closed pane succeeds and still does not rebind.
+		expect(await client.request("work.retire", { abandon: assignment.name })).toEqual({
+			abandoned: true,
+			name: assignment.name,
+		});
+		expect((await send("after-abandon")).engaged).toBe(false);
+		expect(db.bindings.getSessionRecord(originKey(child))?.sessionId).toBeFalsy();
 		expect(port.closes.filter((close) => close.sessionId === childSessionId)).toHaveLength(1);
-		expect(port.closes.filter((close) => close.sessionId === reboundSessionId)).toHaveLength(1);
-		// A pane with damaged provenance still fails closed.
-		db.core.metaSet(`firstmate-pane/child/${originKey(child)}`, "corrupt");
-		expect((await send("after-corruption")).engaged).toBe(false);
 		expect(childTurns()).toBe(5);
 		expect(port.steers).toHaveLength(0);
 	} finally {

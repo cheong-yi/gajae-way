@@ -30,7 +30,7 @@ import type {
 	WorkStatusResult,
 	WorkSteerResult,
 } from "@gajae-gateway/protocol";
-import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
+import { LOOPBACK_ORIGIN, OPS_CYCLE_MAX_LIMIT, originKey, ProtocolError, WORK_JOBS_MAX_LIMIT } from "@gajae-gateway/protocol";
 
 import { GajaewayClient } from "@gajae-gateway/sdk";
 import pkg from "../package.json";
@@ -114,7 +114,7 @@ export function usageFor(command: string | undefined): string | undefined {
 }
 
 export function parseArgs(args: string[]): { command?: string; rest: string[]; socket: string } {
-	let socket = process.env.GAJAEWAY_SOCKET_PATH ?? socketPath();
+	let socket = process.env.GAJAEWAY_SOCKET ?? process.env.GAJAEWAY_SOCKET_PATH ?? socketPath();
 	const rest: string[] = [];
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] === "--socket") socket = args[++i] ?? socket;
@@ -1047,6 +1047,13 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					}
 					break;
 				}
+				const refusal = (error: unknown): never => {
+					if (error instanceof ProtocolError && error.detail && typeof error.detail === "object") {
+						const reason = (error.detail as { reason?: unknown }).reason;
+						if (typeof reason === "string" && reason.length > 0) throw new Error(`${error.message}: ${reason}`);
+					}
+					throw error;
+				};
 				if (command === "retire" && args.includes("--firstmate")) {
 					const [flag, file] = args;
 					if (args.length !== 2 || flag !== "--firstmate" || !file?.trim() || file.startsWith("--"))
@@ -1103,6 +1110,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 						const result = await client.workStart(params);
 						console.log(JSON.stringify(result));
 						if (!result.started) process.exitCode = 1;
+					} catch (error) {
+						refusal(error);
 					} finally {
 						await client.close();
 					}

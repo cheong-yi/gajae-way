@@ -98,6 +98,8 @@ import { DEFAULT_SLO_DAYS, evaluateSlo, type SloRecorder } from "../ops/slo";
 import type { GlobalGjcClient } from "../orchestrator/broker";
 import {
 	lanePaneRecorded,
+	markPaneClosed,
+	paneClosed,
 	paneDeliveryGuard,
 	paneOriginRecorded,
 	readChildPane,
@@ -1113,6 +1115,15 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		busyStallMs: options.config.sessions?.busyStallMs,
 		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
+		paneClosed: (key) => {
+			const raw = options.database.bindings.getSessionRecord(key)?.originRefJson;
+			if (!raw) return false;
+			try {
+				return paneClosed(options.database, JSON.parse(raw) as OriginRef);
+			} catch {
+				return false;
+			}
+		},
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
@@ -2811,7 +2822,10 @@ export function firstmateChildNotice(store: Store, origin: OriginRef): string | 
 
 async function closeFirstmatePane(runtime: Runtime, store: Store, name: string): Promise<void> {
 	const pane = readLanePane(store, name);
-	if (pane) await runtime.personaSessions.close(originKey(pane.childOrigin));
+	if (!pane) return;
+	// Record the close before unbinding, so a message that arrives during close is already refused.
+	markPaneClosed(store, pane);
+	await runtime.personaSessions.close(originKey(pane.childOrigin));
 }
 
 /** A timed-out creation is held, never silently repeated against Discord. */
@@ -2949,6 +2963,15 @@ async function sendChat(
 		throw new ProtocolError("invalid_params", "chat.send requires a valid origin");
 	}
 	const key = originKey(origin);
+	if (origin.kind === "thread" && paneClosed(options.database, origin)) {
+		connection.write({
+			v: PROFILE_VERSION,
+			type: "response",
+			id: request.id,
+			result: { turnId: null, engaged: false },
+		});
+		return;
+	}
 	// A recorded pane with damaged provenance has no owner to answer for it: fail closed.
 	if (
 		origin.kind === "thread" &&
