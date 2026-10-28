@@ -181,7 +181,13 @@ export class FirstmateStore {
 		);
 	}
 
+	allowClosedDecision(binding: FirstmateDecisionBinding): boolean {
+		const row = this.#bindings.getSessionRecord(`work/task/${binding.name}`);
+		return !row?.sessionId && row?.epoch === binding.identity.epoch;
+	}
+
 	#assertLiveBinding(binding: FirstmateDecisionBinding): void {
+		if (this.allowClosedDecision(binding)) return;
 		const row = this.#bindings.getSessionRecord(`work/task/${binding.name}`);
 		firstmateAssert(
 			row?.sessionId === binding.identity.sessionId && row.epoch === binding.identity.epoch,
