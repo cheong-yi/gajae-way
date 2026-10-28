@@ -46,6 +46,7 @@ import {
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
 	type WorkApproveParams,
+	type WorkApproveDecisionParams,
 	type WorkFirstmateAssignmentParams,
 	type WorkFirstmateCorrectionParams,
 	type WorkFirstmateRetireParams,
@@ -1938,6 +1939,20 @@ async function handleRequest(
 			// The manager validates the exact explicit envelope and returns held on
 			// invalid authority/evidence. Never infer identity or recover execution here.
 			const result = await runtime.work.approveFirstmate(request.params as WorkApproveParams);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "work.approve.decision": {
+			const params = request.params;
+			const fields = ["name", "ownerId", "messageId", "decision", "scope"];
+			if (
+				!workObject(params) ||
+				Object.keys(params).some((key) => !fields.includes(key)) ||
+				fields.some((key) => !workString(params[key])) ||
+				(params.decision !== "accept_outcome" && params.decision !== "acknowledge_unavailable")
+			)
+				invalidWorkWire("decision");
+			const result = await runtime.work.approveFirstmateDecision(params as WorkApproveDecisionParams);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
