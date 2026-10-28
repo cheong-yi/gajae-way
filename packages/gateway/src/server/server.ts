@@ -99,6 +99,7 @@ import {
 	paneDeliveryGuard,
 	paneOriginRecorded,
 	readChildPane,
+	readLanePane,
 	saveChildPane,
 } from "../orchestrator/firstmate-pane";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
@@ -1899,7 +1900,7 @@ async function handleRequest(
 				assertFirstmateWire(params.firstmate);
 				const existed = options.database.work.firstmate.assignment(params.firstmate.name) !== undefined;
 				const result = await runtime.work.startFirstmate(params.firstmate);
-				if (result.started && !existed) await openFirstmatePane(runtime, options.database, params.firstmate);
+				if (result.started && !existed) await openFirstmatePane(runtime, options, params.firstmate);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 				return;
 			}
@@ -2055,12 +2056,15 @@ async function handleRequest(
 				const result = await runtime.work.abandonFirstmate(name);
 				if (!result.abandoned)
 					throw new ProtocolError("verb_failed", result.reason, { reasonCode: "firstmate_abandon_held" });
+				await closeFirstmatePane(runtime, options.database, name);
 				console.info(`firstmate_abandoned name=${name} reason=no_outcome`);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 				return;
 			}
 			if (workObject(request.params) && Object.hasOwn(request.params, "firstmate")) {
-				const result = await runtime.work.retireFirstmate(request.params as unknown as WorkFirstmateRetireParams);
+				const params = request.params as unknown as WorkFirstmateRetireParams;
+				const result = await runtime.work.retireFirstmate(params);
+				if (result.retired) await closeFirstmatePane(runtime, options.database, params.firstmate.name);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 				return;
 			}
@@ -2793,12 +2797,18 @@ export function firstmateChildNotice(store: Store, origin: OriginRef): string | 
 	].join("\n");
 }
 
+async function closeFirstmatePane(runtime: Runtime, store: Store, name: string): Promise<void> {
+	const pane = readLanePane(store, name);
+	if (pane) await runtime.personaSessions.close(originKey(pane.childOrigin));
+}
+
 /** A timed-out creation is held, never silently repeated against Discord. */
 async function openFirstmatePane(
 	runtime: Runtime,
-	store: Store,
+	options: GatewayServerOptions,
 	assignment: WorkFirstmateAssignmentParams,
 ): Promise<void> {
+	const store = options.database;
 	if (assignment.thread.platform !== "discord" || !["channel", "thread"].includes(assignment.thread.kind)) return;
 	if (lanePaneRecorded(store, assignment.name)) return;
 	const adapter = [...runtime.connections].find(
@@ -2843,6 +2853,30 @@ async function openFirstmatePane(
 			createdByGateway: store.instanceId,
 		});
 		store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "recorded" }));
+		// Use ordinary inbound admission, not an adapter post or a second session path.
+		await sendChat(
+			{
+				decoder: new FrameDecoder(),
+				negotiated: false,
+				write: () => {},
+				close: () => {},
+				settle: async () => {},
+			},
+			{
+				v: PROFILE_VERSION,
+				type: "request",
+				id: `firstmate-pane-kickoff:${assignment.name}`,
+				verb: "chat.send",
+				params: {
+					origin: childOrigin,
+					messageId: `firstmate-pane-kickoff:${assignment.name}`,
+					text: `The pane for FirstMate lane \`${assignment.name}\` is open.`,
+					engagement: { mentioned: false, group: true, authorId: assignment.ownerId },
+				},
+			},
+			options,
+			runtime,
+		);
 	} catch (error) {
 		// Pane failure never tears down or relaunches its headless lane.
 		console.error(`firstmate_pane_unavailable name=${assignment.name} reason=${diagnostic(error)}`);

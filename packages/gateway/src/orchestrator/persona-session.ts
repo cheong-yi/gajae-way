@@ -1012,6 +1012,21 @@ export class PersonaSessionManager {
 		return this.#actors.get(originKey)?.state ?? "idle";
 	}
 
+	/** Close only after accepted turns settle, with admission fenced in the origin mailbox. */
+	async close(originKey: string): Promise<void> {
+		const actor = this.#actor(originKey);
+		await actor.enqueue(async () => actor.beginClose());
+		try {
+			while (!this.#stopped) {
+				if (await actor.enqueue(async () => await actor.closeWhenIdle())) return;
+				await Bun.sleep(10);
+			}
+			throw new Error("persona manager stopped before session close");
+		} finally {
+			await actor.enqueue(async () => actor.endClose());
+		}
+	}
+
 	async stop(): Promise<void> {
 		this.#stopped = true;
 		await Promise.all([...this.#actors.values()].map((actor) => actor.stop()));
@@ -1354,6 +1369,7 @@ class OriginActor {
 	readonly #loggedCappedFailedTurnSessions = new Set<string>();
 	readonly #personaPreamble = new Map<string, PersonaPreambleState>();
 	#stopped = false;
+	#closing = 0;
 	readonly #deliveredEvents = new Set<string>();
 	#recoveryScanned = false;
 	/** The session whose host this origin counts as holding; cleared when that host is ended. */
@@ -1538,7 +1554,7 @@ class OriginActor {
 	 * origin sends it as the next turn. No window, no coalescing.
 	 */
 	async admit(): Promise<void> {
-		if (this.#manager.draining || this.#manager.restartDrainActive) return;
+		if (this.#closing || this.#manager.draining || this.#manager.restartDrainActive) return;
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
@@ -2205,6 +2221,34 @@ class OriginActor {
 		return this.#current !== undefined || this.#retired.size > 0;
 	}
 
+	beginClose(): void {
+		this.#closing++;
+	}
+
+	endClose(): void {
+		this.#closing--;
+	}
+
+	async closeWhenIdle(): Promise<boolean> {
+		if (!this.#recoveryScanned) await this.recover();
+		if (await this.drain()) return false;
+		await this.sweepObserver(this.#manager.now());
+		if (this.#observer?.active) return false;
+		const database = this.#manager.database;
+		const sessionId = database.bindings.getSessionRecord(this.originKey)?.sessionId;
+		if (!sessionId) return true;
+		try {
+			await this.#manager.port.close({ sessionId, repo: this.#manager.repo });
+		} catch (error) {
+			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
+		}
+		await this.#closeObserver("session_closed");
+		database.transaction((tx) => database.bindings.rotateEpoch(tx, this.originKey));
+		this.#hostSessionId = undefined;
+		this.#manager.hostFreed();
+		return true;
+	}
+
 	async logShutdownHold(): Promise<void> {
 		if (this.#current)
 			this.#manager.log(
@@ -2354,6 +2398,7 @@ class OriginActor {
 
 	async #dispatchNext(): Promise<void> {
 		if (
+			this.#closing ||
 			this.#manager.draining ||
 			this.#manager.restartDrainActive ||
 			this.#state !== "idle" ||
@@ -3011,6 +3056,7 @@ class OriginActor {
 	async #steerPending(): Promise<void> {
 		const current = this.#current;
 		if (
+			this.#closing ||
 			this.#manager.draining ||
 			this.#manager.restartDrainActive ||
 			this.#modelRefusalPaused ||
