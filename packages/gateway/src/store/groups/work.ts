@@ -626,12 +626,19 @@ export class FirstmateStore {
 									...native,
 									state: "running",
 									attempts: record.attempts,
+									sessions: record.sessions,
 									updatedAt: runtime.startedAt,
 								}),
 							),
 						),
 					"correction_native_history_changed",
 				);
+				const current = this.#bindings.getSessionRecord(`work/task/${assignment.name}`);
+				const continuedAfterClose =
+					current?.sessionId === runtime.sessionId &&
+					current.epoch === runtime.epoch &&
+					current.sessionId !== previous.sessionId &&
+					current.epoch > previous.epoch;
 				firstmateAssert(
 					priorRuntime?.opRef === cause.priorOpRef &&
 						priorRuntime.jobId === runtime.jobId &&
@@ -645,8 +652,8 @@ export class FirstmateStore {
 						priorRuntime.settledAt === prior.endedAt &&
 						workAccepted(priorRuntime) &&
 						priorRuntime.terminal?.reasonCode === "end_turn" &&
-						runtime.sessionId === previous.sessionId &&
-						runtime.epoch === previous.epoch,
+						(continuedAfterClose ||
+							(runtime.sessionId === previous.sessionId && runtime.epoch === previous.epoch)),
 					"correction_predecessor_mismatch",
 				);
 			}
