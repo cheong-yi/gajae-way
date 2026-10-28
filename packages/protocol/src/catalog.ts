@@ -902,6 +902,12 @@ export interface WorkApproveDecisionParams {
 	readonly decision: "accept_outcome" | "acknowledge_unavailable";
 	readonly scope: string;
 }
+/** Closeout decision only. The gateway fills the release from the approval this message recorded. */
+export interface WorkCloseoutDecisionParams {
+	readonly name: string;
+	readonly messageId: string;
+	readonly closeoutMessageId: string;
+}
 /**
  * Separate downstream preserving action. Runtime must resolve approvalId to a current
  * FirstmateOutcomeApproval with this exact identity and authority, and check obligations.
@@ -1585,6 +1591,7 @@ export interface VerbCatalogV01 {
 	"work.inspect": { params: WorkInspectParams; result: WorkInspectResult };
 	"work.approve": { params: WorkApproveParams; result: WorkApproveResult };
 	"work.approve.decision": { params: WorkApproveDecisionParams; result: WorkApproveResult };
+	"work.retire.decision": { params: WorkCloseoutDecisionParams; result: WorkFirstmateRetireResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };

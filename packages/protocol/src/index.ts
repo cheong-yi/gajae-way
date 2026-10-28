@@ -94,6 +94,7 @@ export {
 	WORK_JOBS_MAX_LIMIT,
 	type WorkApproveParams,
 	type WorkApproveDecisionParams,
+	type WorkCloseoutDecisionParams,
 	type WorkApproveResult,
 	type WorkDirective,
 	type WorkDirectiveParams,
