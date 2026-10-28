@@ -1070,6 +1070,35 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					}
 					break;
 				}
+				if (command === "approve" && args[0] === "--decision") {
+					const [, name, ownerId, messageId, decision, ...rest] = args;
+					const scope = rest.join(" ").trim();
+					if (
+						args.length < 6 ||
+						!name ||
+						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
+						!ownerId?.trim() ||
+						!messageId?.trim() ||
+						(decision !== "accept" && decision !== "acknowledge") ||
+						!scope
+					)
+						throw new Error(usage);
+					const client = await connectGatewaySocket(parsed.socket);
+					try {
+						const result = await client.request<WorkApproveResult>("work.approve.decision", {
+							name,
+							ownerId,
+							messageId,
+							decision: decision === "accept" ? "accept_outcome" : "acknowledge_unavailable",
+							scope,
+						});
+						console.log(JSON.stringify(result));
+						if (!result.recorded) process.exitCode = 1;
+					} finally {
+						await client.close();
+					}
+					break;
+				}
 				if (command === "approve") {
 					const [flag, file] = args;
 					if (args.length !== 2 || flag !== "--firstmate" || !file?.trim() || file.startsWith("--"))

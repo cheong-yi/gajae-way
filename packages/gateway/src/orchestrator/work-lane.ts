@@ -16,6 +16,7 @@ import {
 	parseOriginKey,
 	validateOriginRef,
 	type WorkApproveParams,
+	type WorkApproveDecisionParams,
 	type WorkApproveResult,
 	type WorkDirective,
 	type WorkDirectiveResult,
@@ -107,6 +108,7 @@ const owners = new WeakSet<Store>();
 
 /** Internal trusted-local observation only. Select an immutable task and exact operation, never latest. */
 export interface FirstmateInspectionInput {
+	readonly allowClosed?: boolean;
 	readonly name: string;
 	readonly taskId: string;
 	readonly opRef: string;
@@ -1031,7 +1033,9 @@ export class WorkLaneManager {
 			)
 				return unavailable("attempt_attribution_changed");
 			const binding = this.#db.bindings.getSessionRecord(sessionKey);
+			const closed = input.allowClosed && !binding?.sessionId;
 			if (
+				!closed &&
 				!release &&
 				binding &&
 				(binding.epoch !== runtime.epoch || (binding.sessionId && binding.sessionId !== runtime.sessionId))
@@ -1588,6 +1592,45 @@ export class WorkLaneManager {
 				),
 			};
 		}
+	}
+	/** Binds an owner decision to the one latest settled attempt. Two settled tails are a refusal. */
+	async approveFirstmateDecision(input: WorkApproveDecisionParams): Promise<WorkApproveResult> {
+		const assignment = this.#db.work.firstmate.assignment(input.name);
+		if (!assignment || assignment.ownerId !== input.ownerId)
+			return { recorded: false, held: true, reason: "approval_authority_mismatch" };
+		const settled = this.#db.work.firstmate
+			.attemptsForTask(assignment.taskId)
+			.filter((attempt) => this.#db.work.workAttemptGet(attempt.opRef)?.settledAt);
+		const latest = settled.at(-1);
+		if (!latest || settled.length !== latest.ordinal + 1)
+			return { recorded: false, held: true, reason: "approval_target_ambiguous" };
+		const observed = await this.inspectFirstmate({
+			allowClosed: true,
+			name: input.name,
+			taskId: assignment.taskId,
+			opRef: latest.opRef,
+		});
+		if (!observed.identity) return { recorded: false, held: true, reason: observed.reasons.at(-1) ?? "approval_target_unavailable" };
+		const { sessionKey: _key, ...identity } = observed.identity;
+		const evidence =
+			observed.evidence.completeness === "unavailable"
+				? { completeness: "unavailable" as const, reasons: observed.reasons }
+				: { ...observed.evidence, reasons: observed.reasons };
+		if (input.decision === "accept_outcome" && evidence.completeness === "unavailable")
+			return { recorded: false, held: true, reason: "approval_evidence_unsupported" };
+		if (input.decision === "acknowledge_unavailable" && evidence.completeness !== "unavailable")
+			return { recorded: false, held: true, reason: "approval_evidence_unsupported" };
+		return this.approveFirstmate({
+			name: input.name,
+			identity,
+			ownerId: input.ownerId,
+			messageId: input.messageId,
+			thread: assignment.thread,
+			mandateId: assignment.mandate.id,
+			scope: input.scope,
+			decision: input.decision,
+			evidence,
+		} as WorkApproveParams);
 	}
 	/** Trusted local protocol composition; not Discord author ingress. */
 	async startFirstmate(assignment: FirstmateAssignment): Promise<WorkStartResult> {
