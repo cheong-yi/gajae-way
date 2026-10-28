@@ -1950,18 +1950,15 @@ test("FirstMate correction refuses changed binding, worktree and native ownershi
 	}
 });
 
-test("FirstMate correction refuses unavailable native session without bind resume or prepare", async () => {
+test("FirstMate correction resumes inactive sessions and refuses unavailable sessions", async () => {
 	const f = await firstmateFixture();
 	const original = await f.manager.startFirstmate(f.assignment);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const job = f.job();
-	for (const patch of [
-		{ live: false, deleted: false, repo: f.assignment.worktree.path },
-		{ live: true, deleted: true, repo: f.assignment.worktree.path },
-		{ live: true, deleted: false, repo: f.directory },
-	]) {
-		f.port.setSessionState(original.sessionId, patch);
+	const input = correctionInput(f, original.opRef);
+	// Refusals run first so the shared fixture is still pristine when the admitted case runs.
+	const refuse = async () => {
 		const spies = [
 			spyOn(f.port, "bind"),
 			spyOn(f.port, "resume"),
@@ -1970,7 +1967,7 @@ test("FirstMate correction refuses unavailable native session without bind resum
 			spyOn(f.manager, "recover"),
 		];
 		try {
-			await expect(f.manager.startFirstmateCorrection(correctionInput(f, original.opRef))).rejects.toMatchObject({
+			await expect(f.manager.startFirstmateCorrection(input)).rejects.toMatchObject({
 				detail: { reason: "correction_session_unavailable" },
 			});
 			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
@@ -1979,7 +1976,40 @@ test("FirstMate correction refuses unavailable native session without bind resum
 		} finally {
 			for (const spy of spies) spy.mockRestore();
 		}
+	};
+	const missing = spyOn(f.port, "inspect").mockImplementation(async () => undefined);
+	try {
+		await refuse();
+	} finally {
+		missing.mockRestore();
 	}
+	f.port.setSessionState(original.sessionId, { live: true, deleted: true, repo: f.assignment.worktree.path });
+	await refuse();
+	f.port.setSessionState(original.sessionId, { live: true, deleted: false, repo: f.directory });
+	await refuse();
+	// Present, same repository, not deleted, merely inactive: admitted on the bound session.
+	f.port.setSessionState(original.sessionId, { live: false, deleted: false, repo: f.assignment.worktree.path });
+	const assignments = f.db.core.groupDb("work").prepare("SELECT * FROM firstmate_assignments ORDER BY task_id").all();
+	const binds = f.port.binds.length;
+	const resumes = f.port.resumes.length;
+	const admitted = await f.manager.startFirstmateCorrection(input);
+	expect(admitted.started).toBe(true);
+	if (!admitted.started) throw new Error("unexpected correction hold");
+	expect(admitted.sessionId).toBe(original.sessionId);
+	expect(admitted.jobId).toBe(original.jobId);
+	expect(admitted.opRef).not.toBe(original.opRef);
+	expect(f.port.binds).toHaveLength(binds);
+	expect(f.port.resumes).toHaveLength(resumes + 1);
+	expect(f.port.resumes.at(-1)).toMatchObject({
+		sessionId: original.sessionId,
+		originKey: original.sessionKey,
+		repo: f.assignment.worktree.path,
+	});
+	expect(f.db.core.groupDb("work").prepare("SELECT * FROM firstmate_assignments ORDER BY task_id").all()).toEqual(
+		assignments,
+	);
+	expect(f.owner.assignment("a")).toEqual(f.assignment);
+	expect(f.job().attempts.at(-1)).toMatchObject({ opRef: admitted.opRef, sessionId: original.sessionId });
 });
 
 test("FirstMate lost correction acceptance holds exact duplicate and cannot be bypassed by a new message", async () => {
