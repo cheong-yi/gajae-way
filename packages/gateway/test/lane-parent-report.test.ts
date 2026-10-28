@@ -1,9 +1,9 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eventTypeOrigin, monitorSessionOrigin, type OriginRef, originKey } from "@gajae-gateway/protocol";
+import { eventTypeOrigin, monitorSessionOrigin, type OriginRef, originKey, type WorkFirstmateAssignmentParams } from "@gajae-gateway/protocol";
 import { maybeCreateThreadOnMention, settleDiscordDelivery, UnnamedThreads } from "../../adapter-discord/src/main";
 import { discordMessageOrigin } from "../../adapter-discord/src/origin";
 import type { GatewayConfig } from "../src/config";
@@ -316,6 +316,98 @@ test("settled persona wakes for a lane report while a running persona receives o
 	);
 	expect(chatMessages(f).map((frame) => frame.payload.text)).toEqual(["The lane found the answer."]);
 });
+test("settled FirstMate lane routes its complete finding as an inbound lane_report wake while the outcome status notice stays a status delivery", async () => {
+	const origin: OriginRef = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "firstmate-thread",
+		parentId: "parent-channel",
+	};
+	const f = await fixture({
+		ownerTarget: origin,
+		channels: { "parent-channel": { engagement: "open", audience: "all" } },
+	});
+	const repo = join(f.home, "repo");
+	await mkdir(repo);
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "fixture",
+				GIT_AUTHOR_EMAIL: "fixture@example.test",
+				GIT_COMMITTER_NAME: "fixture",
+				GIT_COMMITTER_EMAIL: "fixture@example.test",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (result.exitCode) throw new Error(result.stderr.toString());
+		return result.stdout.toString().trim();
+	};
+	git("init", "-q");
+	git("commit", "--allow-empty", "-qm", "fixture");
+	const worktreePath = join(f.home, "assigned");
+	git("worktree", "add", "-qb", "firstmate/fmreport", worktreePath);
+	const assignment: WorkFirstmateAssignmentParams = {
+		taskId: "fmreport-task",
+		name: "fmreport",
+		ownerId: "owner",
+		messageId: "assignment",
+		thread: origin,
+		mandate: { id: "mandate", text: "Trace the reported failure", checkRetries: false, commit: false, push: false },
+		worktree: {
+			path: worktreePath,
+			commonDir: await realpath(git("-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+			gitDir: await realpath(git("-C", worktreePath, "rev-parse", "--absolute-git-dir")),
+			branch: "firstmate/fmreport",
+		},
+	};
+	// The parent persona settles its first turn before the FirstMate lane reports.
+	const persona = await startPersonaTurn(f, origin, "firstmate-parent-trigger");
+	await silencePersona(f, persona.opRef);
+	const start = await f.client.request("work.start", { firstmate: assignment });
+	expect(start.error).toBeUndefined();
+	expect(start.result.started).toBe(true);
+	const finding = "FM-FINDING chunked surrogate pairs dropped at the flush boundary";
+	await settleLane(f, start.result.opRef, finding);
+	// The retained FirstMate outcome status delivery still reaches the parent thread.
+	await eventually(
+		() => chatMessages(f),
+		(messages) => messages.some((frame) => frame.payload.text.includes("[FirstMate fmreport]")),
+		"firstmate outcome status delivery",
+	);
+	// The complete finding arrives as the inbound lane_report wake, never as the status notice body.
+	const sends = await eventually(
+		() => f.port.sends.filter((send) => send.sessionId === persona.sessionId),
+		(items) => items.length === 2,
+		"firstmate lane_report wake",
+	);
+	expect(sends[1]!.text).toContain(finding);
+	expect(sends[1]!.text).not.toContain("[FirstMate fmreport]");
+	expect(sends[1]!.opRef).not.toBe(persona.opRef);
+	const reportId = f.database.work.workAttemptGet(start.result.opRef)!.reportId;
+	const reportRow = await eventually(
+		() => f.database.inbox.turnRows(sends[1]!.opRef),
+		(rows) => rows.some((row) => row.message_id === reportId && row.source === "lane_report"),
+		"firstmate lane_report inbound row",
+	);
+	expect(reportRow.find((row) => row.message_id === reportId)).toMatchObject({ source: "lane_report" });
+	const findingRow = reportRow.find((row) => row.message_id === reportId)!;
+	expect(findingRow.body).toContain(finding);
+	expect(findingRow.body).not.toContain("[FirstMate fmreport]");
+	// The lane itself never posts the finding; only the persona relay may.
+	expect(chatMessages(f).some((frame) => frame.payload.text.includes(finding))).toBe(false);
+	const relay = `Verified finding: ${finding}`;
+	f.port.complete(sends[1]!.opRef, relay);
+	await eventually(
+		() => chatMessages(f),
+		(messages) => messages.some((frame) => frame.payload.text === relay),
+		"persona-authored relay of the finding",
+	);
+	expect(chatMessages(f).filter((frame) => frame.payload.text.includes(finding))).toMatchObject([
+		{ payload: { text: relay, origin } },
+	]);
+}, 20_000);
 
 test("AC-C idle persona is woken with one send carrying the internal lane report", async () => {
 	const f = await fixture();

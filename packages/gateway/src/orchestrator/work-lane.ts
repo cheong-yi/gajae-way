@@ -519,15 +519,6 @@ export class WorkLaneManager {
 					true,
 					paneDeliveryGuard(this.#db, assignment.thread),
 				)!;
-				if (patch.decision === "report") {
-					workAssert(admission?.kind === "persona");
-					admission = {
-						...admission,
-						row: { ...admission.row, body: text },
-						fallbackPayload: outcome,
-						holdReason: "firstmate_outcome",
-					};
-				}
 			}
 			const checks = {
 				...(admission?.kind === "persona"
