@@ -13,6 +13,7 @@ export interface FirstmatePane {
 
 const CHILD_PREFIX = "firstmate-pane/child/";
 const LANE_PREFIX = "firstmate-pane/lane/";
+const CLOSED_PREFIX = "firstmate-pane/closed/";
 
 function parsePane(raw: string | undefined): FirstmatePane | undefined {
 	if (!raw) return undefined;
@@ -65,6 +66,15 @@ export function readChildPane(store: Store, origin: OriginRef): FirstmatePane | 
 	return pane && origin.threadVisibility !== "private" && originKey(pane.childOrigin) === originKey(origin)
 		? pane
 		: undefined;
+}
+
+/** A closed pane keeps its provenance so a later message cannot start a new persona. */
+export function paneClosed(store: Store, origin: OriginRef): boolean {
+	return store.core.metaGet(CLOSED_PREFIX + originKey(origin)) === "1";
+}
+
+export function markPaneClosed(store: Store, pane: FirstmatePane): void {
+	store.core.metaSet(CLOSED_PREFIX + originKey(pane.childOrigin), "1");
 }
 
 export function paneOriginRecorded(store: Store, origin: OriginRef): boolean {

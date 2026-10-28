@@ -605,6 +605,8 @@ export interface PersonaSessionManagerOptions {
 		abandoned?: boolean;
 	}) => void | Promise<void>;
 	/** Judges the SDK daemon from its discovery file after an identical bind-failure streak. */
+	/** A closed FirstMate pane refuses new turns after the close call has returned. */
+	readonly paneClosed?: (originKey: string) => boolean;
 	readonly brokerLiveness?: BrokerLivenessProbe;
 	/** Emits a cause-bearing hold notice while the inbound trigger remains pending. */
 	readonly onBindHold?: (input: PersonaBindHoldInput) => void | Promise<void>;
@@ -688,6 +690,7 @@ export class PersonaSessionManager {
 	readonly #onHeldSteerAccepted: PersonaSessionManagerOptions["onHeldSteerAccepted"];
 	readonly #heldSteerContextMessageId: PersonaSessionManagerOptions["heldSteerContextMessageId"];
 	readonly #brokerLiveness: BrokerLivenessProbe | undefined;
+	readonly #paneClosed: PersonaSessionManagerOptions["paneClosed"];
 	readonly #onBindHold: PersonaSessionManagerOptions["onBindHold"];
 	readonly #onReverseRequest: PersonaSessionManagerOptions["onReverseRequest"];
 	readonly #onSloEvent: PersonaSessionManagerOptions["onSloEvent"];
@@ -734,6 +737,7 @@ export class PersonaSessionManager {
 		this.#onHeldSteerAccepted = options.onHeldSteerAccepted;
 		this.#heldSteerContextMessageId = options.heldSteerContextMessageId;
 		this.#brokerLiveness = options.brokerLiveness;
+		this.#paneClosed = options.paneClosed;
 		this.#onBindHold = options.onBindHold;
 		this.#onReverseRequest = options.onReverseRequest;
 		this.#maxLiveHosts = positiveInteger(options.maxLiveHosts, DEFAULT_SESSIONS_MAX_LIVE_HOSTS, "maxLiveHosts");
@@ -1008,6 +1012,9 @@ export class PersonaSessionManager {
 		).then(() => undefined);
 	}
 
+	paneClosed(originKey: string): boolean {
+		return this.#paneClosed?.(originKey) === true;
+	}
 	state(originKey: string): PersonaActorState {
 		return this.#actors.get(originKey)?.state ?? "idle";
 	}
@@ -1555,6 +1562,7 @@ class OriginActor {
 	 */
 	async admit(): Promise<void> {
 		if (this.#closing || this.#manager.draining || this.#manager.restartDrainActive) return;
+		if (this.#manager.paneClosed(this.originKey)) return;
 		if (!this.#recoveryScanned) await this.recover();
 		if (this.#state === "turn-running") {
 			await this.#steerPending();
@@ -2401,6 +2409,7 @@ class OriginActor {
 			this.#closing ||
 			this.#manager.draining ||
 			this.#manager.restartDrainActive ||
+			this.#manager.paneClosed(this.originKey) ||
 			this.#state !== "idle" ||
 			this.#current ||
 			this.#dispatchRetry
