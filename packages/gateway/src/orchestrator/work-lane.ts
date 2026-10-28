@@ -1799,11 +1799,15 @@ export class WorkLaneManager {
 		);
 		const sessionKey = workSessionKey(assignment.name);
 		const binding = this.#db.bindings.getSessionRecord(sessionKey);
+		const released = binding?.sessionId === "" && (binding?.epoch ?? 0) > prior.epoch;
 		firstmateAssert(
-			binding?.sessionId === prior.sessionId && binding.epoch === prior.epoch && runtime.sessionKey === sessionKey,
+			runtime.sessionKey === sessionKey &&
+				(released || (binding?.sessionId === prior.sessionId && binding.epoch === prior.epoch)),
 			"correction_session_changed",
 		);
-		return { sessionId: prior.sessionId, epoch: prior.epoch, originKey: sessionKey, repo: assignment.worktree.path };
+		return released
+			? undefined
+			: { sessionId: prior.sessionId, epoch: prior.epoch, originKey: sessionKey, repo: assignment.worktree.path };
 	}
 	#assertFirstmateAdmission(assignment: FirstmateAssignment): void {
 		const owner = this.#db.work.firstmate;
@@ -2099,16 +2103,37 @@ export class WorkLaneManager {
 						let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 						try {
 							if (correction) {
-								binding = this.#assertCorrectionPredecessor(correction);
-								const session = await this.#port.inspect({ sessionId: binding.sessionId, repo: worktreePath });
-								firstmateAssert(
-									session?.sessionId === binding.sessionId && session.repo === worktreePath && session.deleted !== true,
-									"correction_session_unavailable",
-								);
-								// Resume only the existing owned session; never bind a replacement.
-								binding = this.#assertCorrectionPredecessor(correction);
-								if (!session.live) await this.#port.resume(binding);
-								binding = this.#assertCorrectionPredecessor(correction);
+								const predecessor = this.#assertCorrectionPredecessor(correction);
+								if (predecessor) {
+									binding = predecessor;
+									const session = await this.#port.inspect({ sessionId: binding.sessionId, repo: worktreePath });
+									firstmateAssert(
+										session?.sessionId === binding.sessionId &&
+											session.repo === worktreePath &&
+											session.deleted !== true,
+										"correction_session_unavailable",
+									);
+									// Resume only the existing owned session; never bind a replacement.
+									binding = this.#assertCorrectionPredecessor(correction) ?? binding;
+									if (!session.live) await this.#port.resume(binding);
+									binding = this.#assertCorrectionPredecessor(correction) ?? binding;
+								} else {
+									// Close cleared the predecessor. A new session continues the task; the old attempt stays immutable.
+									binding = await this.#port.bind({
+										originKey: sessionKey,
+										epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
+										repo: worktreePath,
+										codingRegister: true,
+										...((input.model ?? this.#options.sessionModel)
+											? { model: input.model ?? this.#options.sessionModel }
+											: {}),
+									});
+									firstmateAssert(
+										binding.sessionId !== correction.cause.priorOpRef &&
+											this.#db.bindings.getSessionRecord(sessionKey)?.sessionId === binding.sessionId,
+										"correction_session_changed",
+									);
+								}
 							} else {
 								binding = await this.#port.bind({
 									originKey: sessionKey,

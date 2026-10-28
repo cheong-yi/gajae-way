@@ -1746,6 +1746,7 @@ for (const state of ["attempt_ended", "done"] as const) {
 			payloadJson: expect.stringContaining(original.opRef),
 		});
 		const priorAnswer = await inspectWithoutExecution(f, original.opRef);
+		f.port.setSessionState(original.sessionId, { live: true, deleted: false, repo: f.assignment.worktree.path });
 		const input = correctionInput(f, original.opRef);
 		const bind = spyOn(f.port, "bind");
 		const recover = spyOn(f.manager, "recover");
@@ -2010,6 +2011,31 @@ test("FirstMate correction resumes inactive sessions and refuses unavailable ses
 	);
 	expect(f.owner.assignment("a")).toEqual(f.assignment);
 	expect(f.job().attempts.at(-1)).toMatchObject({ opRef: admitted.opRef, sessionId: original.sessionId });
+});
+test("FirstMate correction after close binds a new session and keeps the old attempt", async () => {
+	const f = await firstmateFixture();
+	const original = await f.manager.startFirstmate(f.assignment);
+	if (!original.started) throw new Error("unexpected hold");
+	await settleFirstmateSetup(f, original.opRef);
+	const before = f.db.work.firstmate.attempt(original.opRef);
+	const beforeRuntime = f.db.work.workAttemptGet(original.opRef);
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey(f.assignment.name)));
+	const input = correctionInput(f, original.opRef);
+	input.messageId = "follow-up-after-close";
+	const binds = f.port.binds.length;
+	const admitted = await f.manager.startFirstmateCorrection(input);
+	expect(admitted.started).toBe(true);
+	if (!admitted.started) throw new Error("unexpected correction hold");
+	expect(admitted.sessionId).not.toBe(original.sessionId);
+	expect(admitted.opRef).not.toBe(original.opRef);
+	expect(admitted.jobId).toBe(original.jobId);
+	expect(f.port.binds).toHaveLength(binds + 1);
+	expect(f.db.work.firstmate.attempt(original.opRef)).toEqual(before);
+	expect(f.db.work.workAttemptGet(original.opRef)).toEqual(beforeRuntime);
+	expect(f.job().attempts).toHaveLength(2);
+	expect(f.job().attempts[0]).toMatchObject({ opRef: original.opRef, sessionId: original.sessionId });
+	expect(f.owner.assignment(f.assignment.name)?.worktree).toEqual(f.assignment.worktree);
+	expect(f.owner.assignment(f.assignment.name)?.thread).toEqual(f.assignment.thread);
 });
 
 test("FirstMate lost correction acceptance holds exact duplicate and cannot be bypassed by a new message", async () => {
