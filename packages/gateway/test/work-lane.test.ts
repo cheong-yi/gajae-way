@@ -2713,6 +2713,41 @@ test("FirstMate requires a canonical dedicated linked worktree rather than a mai
 	expect(f.owner.assignment("a")).toBeUndefined();
 });
 
+test("FirstMate admits an abandoned lane worktree but refuses a live lane worktree", async () => {
+	const live = await firstmateFixture();
+	const native = await live.manager.start({
+		name: "other",
+		text: "native",
+		cwd: live.assignment.worktree.path,
+	});
+	if (!native.started) throw new Error("unexpected hold");
+	await settleFirstmateSetup(live, native.opRef);
+	await expect(live.manager.startFirstmate(live.assignment)).rejects.toMatchObject({
+		detail: { reason: "worktree_already_owned" },
+	});
+
+	const f = await firstmateFixture();
+	const original = await f.manager.startFirstmate(f.assignment);
+	if (!original.started) throw new Error("unexpected hold");
+	await settleFirstmateSetup(f, original.opRef);
+	const replacement: FirstmateAssignment = {
+		...structuredClone(f.assignment),
+		taskId: "task-replacement",
+		name: "replacement",
+		messageId: "replacement-message",
+		thread: { ...f.assignment.thread, conversationId: "replacement-thread" },
+	};
+	await expect(f.manager.startFirstmate(replacement)).rejects.toMatchObject({
+		detail: { reason: "immutable_assignment_conflict" },
+	});
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: "a" });
+	const admitted = await f.manager.startFirstmate(replacement);
+	expect(admitted.started).toBe(true);
+	if (!admitted.started) throw new Error("unexpected hold");
+	await settleFirstmateSetup(f, admitted.opRef);
+	expect(f.db.work.laneJobRows(true).some((row) => row.job_id === original.jobId)).toBe(true);
+});
+
 test("FirstMate refuses a competing native worktree and permits disjoint work after a stale mapping", async () => {
 	const competing = await firstmateFixture();
 	const native = await competing.manager.start({

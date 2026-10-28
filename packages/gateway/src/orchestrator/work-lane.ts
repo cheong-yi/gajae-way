@@ -1860,6 +1860,7 @@ export class WorkLaneManager {
 		}
 		for (const row of this.#db.work.laneJobRows(true)) {
 			if (row.job_id === job?.jobId) continue;
+			if (this.#db.work.firstmate.abandoned(row.lane_key.replace(/^work-/, ""))) continue;
 			firstmateAssert(
 				realpathOfPossiblyMissing(row.worktree_path) !== assignment.worktree.path,
 				"worktree_already_owned",
