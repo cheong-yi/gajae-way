@@ -1944,7 +1944,7 @@ async function handleRequest(
 		}
 		case "work.approve.decision": {
 			const params = request.params;
-			const fields = ["name", "ownerId", "messageId", "decision", "scope"];
+			const fields = ["name", "messageId", "decision", "scope"];
 			if (
 				!workObject(params) ||
 				Object.keys(params).some((key) => !fields.includes(key)) ||

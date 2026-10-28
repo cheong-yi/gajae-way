@@ -895,10 +895,9 @@ export type WorkApproveResult =
 	| { readonly recorded: true; readonly approval: FirstmateApproval }
 	| { readonly recorded: false; readonly held: true; readonly reason: string };
 
-/** Owner decision only. The gateway binds it to the one latest settled attempt. */
+/** Owner decision only. The gateway reads the owner's message in the task thread. */
 export interface WorkApproveDecisionParams {
 	readonly name: string;
-	readonly ownerId: string;
 	readonly messageId: string;
 	readonly decision: "accept_outcome" | "acknowledge_unavailable";
 	readonly scope: string;

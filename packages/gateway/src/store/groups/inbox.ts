@@ -1282,6 +1282,20 @@ export class InboxGroup {
 		return this.#db.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ?").get(messageId) !== null;
 	}
 
+	decisionMessage(messageId: string): { readonly authorId: string; readonly body: string } | undefined {
+		const inbound = this.#db
+			.prepare("SELECT engagement_json, body FROM inbound_messages WHERE message_id = ?")
+			.get(messageId) as { engagement_json: string | null; body: string } | null;
+		if (inbound) {
+			const authorId = JSON.parse(inbound.engagement_json ?? "{}").authorId;
+			return typeof authorId === "string" && authorId ? { authorId, body: inbound.body } : undefined;
+		}
+		const context = this.#db
+			.prepare("SELECT author_id, body FROM conversation_context WHERE message_id = ?")
+			.get(messageId) as { author_id: string | null; body: string } | null;
+		return context?.author_id ? { authorId: context.author_id, body: context.body } : undefined;
+	}
+
 	hasQuarantinedTurn(opRef: string): boolean {
 		return (
 			this.#db

@@ -1058,14 +1058,13 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					break;
 				}
 				if (command === "approve" && args[0] === "--decision") {
-					const [, name, ownerId, messageId, decision, ...rest] = args;
+					const [, name, messageId, decision, ...rest] = args;
 					const scope = rest.join(" ").trim();
 					if (
-						args.length < 6 ||
+						args.length < 5 ||
 						!name ||
-						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
-						!ownerId?.trim() ||
 						!messageId?.trim() ||
+						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
 						(decision !== "accept" && decision !== "acknowledge") ||
 						!scope
 					)
@@ -1074,7 +1073,6 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					try {
 						const result = await client.request<WorkApproveResult>("work.approve.decision", {
 							name,
-							ownerId,
 							messageId,
 							decision: decision === "accept" ? "accept_outcome" : "acknowledge_unavailable",
 							scope,

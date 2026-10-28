@@ -1593,11 +1593,14 @@ export class WorkLaneManager {
 			};
 		}
 	}
-	/** Binds an owner decision to the one latest settled attempt. Two settled tails are a refusal. */
+	/** Resolves the one open hold from the owner's own message. */
 	async approveFirstmateDecision(input: WorkApproveDecisionParams): Promise<WorkApproveResult> {
 		const assignment = this.#db.work.firstmate.assignment(input.name);
-		if (!assignment || assignment.ownerId !== input.ownerId)
+		const message = this.#db.inbox.decisionMessage(input.messageId);
+		if (!assignment || !message || message.authorId !== assignment.ownerId)
 			return { recorded: false, held: true, reason: "approval_authority_mismatch" };
+		const scope = message.body.trim();
+		if (scope !== input.scope) return { recorded: false, held: true, reason: "approval_scope_mismatch" };
 		const settled = this.#db.work.firstmate
 			.attemptsForTask(assignment.taskId)
 			.filter((attempt) => this.#db.work.workAttemptGet(attempt.opRef)?.settledAt);
@@ -1610,7 +1613,8 @@ export class WorkLaneManager {
 			taskId: assignment.taskId,
 			opRef: latest.opRef,
 		});
-		if (!observed.identity) return { recorded: false, held: true, reason: observed.reasons.at(-1) ?? "approval_target_unavailable" };
+		if (!observed.identity)
+			return { recorded: false, held: true, reason: observed.reasons.at(-1) ?? "approval_target_unavailable" };
 		const { sessionKey: _key, ...identity } = observed.identity;
 		const evidence =
 			observed.evidence.completeness === "unavailable"
@@ -1623,11 +1627,11 @@ export class WorkLaneManager {
 		return this.approveFirstmate({
 			name: input.name,
 			identity,
-			ownerId: input.ownerId,
-			messageId: input.messageId,
+			ownerId: assignment.ownerId,
+			messageId: message.messageId,
 			thread: assignment.thread,
 			mandateId: assignment.mandate.id,
-			scope: input.scope,
+			scope,
 			decision: input.decision,
 			evidence,
 		} as WorkApproveParams);
