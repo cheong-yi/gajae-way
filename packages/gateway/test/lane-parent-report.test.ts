@@ -275,6 +275,48 @@ test("AC-A [SILENT] persona answer posts nothing", async () => {
 	expect(chatMessages(f)).toHaveLength(0);
 });
 
+test("settled persona wakes for a lane report while a running persona receives only a steer", async () => {
+	const origin: OriginRef = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "relay-thread",
+		parentId: "parent-channel",
+	};
+	const f = await fixture({
+		ownerTarget: origin,
+		channels: { "parent-channel": { engagement: "open", audience: "all" } },
+	});
+	const persona = await startPersonaTurn(f, origin, "relay-wake-trigger");
+	const firstLane = await startLane(f, "relay-mid-turn", persona.sessionId);
+	expect(firstLane.error).toBeUndefined();
+	await settleLane(f, firstLane.result.opRef, "mid-turn finding");
+	await eventually(
+		() => f.port.steers,
+		(steers) => steers.some((steer) => steer.text.includes("mid-turn finding")),
+		"running persona report steer",
+	);
+	expect(f.port.sends.filter((send) => send.sessionId === persona.sessionId)).toHaveLength(1);
+	const secondLane = await startLane(f, "relay-after-turn", persona.sessionId);
+	expect(secondLane.error).toBeUndefined();
+	await silencePersona(f, persona.opRef);
+	await settleLane(f, secondLane.result.opRef, "settled-turn finding");
+	const sends = await eventually(
+		() => f.port.sends.filter((send) => send.sessionId === persona.sessionId),
+		(items) => items.length === 2,
+		"settled persona relay wake",
+	);
+	expect(sends[1]!.text).toContain("settled-turn finding");
+	expect(sends[1]!.opRef).not.toBe(persona.opRef);
+	expect(chatMessages(f)).toHaveLength(0);
+	f.port.complete(sends[1]!.opRef, "The lane found the answer.");
+	await eventually(
+		() => chatMessages(f),
+		(messages) => messages.length === 1,
+		"persona-authored relay",
+	);
+	expect(chatMessages(f).map((frame) => frame.payload.text)).toEqual(["The lane found the answer."]);
+});
+
 test("AC-C idle persona is woken with one send carrying the internal lane report", async () => {
 	const f = await fixture();
 	const personaSessionId = crypto.randomUUID();
