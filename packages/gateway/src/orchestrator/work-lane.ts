@@ -2551,7 +2551,11 @@ export class WorkLaneManager {
 								});
 							}
 						} catch (error) {
-							if (correction || error instanceof ProtocolError) throw error;
+							if (correction) throw error;
+							const detail = error instanceof ProtocolError ? error.detail : undefined;
+							const reason =
+								detail && typeof detail === "object" && "reasonCode" in detail ? detail.reasonCode : undefined;
+							if (reason === "firstmate_admission_refused") throw error;
 							throw isBrokerUnavailable(error) ? error : bindFailed(error);
 						}
 						this.#live();
