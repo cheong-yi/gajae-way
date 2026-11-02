@@ -70,7 +70,12 @@ export function readChildPane(store: Store, origin: OriginRef): FirstmatePane | 
 
 /** A closed pane keeps its provenance so a later message cannot start a new persona. */
 export function paneClosed(store: Store, origin: OriginRef): boolean {
-	return store.core.metaGet(CLOSED_PREFIX + originKey(origin)) === "1";
+	return paneKeyClosed(store, originKey(origin));
+}
+
+/** The closed marker is keyed by the child's origin key; no origin row is needed to read it. */
+export function paneKeyClosed(store: Store, key: string): boolean {
+	return store.core.metaGet(CLOSED_PREFIX + key) === "1";
 }
 
 export function markPaneClosed(store: Store, pane: FirstmatePane): void {

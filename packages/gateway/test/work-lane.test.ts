@@ -902,6 +902,104 @@ test("pane checks terminal event has its own replay identity and confirmed outco
 	expect((await f.manager.retireFirstmate(request)).retired).toBe(true);
 });
 
+test("FirstMate merge refuses unfinished checks and the writer, then the gateway merges after another session passes", async () => {
+	const errors = spyOn(console, "error").mockImplementation(() => {});
+	cleanups.push(async () => errors.mockRestore());
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-firstmate-merge-"));
+	cleanups.push(() => rm(directory, { recursive: true, force: true }));
+	const ghPath = join(directory, "gh");
+	const mergesPath = join(directory, "merges.txt");
+	await writeFile(ghPath, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(mergesPath)}\n`);
+	await chmod(ghPath, 0o755);
+	const merges = async () => (await readFile(mergesPath, "utf8").catch(() => "")).trim();
+	const green = { prNumber: 700, status: "green" as const, failingChecks: [], prState: "open" as const, merged: false };
+	const checks = scriptedChecks(green);
+	const f = await firstmateFixture({ checkStatusClient: checks.client, ghExecutable: ghPath });
+	const merger = crypto.randomUUID();
+	const reviewer = crypto.randomUUID();
+	const reviewOrigin = originKey({ platform: "discord", kind: "thread", conversationId: "review", parentId: "cockpit" });
+	f.db.transaction((tx) => {
+		f.db.bindings.bind(tx, originKey(f.assignment.thread), merger);
+		f.db.bindings.bind(tx, reviewOrigin, reviewer);
+		f.db.inbox.contextRecord(tx, {
+			messageId: "merge-class",
+			originKey: originKey(f.assignment.thread),
+			authorId: f.assignment.ownerId,
+			body: "Merge this task once its checks are green and another session has reviewed it.",
+		});
+	});
+	const start = await f.manager.startFirstmate(f.assignment);
+	if (!start.started) throw new Error("unexpected hold");
+	await settleFirstmateSetup(f, start.opRef);
+	const name = f.assignment.name;
+	expect(await f.manager.authorizeFirstmateMerge({ name, messageId: "merge-class" })).toEqual({
+		recorded: true,
+		messageId: "merge-class",
+	});
+	// The approval hold is still open: nothing merges.
+	expect(await f.manager.mergeFirstmate({ name, sessionId: merger })).toMatchObject({ reason: "merge_hold_open" });
+	const approval = await f.manager.approveFirstmate(await approvalInput(f, start.opRef));
+	if (!approval.recorded) throw new Error(approval.reason);
+	for (const row of f.db.outbox.rows()) f.db.transaction((tx) => f.db.outbox.confirm(tx, row.delivery_id));
+	const closed = await f.manager.retireFirstmate({
+		firstmate: {
+			name,
+			identity: approval.approval.identity,
+			ownerId: f.assignment.ownerId,
+			messageId: "closeout",
+			thread: f.assignment.thread,
+			mandateId: f.assignment.mandate.id,
+			scope: approval.approval.scope,
+			approvalId: approval.approval.approvalId,
+			action: "release_session_preserve_work",
+		},
+	});
+	expect(closed.retired).toBe(true);
+	expect(await merges()).toBe("");
+	const head = f.git("-C", f.assignment.worktree.path, "rev-parse", "HEAD");
+
+	// Checks not green: no pass is recorded and nothing merges.
+	checks.set({ ...green, status: "pending" });
+	expect(await f.manager.reviewFirstmate({ name, sessionId: reviewer, headSha: head, verdict: "pass" })).toMatchObject({
+		recorded: false,
+		reason: "review_checks_unfinished",
+	});
+	expect(await f.manager.mergeFirstmate({ name, sessionId: merger })).toEqual({
+		merged: false,
+		held: true,
+		reason: "merge_checks_not_green",
+	});
+
+	// The writer can neither review nor merge.
+	checks.set(green);
+	expect(
+		await f.manager.reviewFirstmate({ name, sessionId: start.sessionId, headSha: head, verdict: "pass" }),
+	).toMatchObject({ recorded: false, reason: "review_writer_refused" });
+	expect(await f.manager.mergeFirstmate({ name, sessionId: start.sessionId })).toEqual({
+		merged: false,
+		held: true,
+		reason: "merge_writer_refused",
+	});
+	expect(await f.manager.mergeFirstmate({ name, sessionId: merger })).toMatchObject({ reason: "merge_review_missing" });
+	expect(await merges()).toBe("");
+
+	// A different session passes after the checks finished; the reviewer itself cannot merge.
+	expect(await f.manager.reviewFirstmate({ name, sessionId: reviewer, headSha: head, verdict: "pass" })).toEqual({
+		recorded: true,
+		headSha: head,
+		verdict: "pass",
+	});
+	expect(await f.manager.mergeFirstmate({ name, sessionId: reviewer })).toMatchObject({
+		reason: "merge_reviewer_refused",
+	});
+	expect(await merges()).toBe("");
+	expect(await f.manager.mergeFirstmate({ name, sessionId: merger })).toEqual({ merged: true, prNumber: 700, headSha: head });
+	expect(await merges()).toBe(`pr merge 700 --merge --match-head-commit ${head}`);
+	expect(f.owner.merges(name)).toMatchObject([
+		{ prNumber: 700, headSha: head, authorizationMessageId: "merge-class", reviewSessionId: reviewer, requestedBy: merger },
+	]);
+});
+
 test("pane queued steer refuses a preserving release without using a persona mailbox lock", async () => {
 	const f = await paneFixture();
 	const entered = deferred<void>();
@@ -978,9 +1076,10 @@ async function releaseFixture(delivered = true, unavailable = false) {
 	return { ...f, request, approved: approved.approval };
 }
 
-test("FirstMate separate release preserves dirty Git and returns immutable duplicates and retained receipts", async () => {
+test("FirstMate separate release refuses a dirty checkout, preserves Git and returns immutable duplicates and retained receipts", async () => {
 	const f = await releaseFixture();
-	await Bun.write(join(f.assignment.worktree.path, "unique-untracked"), "preserve this\n");
+	const untracked = join(f.assignment.worktree.path, "unique-untracked");
+	await Bun.write(untracked, "preserve this\n");
 	f.git("-C", f.assignment.worktree.path, "commit", "--allow-empty", "-m", "unique local commit");
 	const gitSnapshot = () => ({
 		head: f.git("-C", f.assignment.worktree.path, "rev-parse", "HEAD"),
@@ -988,6 +1087,20 @@ test("FirstMate separate release preserves dirty Git and returns immutable dupli
 		status: f.git("-C", f.assignment.worktree.path, "status", "--porcelain"),
 		worktrees: f.git("worktree", "list", "--porcelain"),
 	});
+	const dirty = gitSnapshot();
+	const dirtyBinding = f.db.bindings.getSessionRecord(f.start.sessionKey);
+	const held = await f.manager.retireFirstmate(f.request);
+	expect(held).toMatchObject({ retired: false, held: true });
+	if (held.retired) throw new Error("dirty checkout was released");
+	expect(held.reason).toContain(`dirty checkout at ${f.assignment.worktree.path}`);
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.owner.releaseForAttempt(f.start.opRef)).toBeUndefined();
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)).toEqual(dirtyBinding);
+	expect(gitSnapshot()).toEqual(dirty);
+	expect(await Bun.file(untracked).text()).toBe("preserve this\n");
+	// The operator commits the work; a clean checkout with unique local commits releases.
+	f.git("-C", f.assignment.worktree.path, "add", "unique-untracked");
+	f.git("-C", f.assignment.worktree.path, "commit", "-q", "-m", "keep the untracked work");
 	const before = gitSnapshot();
 	const recover = spyOn(f.manager, "recover");
 	const result = await f.manager.retireFirstmate(f.request);
@@ -997,7 +1110,7 @@ test("FirstMate separate release preserves dirty Git and returns immutable dupli
 	expect(recover).not.toHaveBeenCalled();
 	recover.mockRestore();
 	expect(gitSnapshot()).toEqual(before);
-	expect(await Bun.file(join(f.assignment.worktree.path, "unique-untracked")).text()).toBe("preserve this\n");
+	expect(await Bun.file(untracked).text()).toBe("preserve this\n");
 	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)).toMatchObject({
 		sessionId: "",
 		epoch: f.request.firstmate.identity.epoch + 1,
@@ -1018,6 +1131,46 @@ test("FirstMate separate release preserves dirty Git and returns immutable dupli
 	expect(observation.evidence.text).toBe("done");
 	expect(f.port.workerOutputReads).toHaveLength(reads);
 	expect(f.port.closes).toHaveLength(1);
+});
+
+test("FirstMate abandonment refuses a dirty checkout without touching it and abandons once clean", async () => {
+	const f = await approvalFixture();
+	const path = f.assignment.worktree.path;
+	await Bun.write(join(path, "tracked.txt"), "base\n");
+	f.git("-C", path, "add", "tracked.txt");
+	f.git("-C", path, "commit", "-q", "-m", "tracked base");
+	const binding = f.db.bindings.getSessionRecord(f.start.sessionKey);
+	const status = () => f.git("-C", path, "status", "--porcelain", "--untracked-files=all");
+	const head = f.git("-C", path, "rev-parse", "HEAD");
+	const expectHeld = async (expectedStatus: string) => {
+		const result = await f.manager.abandonFirstmate(f.assignment.name);
+		expect(result.abandoned).toBe(false);
+		if (result.abandoned) throw new Error("dirty checkout was abandoned");
+		expect(result.reason).toContain(`dirty checkout at ${path}`);
+		expect(f.owner.abandoned(f.assignment.name)).toBe(false);
+		expect(f.port.closes).toHaveLength(0);
+		expect(f.db.bindings.getSessionRecord(f.start.sessionKey)).toEqual(binding);
+		expect(status()).toBe(expectedStatus);
+		expect(f.git("-C", path, "rev-parse", "HEAD")).toBe(head);
+	};
+	// Untracked work holds abandonment and stays in place.
+	await Bun.write(join(path, "notes.txt"), "untracked\n");
+	await expectHeld("?? notes.txt");
+	expect(await Bun.file(join(path, "notes.txt")).text()).toBe("untracked\n");
+	await rm(join(path, "notes.txt"));
+	// A tracked modification holds it too.
+	await Bun.write(join(path, "tracked.txt"), "changed\n");
+	await expectHeld("M tracked.txt");
+	expect(await Bun.file(join(path, "tracked.txt")).text()).toBe("changed\n");
+	f.git("-C", path, "checkout", "--", "tracked.txt");
+	// A clean checkout abandons, closes the session and frees the reservation.
+	expect(status()).toBe("");
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
+	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: path }]);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+	expect(f.git("-C", path, "rev-parse", "HEAD")).toBe(head);
+	expect(await Bun.file(join(path, "tracked.txt")).text()).toBe("base\n");
 });
 
 test("FirstMate release holds handed-off and pending delivery debt but ignores unrelated same-thread inbox", async () => {
@@ -1180,11 +1333,81 @@ test("FirstMate release and correction share one native lock; pending release bl
 	const releasing = f.manager.retireFirstmate(f.request);
 	await entered.promise;
 	const correcting = f.manager.startFirstmateCorrection(correctionInput(f, f.start.opRef));
-	const rejected = expect(correcting).rejects.toBeDefined();
+	const rejected = expect(correcting).rejects.toMatchObject({
+		detail: { reason: "task_release_pending_or_completed" },
+	});
 	resume.resolve();
 	expect((await releasing).retired).toBe(true);
 	await rejected;
 	expect(f.owner.attemptsForTask(f.assignment.taskId)).toHaveLength(1);
+	// A confirmed release refuses a follow-up before any session binds, also after restart.
+	const binds = f.port.binds.length;
+	await expect(f.manager.startFirstmateCorrection(correctionInput(f, f.start.opRef))).rejects.toMatchObject({
+		detail: { reason: "task_released" },
+	});
+	await f.restart();
+	await expect(
+		f.currentManager().startFirstmateCorrection({ ...correctionInput(f, f.start.opRef), messageId: "after-restart" }),
+	).rejects.toMatchObject({ detail: { reason: "task_released" } });
+	expect(f.port.binds).toHaveLength(binds);
+	expect(f.owner.attemptsForTask(f.assignment.taskId)).toHaveLength(1);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+});
+
+test("FirstMate follow-up of an abandoned task refuses before a new session binds", async () => {
+	const f = await approvalFixture();
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
+	const binds = f.port.binds.length;
+	await expect(f.manager.startFirstmateCorrection(correctionInput(f, f.start.opRef))).rejects.toMatchObject({
+		detail: { reason: "task_abandoned" },
+	});
+	expect(f.port.binds).toHaveLength(binds);
+	expect(f.owner.attemptsForTask(f.assignment.taskId)).toHaveLength(1);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+});
+
+test("FirstMate confirmed release frees its clean checkout and thread for a new assignment; a live task still conflicts", async () => {
+	const f = await releaseFixture();
+	// Same worktree path, git dir and thread; a new task, lane and assignment message.
+	const replacement: FirstmateAssignment = {
+		...structuredClone(f.assignment),
+		taskId: "task-replacement",
+		name: "replacement",
+		messageId: "replacement-message",
+	};
+	await expect(f.manager.startFirstmate(replacement)).rejects.toMatchObject({
+		detail: { reason: "immutable_assignment_conflict" },
+	});
+	expect(f.owner.released(f.assignment.name)).toBe(false);
+	const released = await f.manager.retireFirstmate(f.request);
+	if (!released.retired) throw new Error(released.reason);
+	expect(f.owner.released(f.assignment.name)).toBe(true);
+	expect(f.git("-C", f.assignment.worktree.path, "status", "--porcelain", "--untracked-files=all")).toBe("");
+	const admitted = await f.manager.startFirstmate(replacement);
+	if (!admitted.started) throw new Error(admitted.reason);
+	await settleFirstmateSetup(f, admitted.opRef);
+	// The released task keeps its assignment, attempts, approval and release receipt.
+	expect(f.owner.assignment(f.assignment.name)).toEqual(f.assignment);
+	expect(f.owner.attemptsForTask(f.assignment.taskId).map((attempt) => attempt.opRef)).toEqual([f.start.opRef]);
+	expect(f.owner.approval(f.approved.approvalId)).toEqual(f.approved);
+	expect(f.owner.releaseReceipt(released.release.releaseId)).toEqual(released.release);
+	expect(f.owner.assignment("replacement")).toEqual(replacement);
+	// The new task is live on that checkout: another task still conflicts with it.
+	const third: FirstmateAssignment = {
+		...structuredClone(f.assignment),
+		taskId: "task-third",
+		name: "third",
+		messageId: "third-message",
+		thread: { ...f.assignment.thread, conversationId: "third-thread" },
+	};
+	await expect(f.manager.startFirstmate(third)).rejects.toMatchObject({
+		detail: { reason: "immutable_assignment_conflict" },
+	});
+	expect(f.owner.assignment("third")).toBeUndefined();
+	// The released task's own name and task stay reserved.
+	await expect(
+		f.manager.startFirstmate({ ...structuredClone(f.assignment), messageId: "reassign-message" }),
+	).rejects.toMatchObject({ detail: { reason: "immutable_assignment_conflict" } });
 });
 
 test("FirstMate mapped ordinary force all-dead and idle retirement cannot bypass scoped release", async () => {
@@ -1426,7 +1649,15 @@ for (const state of ["attempt_ended", "done"] as const) {
 			await pollUntil(f, () => f.job().state === "done");
 		}
 		expect(f.job().state).toBe(state);
-		expect(f.db.work.workAttemptGet(start.opRef)?.decision).toBe("fallback");
+		const settledRuntime = f.db.work.workAttemptGet(start.opRef)!;
+		expect(settledRuntime.decision).toBe("reported");
+		expect(
+			f.db.inbox.messageDisposition(originKey(f.assignment.thread), settledRuntime.reportId)?.message,
+		).toMatchObject({
+			message_id: settledRuntime.reportId,
+			origin_key: originKey(f.assignment.thread),
+			source: "lane_report",
+		});
 		const input = await approvalInput(f, start.opRef);
 		const approved = await withoutFirstmateEffects(f, () => f.manager.approveFirstmate(input));
 		expect(approved.recorded).toBe(true);
@@ -1739,7 +1970,13 @@ for (const state of ["attempt_ended", "done"] as const) {
 		const priorAttribution = f.owner.attempt(original.opRef);
 		const journal = f.db.core.groupDb("work").prepare("SELECT * FROM work_journal ORDER BY seq").all();
 		const report = f.db.outbox.get(priorRuntime!.deliveryId);
-		expect(priorRuntime?.decision).toBe("fallback");
+		expect(priorRuntime?.decision).toBe("reported");
+		const priorInbox = f.db.inbox.messageDisposition(parentKey, priorRuntime!.reportId)?.message;
+		expect(priorInbox).toMatchObject({
+			message_id: priorRuntime!.reportId,
+			origin_key: parentKey,
+			source: "lane_report",
+		});
 		expect(report).toMatchObject({
 			originKey: parentKey,
 			turnId: original.opRef,
@@ -1794,8 +2031,15 @@ for (const state of ["attempt_ended", "done"] as const) {
 		expect(answer.evidence).toMatchObject({ completeness: "complete", text: "Corrected exact answer." });
 		expect(answer.identity?.opRef).toBe(correction.opRef);
 		expect(f.db.bindings.getSessionRecord(parentKey)?.sessionId).toBe(parentSessionId);
-		expect(f.db.work.workAttemptGet(correction.opRef)?.decision).toBe("fallback");
-		expect(f.db.work.workAttemptGet(correction.opRef)!.reportId).not.toBe(priorRuntime!.reportId);
+		expect(f.db.work.workAttemptGet(correction.opRef)?.decision).toBe("reported");
+		const correctedReportId = f.db.work.workAttemptGet(correction.opRef)!.reportId;
+		expect(correctedReportId).not.toBe(priorRuntime!.reportId);
+		expect(f.db.inbox.messageDisposition(parentKey, correctedReportId)?.message).toMatchObject({
+			message_id: correctedReportId,
+			origin_key: parentKey,
+			source: "lane_report",
+		});
+		expect(f.db.inbox.messageDisposition(parentKey, priorRuntime!.reportId)?.message).toEqual(priorInbox);
 		const correctedOutcome = f.db.outbox.get(f.db.work.workAttemptGet(correction.opRef)!.deliveryId)!;
 		expect(correctedOutcome).toMatchObject({
 			originKey: parentKey,
@@ -2020,8 +2264,7 @@ test("FirstMate correction after close binds a new session and keeps the old att
 	const before = f.db.work.firstmate.attempt(original.opRef);
 	const beforeRuntime = f.db.work.workAttemptGet(original.opRef);
 	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey(f.assignment.name)));
-	const input = correctionInput(f, original.opRef);
-	input.messageId = "follow-up-after-close";
+	const input = { ...correctionInput(f, original.opRef), messageId: "follow-up-after-close" };
 	const binds = f.port.binds.length;
 	const admitted = await f.manager.startFirstmateCorrection(input);
 	expect(admitted.started).toBe(true);

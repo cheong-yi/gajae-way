@@ -51,16 +51,212 @@ function approvalRequest(approval: FirstmateApproval) {
 	return request;
 }
 
+/**
+ * An approval hold names the one settled attempt an owner's approval may resolve. Opened when
+ * a FirstMate attempt settles; a later settled attempt supersedes it.
+ */
+export interface FirstmateApprovalHold {
+	readonly kind: "approval";
+	readonly key: string;
+	readonly taskId: string;
+	readonly opRef: string;
+	readonly ordinal: number;
+	readonly sessionId: string;
+	readonly epoch: number;
+	readonly state: "open" | "resolved" | "superseded";
+	readonly approvalId?: string;
+	readonly messageId?: string;
+}
+
+/** A finish hold names the one outcome approval an owner's closeout message may release. */
+export interface FirstmateFinishHold {
+	readonly kind: "finish";
+	readonly key: string;
+	readonly taskId: string;
+	readonly approvalId: string;
+	readonly opRef: string;
+	readonly approvalMessageId: string;
+	readonly state: "open" | "resolved" | "superseded";
+	readonly releaseId?: string;
+	readonly messageId?: string;
+}
+
+/**
+ * The owner's one stored class authorization for a task. Class `merge` lets the gateway merge
+ * the task's pull request itself, and only once every merge gate holds at merge time.
+ */
+export interface FirstmateMergeAuthorization {
+	readonly kind: "merge-authorization";
+	readonly key: string;
+	readonly taskId: string;
+	readonly class: "merge";
+	readonly ownerId: string;
+	readonly messageId: string;
+	readonly body: string;
+	readonly recordedAt: string;
+}
+
+/**
+ * A review verdict, pass or fail only, from a session that did not write the change. A pass is
+ * recorded only after the gateway's live check read was green at that exact head.
+ */
+export interface FirstmateReview {
+	readonly kind: "review";
+	readonly key: string;
+	readonly taskId: string;
+	readonly sessionId: string;
+	readonly headSha: string;
+	readonly verdict: "pass" | "fail";
+	readonly recordedAt: string;
+}
+
+/** The gateway's own merge of one exact pull request head. */
+export interface FirstmateMerge {
+	readonly kind: "merge";
+	readonly key: string;
+	readonly taskId: string;
+	readonly prNumber: number;
+	readonly headSha: string;
+	readonly authorizationMessageId: string;
+	readonly reviewSessionId: string;
+	readonly requestedBy: string;
+	readonly mergedAt: string;
+}
+
+type FirstmateHoldRecord =
+	| FirstmateApprovalHold
+	| FirstmateFinishHold
+	| FirstmateMergeAuthorization
+	| FirstmateReview
+	| FirstmateMerge;
+
+/** Lanes with a confirmed preserving release: the one definition every released-lane read uses. */
+const RELEASED_LANES =
+	"SELECT a.lane_name FROM firstmate_release_receipts r JOIN firstmate_release_intents i ON i.release_id = r.release_id JOIN firstmate_attempts a ON a.op_ref = i.op_ref";
+
+const HOLD_PREFIX = "firstmate-hold/";
+const holdPrefix = (kind: FirstmateHoldRecord["kind"], name: string) => `${HOLD_PREFIX}${kind}/${name}/`;
+
 /** Immutable policy/evidence stays under the existing work table owner, outside journal replay. */
 export class FirstmateStore {
 	readonly #db: GroupDb;
+	readonly #core: StoreCore;
 	readonly #work: WorkGroup;
 	readonly #bindings: BindingsGroup;
 
 	constructor(core: StoreCore, work: WorkGroup) {
+		this.#core = core;
 		this.#db = core.groupDb("work");
 		this.#work = work;
 		this.#bindings = new BindingsGroup(core);
+	}
+
+	#holds<T extends FirstmateHoldRecord>(kind: T["kind"], name: string): T[] {
+		const prefix = holdPrefix(kind, name);
+		return this.#core.metaKeysInRange(prefix, `${prefix}\uffff`).map((key) => {
+			const hold = JSON.parse(this.#core.metaGet(key)!) as T;
+			firstmateAssert(hold.kind === kind && hold.key === key, "hold_corrupt");
+			return hold;
+		});
+	}
+
+	#putHold(tx: WriteTx, hold: FirstmateHoldRecord): void {
+		this.#core.assertActive(tx);
+		this.#core.metaSet(hold.key, receiptJson(hold));
+	}
+
+	mergeAuthorizations(name: string): FirstmateMergeAuthorization[] {
+		return this.#holds<FirstmateMergeAuthorization>("merge-authorization", name);
+	}
+
+	/** One class authorization per task: the same owner message is idempotent, another is refused. */
+	recordMergeAuthorization(
+		tx: WriteTx,
+		name: string,
+		input: Omit<FirstmateMergeAuthorization, "kind" | "key" | "class">,
+	): FirstmateMergeAuthorization {
+		const existing = this.mergeAuthorizations(name);
+		const same = existing.find((authorization) => authorization.messageId === input.messageId);
+		if (same) return same;
+		firstmateAssert(existing.length === 0, "merge_authorization_conflict");
+		const authorization: FirstmateMergeAuthorization = {
+			...input,
+			kind: "merge-authorization",
+			class: "merge",
+			key: `${holdPrefix("merge-authorization", name)}${input.messageId}`,
+		};
+		this.#putHold(tx, authorization);
+		return authorization;
+	}
+
+	reviews(name: string): FirstmateReview[] {
+		return this.#holds<FirstmateReview>("review", name);
+	}
+
+	/** A session's later verdict on the same head replaces its earlier one. */
+	recordReview(tx: WriteTx, name: string, input: Omit<FirstmateReview, "kind" | "key">): FirstmateReview {
+		const review: FirstmateReview = {
+			...input,
+			kind: "review",
+			key: `${holdPrefix("review", name)}${input.headSha}/${input.sessionId}`,
+		};
+		this.#putHold(tx, review);
+		return review;
+	}
+
+	merges(name: string): FirstmateMerge[] {
+		return this.#holds<FirstmateMerge>("merge", name);
+	}
+
+	recordMerge(tx: WriteTx, name: string, input: Omit<FirstmateMerge, "kind" | "key">): FirstmateMerge {
+		const merge: FirstmateMerge = { ...input, kind: "merge", key: `${holdPrefix("merge", name)}${input.headSha}` };
+		this.#putHold(tx, merge);
+		return merge;
+	}
+
+	approvalHolds(name: string): FirstmateApprovalHold[] {
+		return this.#holds<FirstmateApprovalHold>("approval", name);
+	}
+
+	finishHolds(name: string): FirstmateFinishHold[] {
+		return this.#holds<FirstmateFinishHold>("finish", name);
+	}
+
+	/** Records the settled attempt as the lane's one open approval hold; earlier open holds are superseded. */
+	openApprovalHold(tx: WriteTx, name: string, attempt: FirstmateAttempt): void {
+		const key = `${holdPrefix("approval", name)}${String(attempt.ordinal).padStart(10, "0")}`;
+		if (this.#core.metaGet(key) !== undefined) return;
+		for (const hold of [...this.approvalHolds(name), ...this.finishHolds(name)])
+			if (hold.state === "open") this.#putHold(tx, { ...hold, state: "superseded" });
+		this.#putHold(tx, {
+			kind: "approval",
+			key,
+			taskId: attempt.taskId,
+			opRef: attempt.opRef,
+			ordinal: attempt.ordinal,
+			sessionId: attempt.sessionId,
+			epoch: attempt.epoch,
+			state: "open",
+		});
+	}
+
+	/** A confirmed preserving release: the lane keeps its records but no longer reserves its checkout or thread. */
+	released(name: string): boolean {
+		return (
+			this.#db
+				.prepare(`SELECT 1 FROM firstmate_assignments WHERE lane_name = ? AND lane_name IN (${RELEASED_LANES})`)
+				.get(name) !== null
+		);
+	}
+
+	/** The lane of the live (neither abandoned nor released) assignment that reserves `path`, if any. */
+	liveWorktreeOwner(path: string): string | undefined {
+		const row = this.#db
+			.prepare(
+				`SELECT lane_name FROM firstmate_assignments WHERE worktree_path = ? AND lane_name NOT IN (SELECT lane_name FROM firstmate_abandonments) AND lane_name NOT IN (${RELEASED_LANES})`,
+			)
+			.get(path) as { lane_name: string } | null;
+		return row?.lane_name;
 	}
 
 	approval(approvalId: string): FirstmateApproval | undefined {
@@ -181,9 +377,13 @@ export class FirstmateStore {
 		);
 	}
 
+	/**
+	 * A closed lane (empty session binding) stays decidable. Closing rotates the epoch
+	 * (abandonment, release, a lost session), so the epoch cannot be required to match.
+	 */
 	allowClosedDecision(binding: FirstmateDecisionBinding): boolean {
 		const row = this.#bindings.getSessionRecord(`work/task/${binding.name}`);
-		return !row?.sessionId && row?.epoch === binding.identity.epoch;
+		return row !== undefined && !row.sessionId;
 	}
 
 	#assertLiveBinding(binding: FirstmateDecisionBinding): void {
@@ -273,6 +473,28 @@ export class FirstmateStore {
 				approval.messageId,
 				receiptJson(approval),
 			);
+		// The approval answers its attempt's hold; an outcome approval opens the one finish hold.
+		for (const hold of this.approvalHolds(approval.name))
+			if (hold.state === "open" && hold.opRef === approval.identity.opRef)
+				this.#putHold(tx, {
+					...hold,
+					state: "resolved",
+					approvalId: approval.approvalId,
+					messageId: approval.messageId,
+				});
+		if (approval.decision === "accept_outcome") {
+			for (const hold of this.finishHolds(approval.name))
+				if (hold.state === "open") this.#putHold(tx, { ...hold, state: "superseded" });
+			this.#putHold(tx, {
+				kind: "finish",
+				key: `${holdPrefix("finish", approval.name)}${approval.approvalId}`,
+				taskId: approval.identity.taskId,
+				approvalId: approval.approvalId,
+				opRef: approval.identity.opRef,
+				approvalMessageId: approval.messageId,
+				state: "open",
+			});
+		}
 	}
 
 	releaseIntent(releaseId: string): FirstmateReleaseIntent | undefined {
@@ -320,6 +542,10 @@ export class FirstmateStore {
 	#assertRelease(intent: FirstmateReleaseIntent): void {
 		const request = intent.request;
 		firstmateAssert(identityText(intent.releaseId) && identityText(intent.requestedAt), "release_identity_invalid");
+		firstmateAssert(
+			intent.body === undefined || (typeof intent.body === "string" && intent.body.trim().length > 0),
+			"release_body_invalid",
+		);
 		this.#assertDecisionBinding(request);
 		const approval = this.approval(request.approvalId);
 		firstmateAssert(
@@ -377,6 +603,7 @@ export class FirstmateStore {
 				receipt.requestedAt === intent.requestedAt &&
 				receiptJson(receipt.request) === receiptJson(intent.request) &&
 				identityText(receipt.releasedAt) &&
+				receipt.body === intent.body &&
 				receipt.preserved === true &&
 				receipt.sessionKey === `work/task/${intent.request.name}`,
 			"release_receipt_mismatch",
@@ -392,6 +619,14 @@ export class FirstmateStore {
 		this.#db
 			.prepare("INSERT INTO firstmate_release_receipts (release_id, record_json) VALUES (?, ?)")
 			.run(tx, receipt.releaseId, receiptJson(receipt));
+		for (const hold of this.finishHolds(intent.request.name))
+			if (hold.state === "open" && hold.approvalId === intent.request.approvalId)
+				this.#putHold(tx, {
+					...hold,
+					state: "resolved",
+					releaseId: receipt.releaseId,
+					messageId: intent.request.messageId,
+				});
 	}
 
 	assignment(name: string): FirstmateAssignment | undefined {
@@ -504,21 +739,25 @@ export class FirstmateStore {
 		return attempt;
 	}
 
-	/** Repeated immutable policy may match; conflicting reservations never authorize adoption. An abandoned lane no longer reserves. */
+	/**
+	 * Repeated immutable policy may match; conflicting reservations never authorize adoption.
+	 * An abandoned lane no longer reserves. A released lane keeps its task, name and message
+	 * but no longer reserves its worktree path, git dir or thread.
+	 */
 	assertAssignment(assignment: FirstmateAssignment): void {
 		const json = assignmentJson(assignment);
 		const rows = this.#db
 			.prepare(
-				"SELECT assignment_json FROM firstmate_assignments WHERE lane_name NOT IN (SELECT lane_name FROM firstmate_abandonments) AND (task_id = ? OR lane_name = ? OR worktree_path = ? OR git_dir = ? OR thread_key = ? OR (owner_id = ? AND message_id = ?))",
+				`SELECT assignment_json FROM firstmate_assignments WHERE lane_name NOT IN (SELECT lane_name FROM firstmate_abandonments) AND (task_id = ? OR lane_name = ? OR (owner_id = ? AND message_id = ?) OR ((worktree_path = ? OR git_dir = ? OR thread_key = ?) AND lane_name NOT IN (${RELEASED_LANES})))`,
 			)
 			.all(
 				assignment.taskId,
 				assignment.name,
+				assignment.ownerId,
+				assignment.messageId,
 				assignment.worktree.path,
 				assignment.worktree.gitDir,
 				originKey(assignment.thread),
-				assignment.ownerId,
-				assignment.messageId,
 			) as { assignment_json: string }[];
 		for (const row of rows) {
 			firstmateAssert(
@@ -658,8 +897,7 @@ export class FirstmateStore {
 						priorRuntime.settledAt === prior.endedAt &&
 						workAccepted(priorRuntime) &&
 						priorRuntime.terminal?.reasonCode === "end_turn" &&
-						(continuedAfterClose ||
-							(runtime.sessionId === previous.sessionId && runtime.epoch === previous.epoch)),
+						(continuedAfterClose || (runtime.sessionId === previous.sessionId && runtime.epoch === previous.epoch)),
 					"correction_predecessor_mismatch",
 				);
 			}

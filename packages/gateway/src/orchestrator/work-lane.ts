@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
 	type ChatMessagePayload,
+	type FirstmateApproval,
 	type FirstmateReleaseIntent,
 	type FirstmateReleaseReceipt,
 	isSilentOutput,
@@ -21,6 +22,12 @@ import {
 	type WorkApproveResult,
 	type WorkDirective,
 	type WorkDirectiveResult,
+	type WorkMergeAuthorizeParams,
+	type WorkMergeAuthorizeResult,
+	type WorkMergeParams,
+	type WorkMergeResult,
+	type WorkReviewParams,
+	type WorkReviewResult,
 	type WorkFirstmateCorrectionParams,
 	type WorkFirstmateRetireParams,
 	type WorkFirstmateRetireResult,
@@ -297,6 +304,8 @@ export interface WorkLaneManagerOptions {
 	readonly hostLostGraceMs?: number;
 	readonly now?: () => number;
 	readonly checkStatusClient?: CheckStatusClient;
+	/** The `gh` executable the gateway's own FirstMate merge runs; defaults to `gh` on PATH. */
+	readonly ghExecutable?: string;
 	/** Bounded wait for a restarting broker before a lane bind fails; defaults to {@link WORK_BIND_BROKER_WAIT}. */
 	readonly brokerWait?: BrokerWaitOptions;
 	/** Test seam: one deadline for every lane git command instead of {@link GIT_TIMEOUTS}. */
@@ -536,6 +545,9 @@ export class WorkLaneManager {
 			};
 			const settled = this.#db.work.workAttemptSettle(tx, opRef, expectedVersion, record, patch, admission, checks);
 			if (!settled) return undefined;
+			// A settled FirstMate attempt is the one answer an owner approval may resolve.
+			if (attribution)
+				this.#db.work.firstmate.openApprovalHold(tx, current.sessionKey.slice("work/task/".length), attribution);
 			this.#refreshWorkSession(tx, settled.runtime, settled.runtime.settledAt!);
 			if (settled.runtime.decision === "reported" && admission?.kind === "persona") {
 				workAssert(
@@ -1139,14 +1151,19 @@ export class WorkLaneManager {
 	 * the session through the same lock a scoped release uses and records the row
 	 * that frees the reservation. The worktree stays; the assignment stays.
 	 */
-	async abandonFirstmate(name: string): Promise<{ abandoned: true; name: string } | { abandoned: false; reason: string }> {
+	async abandonFirstmate(
+		name: string,
+	): Promise<{ abandoned: true; name: string } | { abandoned: false; reason: string }> {
 		const owner = this.#db.work.firstmate;
 		const assignment = owner.assignment(name);
 		if (!assignment) return { abandoned: false, reason: "unknown assignment" };
 		const runtime = this.#db.work.workAttemptGet(owner.attemptsForTask(assignment.taskId).at(-1)?.opRef ?? "");
-		if (!runtime || runtime.settledAt === null) return { abandoned: false, reason: "abandon requires a settled attempt" };
+		if (!runtime || runtime.settledAt === null)
+			return { abandoned: false, reason: "abandon requires a settled attempt" };
 		const held = (reason: string): { abandoned: false; reason: string } => ({ abandoned: false, reason });
-		return this.#options.lanes.retirePreserving<{ abandoned: true; name: string } | { abandoned: false; reason: string }>(name, {
+		return this.#options.lanes.retirePreserving<
+			{ abandoned: true; name: string } | { abandoned: false; reason: string }
+		>(name, {
 			held,
 			prepare: () => {
 				const current = owner.assignment(name);
@@ -1176,6 +1193,14 @@ export class WorkLaneManager {
 
 	/** Separate explicit preserving release; the governor alone owns the native lane lock. */
 	async retireFirstmate(input: WorkFirstmateRetireParams): Promise<WorkFirstmateRetireResult> {
+		return this.#retireFirstmate(input);
+	}
+
+	/** `closeout` is the owner's closeout message answering the approval's open finish hold. */
+	async #retireFirstmate(
+		input: WorkFirstmateRetireParams,
+		closeout?: { readonly body: string },
+	): Promise<WorkFirstmateRetireResult> {
 		let obligations: { id: string; reason: string }[] = [];
 		const held = (reason: string): WorkFirstmateRetireResult => ({
 			retired: false,
@@ -1208,6 +1233,7 @@ export class WorkLaneManager {
 				]),
 				"release_envelope_invalid",
 			);
+			firstmateAssert(!this.#db.work.firstmate.abandoned(request.name), "release_abandoned");
 			firstmateAssert(
 				exact(request.identity, ["taskId", "jobId", "opRef", "sessionId", "epoch", "ordinal"]),
 				"release_identity_invalid",
@@ -1236,7 +1262,10 @@ export class WorkLaneManager {
 					this.#live();
 					const previous = owner.releaseForMessage(request.ownerId, request.messageId);
 					if (previous) {
-						firstmateAssert(isDeepStrictEqual(previous.request, request), "release_conflict");
+						firstmateAssert(
+							isDeepStrictEqual(previous.request, request) && previous.body === closeout?.body,
+							"release_conflict",
+						);
 						const completed = owner.releaseReceipt(previous.releaseId);
 						if (completed) return { result: { retired: true, release: completed } };
 					}
@@ -1247,6 +1276,7 @@ export class WorkLaneManager {
 						releaseId: newOpRef("firstmate-release"),
 						request,
 						requestedAt: this.#at(),
+						...(closeout ? { body: closeout.body } : {}),
 					};
 					const sessionKey = workSessionKey(request.name);
 					const check = () => {
@@ -1271,8 +1301,11 @@ export class WorkLaneManager {
 							"release_approval_mismatch",
 						);
 						const binding = this.#db.bindings.getSessionRecord(sessionKey);
+						// A closed lane (empty binding) releases the approved attempt; a live one must be that attempt's.
 						firstmateAssert(
-							binding?.sessionId === request.identity.sessionId && binding.epoch === request.identity.epoch,
+							binding !== undefined &&
+								(binding.sessionId === "" ||
+									(binding.sessionId === request.identity.sessionId && binding.epoch === request.identity.epoch)),
 							"release_binding_stale",
 						);
 						firstmateAssert(
@@ -1315,6 +1348,14 @@ export class WorkLaneManager {
 								runtime.output.disposition !== "pending",
 							"release_execution_unsettled",
 						);
+						if (closeout) {
+							// The closeout answers exactly this approval's finish hold, still open.
+							const open = owner.finishHolds(request.name).filter((hold) => hold.state === "open");
+							firstmateAssert(
+								open.length === 1 && open[0]!.approvalId === request.approvalId,
+								"release_finish_hold_changed",
+							);
+						}
 						obligations = this.#firstmateReleaseObligations(assignment, attempts);
 						firstmateAssert(obligations.length === 0, "release_obligations_unsettled");
 					};
@@ -1475,6 +1516,11 @@ export class WorkLaneManager {
 
 	/** Records owner policy only; never recovers, sends, settles or closes native work. */
 	async approveFirstmate(input: WorkApproveParams): Promise<WorkApproveResult> {
+		return this.#approveFirstmate(input);
+	}
+
+	/** `holdKey` names the open approval hold the owner's message answers; it must still be open when recorded. */
+	async #approveFirstmate(input: WorkApproveParams, holdKey?: string): Promise<WorkApproveResult> {
 		try {
 			this.#live();
 			input = structuredClone(input);
@@ -1521,6 +1567,7 @@ export class WorkLaneManager {
 			const owner = this.#db.work.firstmate;
 			const assignment = owner.assignment(input.name);
 			firstmateAssert(assignment, "assignment_missing");
+			firstmateAssert(!owner.abandoned(input.name), "approval_abandoned");
 			return await this.#port.runExclusive(workSessionKey(input.name), async (): Promise<WorkApproveResult> => {
 				this.#live();
 				// Historical exact retries do not depend on current evidence, binding or filesystem.
@@ -1540,8 +1587,11 @@ export class WorkLaneManager {
 				});
 				const before = snapshot();
 				firstmateAssert(isDeepStrictEqual(before.assignment, assignment), "approval_binding_changed");
+				// A closed lane keeps its retained evidence; its rotated binding is not stale evidence.
+				const closed = !before.binding?.sessionId;
 				const inspect = (native: boolean) =>
 					this.inspectFirstmate({
+						allowClosed: closed,
 						name: input.name,
 						taskId: input.identity.taskId,
 						opRef: input.identity.opRef,
@@ -1572,6 +1622,13 @@ export class WorkLaneManager {
 				};
 				const recorded = this.#db.transaction((tx) => {
 					firstmateAssert(isDeepStrictEqual(before, snapshot()), "approval_binding_changed");
+					if (holdKey !== undefined) {
+						const open = owner.approvalHolds(input.name).filter((hold) => hold.state === "open");
+						firstmateAssert(
+							open.length === 1 && open[0]!.key === holdKey && open[0]!.opRef === input.identity.opRef,
+							"approval_hold_changed",
+						);
+					}
 					// Store rechecks latest prepared identity (including uncertain successors),
 					// settled execution, quarantine, live binding and exact owner authority.
 					owner.recordApproval(tx, approval);
@@ -1594,63 +1651,85 @@ export class WorkLaneManager {
 			};
 		}
 	}
-	/** Resolves the one open hold from the owner's own message. */
+	/**
+	 * Resolves the lane's one open approval hold from the owner's own message in the assignment
+	 * thread. The message body is the recorded scope; the caller never repeats it.
+	 */
 	async approveFirstmateDecision(input: WorkApproveDecisionParams): Promise<WorkApproveResult> {
-		const assignment = this.#db.work.firstmate.assignment(input.name);
+		const held = (reason: string): WorkApproveResult => ({ recorded: false, held: true, reason });
+		const owner = this.#db.work.firstmate;
+		const assignment = owner.assignment(input.name);
 		const message = this.#db.inbox.decisionMessage(input.messageId);
-		if (!assignment || !message || message.authorId !== assignment.ownerId)
-			return { recorded: false, held: true, reason: "approval_authority_mismatch" };
-		const scope = message.body.trim();
-		if (scope !== input.scope) return { recorded: false, held: true, reason: "approval_scope_mismatch" };
-		const settled = this.#db.work.firstmate
-			.attemptsForTask(assignment.taskId)
-			.filter((attempt) => this.#db.work.workAttemptGet(attempt.opRef)?.settledAt);
-		const latest = settled.at(-1);
-		if (!latest || settled.length !== latest.ordinal + 1)
-			return { recorded: false, held: true, reason: "approval_target_ambiguous" };
+		if (!assignment || !message || message.authorId !== assignment.ownerId) return held("approval_authority_mismatch");
+		if (message.originKey !== originKey(assignment.thread)) return held("approval_origin_mismatch");
+		const scope = message.body;
+		if (!scope.trim()) return held("approval_scope_missing");
+		const previous = owner.approvalForMessage(assignment.ownerId, input.messageId);
+		if (previous)
+			return previous.decision === input.decision && previous.scope === scope
+				? { recorded: true, approval: previous }
+				: held("approval_conflict");
+		if (owner.abandoned(input.name)) return held("approval_abandoned");
+		const open = owner.approvalHolds(input.name).filter((hold) => hold.state === "open");
+		if (open.length > 1) return held("approval_hold_ambiguous");
+		const hold = open[0];
+		if (!hold) return held("approval_hold_missing");
 		const observed = await this.inspectFirstmate({
 			allowClosed: true,
 			name: input.name,
 			taskId: assignment.taskId,
-			opRef: latest.opRef,
+			opRef: hold.opRef,
 		});
-		if (!observed.identity)
-			return { recorded: false, held: true, reason: observed.reasons.at(-1) ?? "approval_target_unavailable" };
+		if (!observed.identity) return held(observed.reasons.at(-1) ?? "approval_target_unavailable");
 		const { sessionKey: _key, ...identity } = observed.identity;
+		if (
+			identity.opRef !== hold.opRef ||
+			identity.ordinal !== hold.ordinal ||
+			identity.sessionId !== hold.sessionId ||
+			identity.epoch !== hold.epoch
+		)
+			return held("approval_hold_mismatch");
 		const evidence =
 			observed.evidence.completeness === "unavailable"
 				? { completeness: "unavailable" as const, reasons: observed.reasons }
 				: { ...observed.evidence, reasons: observed.reasons };
 		if (input.decision === "accept_outcome" && evidence.completeness === "unavailable")
-			return { recorded: false, held: true, reason: "approval_evidence_unsupported" };
+			return held("approval_evidence_unsupported");
 		if (input.decision === "acknowledge_unavailable" && evidence.completeness !== "unavailable")
-			return { recorded: false, held: true, reason: "approval_evidence_unsupported" };
-		return this.approveFirstmate({
-			name: input.name,
-			identity,
-			ownerId: assignment.ownerId,
-			messageId: input.messageId,
-			thread: assignment.thread,
-			mandateId: assignment.mandate.id,
-			scope,
-			decision: input.decision,
-			evidence,
-		} as WorkApproveParams);
+			return held("approval_evidence_unsupported");
+		return this.#approveFirstmate(
+			{
+				name: input.name,
+				identity,
+				ownerId: assignment.ownerId,
+				messageId: input.messageId,
+				thread: assignment.thread,
+				mandateId: assignment.mandate.id,
+				scope,
+				decision: input.decision,
+				evidence,
+			} as WorkApproveParams,
+			hold.key,
+		);
 	}
-	/** Closes out the approval the owner's message already recorded. */
+	/**
+	 * Resolves the lane's one open finish hold, opened by an outcome approval, from a later owner
+	 * message in the assignment thread. The closeout message body is stored on the release.
+	 */
 	async closeoutFirstmateDecision(input: WorkCloseoutDecisionParams): Promise<WorkFirstmateRetireResult> {
-		const assignment = this.#db.work.firstmate.assignment(input.name);
+		const held = (reason: string): WorkFirstmateRetireResult => ({ retired: false, held: true, reason });
+		const owner = this.#db.work.firstmate;
+		const assignment = owner.assignment(input.name);
 		const message = this.#db.inbox.decisionMessage(input.messageId);
-		const closeout = this.#db.inbox.decisionMessage(input.closeoutMessageId);
-		const approval = assignment ? this.#db.work.firstmate.approvalForMessage(assignment.ownerId, input.messageId) : undefined;
-		if (!assignment || !message || !closeout || closeout.authorId !== assignment.ownerId || message.authorId !== assignment.ownerId || !approval)
-			return { retired: false, held: true, reason: "release_approval_missing" };
-		return this.retireFirstmate({
+		if (!assignment || !message || message.authorId !== assignment.ownerId) return held("release_authority_mismatch");
+		if (message.originKey !== originKey(assignment.thread)) return held("release_origin_mismatch");
+		if (!message.body.trim()) return held("release_body_missing");
+		const request = (approval: FirstmateApproval): WorkFirstmateRetireParams => ({
 			firstmate: {
 				name: input.name,
 				identity: approval.identity,
 				ownerId: assignment.ownerId,
-				messageId: input.closeoutMessageId,
+				messageId: input.messageId,
 				thread: assignment.thread,
 				mandateId: assignment.mandate.id,
 				scope: approval.scope,
@@ -1658,7 +1737,225 @@ export class WorkLaneManager {
 				action: "release_session_preserve_work",
 			},
 		});
+		// Exact retry of a closeout this message already recorded.
+		const previous = owner.releaseForMessage(assignment.ownerId, input.messageId);
+		if (previous) {
+			const approval = owner.approval(previous.request.approvalId);
+			if (!approval) return held("release_approval_missing");
+			return this.#retireFirstmate(request(approval), { body: message.body });
+		}
+		const open = owner.finishHolds(input.name).filter((hold) => hold.state === "open");
+		if (open.length > 1) return held("release_finish_hold_ambiguous");
+		const hold = open[0];
+		if (!hold) return held("release_finish_hold_missing");
+		const approval = owner.approval(hold.approvalId);
+		if (!approval || approval.messageId !== hold.approvalMessageId || approval.identity.opRef !== hold.opRef)
+			return held("release_approval_missing");
+		if (input.messageId === approval.messageId) return held("release_message_reused");
+		// The closeout answers the approval, so it must have been received after the approval message.
+		const approvalMessage = this.#db.inbox.decisionMessage(approval.messageId);
+		if (!approvalMessage) return held("release_approval_message_missing");
+		if (!(Date.parse(message.receivedAt) > Date.parse(approvalMessage.receivedAt)))
+			return held("release_message_not_later");
+		return this.#retireFirstmate(request(approval), { body: message.body });
 	}
+	/** The owner's message in the assignment thread stores the task's one class authorization to merge. */
+	async authorizeFirstmateMerge(input: WorkMergeAuthorizeParams): Promise<WorkMergeAuthorizeResult> {
+		const held = (reason: string): WorkMergeAuthorizeResult => ({ recorded: false, held: true, reason });
+		const owner = this.#db.work.firstmate;
+		const assignment = owner.assignment(input.name);
+		const message = this.#db.inbox.decisionMessage(input.messageId);
+		if (!assignment || !message || message.authorId !== assignment.ownerId) return held("merge_authority_mismatch");
+		if (message.originKey !== originKey(assignment.thread)) return held("merge_origin_mismatch");
+		if (!message.body.trim()) return held("merge_authorization_body_missing");
+		if (owner.abandoned(input.name)) return held("merge_abandoned");
+		const existing = owner.mergeAuthorizations(input.name);
+		if (existing.some((authorization) => authorization.messageId !== input.messageId))
+			return held("merge_authorization_conflict");
+		const authorization = this.#db.transaction((tx) =>
+			owner.recordMergeAuthorization(tx, input.name, {
+				taskId: assignment.taskId,
+				ownerId: assignment.ownerId,
+				messageId: input.messageId,
+				body: message.body,
+				recordedAt: this.#at(),
+			}),
+		);
+		return { recorded: true, messageId: authorization.messageId };
+	}
+
+	/** A session that wrote this task's change, by attempt or by its lane binding. */
+	#firstmateWriter(name: string, taskId: string, sessionId: string, origin: string | undefined): boolean {
+		return (
+			origin === workSessionKey(name) ||
+			this.#db.bindings.getSessionRecord(workSessionKey(name))?.sessionId === sessionId ||
+			this.#db.work.firstmate.attemptsForTask(taskId).some((attempt) => attempt.sessionId === sessionId)
+		);
+	}
+
+	/**
+	 * After a release the worktree path is free; a later live assignment may own it. This task's
+	 * git and gh reads run there only while no other live assignment owns the checkout.
+	 */
+	#firstmateOwnsCheckout(name: string, assignment: FirstmateAssignment): boolean {
+		const holder = this.#db.work.firstmate.liveWorktreeOwner(assignment.worktree.path);
+		return holder === undefined || holder === name;
+	}
+
+	async #firstmateHead(path: string): Promise<string | undefined> {
+		const result = await runGit(["rev-parse", "HEAD"], { cwd: path, timeoutMs: this.#gitTimeouts().local }).catch(
+			() => undefined,
+		);
+		const head = result?.exitCode === 0 ? result.stdout.trim() : "";
+		return /^[0-9a-f]{40}$/.test(head) ? head : undefined;
+	}
+
+	/** The gateway's live read; green only for an open, unmerged pull request at exactly `head`. */
+	async #firstmateGreen(assignment: FirstmateAssignment, head: string): Promise<CheckStatusSnapshot | undefined> {
+		const snapshot = await this.#options.checkStatusClient?.getCheckStatus(
+			head,
+			assignment.worktree.path,
+			undefined,
+			assignment.worktree.branch,
+		);
+		return snapshot &&
+			snapshot.status === "green" &&
+			snapshot.headSha === head &&
+			snapshot.prState === "open" &&
+			snapshot.merged !== true
+			? snapshot
+			: undefined;
+	}
+
+	/**
+	 * Records a reviewer's pass or fail for the task's current head. The writer cannot review; a
+	 * pass is refused until the gateway's live check read at that head is green, so every stored
+	 * pass was recorded after the checks finished.
+	 */
+	async reviewFirstmate(input: WorkReviewParams): Promise<WorkReviewResult> {
+		const held = (reason: string): WorkReviewResult => ({ recorded: false, held: true, reason });
+		if (!/^[0-9a-f]{40}$/.test(input.headSha)) return held("review_head_invalid");
+		const owner = this.#db.work.firstmate;
+		const assignment = owner.assignment(input.name);
+		if (!assignment) return held("review_assignment_missing");
+		const origin = this.#db.bindings.originForSessionId(input.sessionId);
+		if (this.#firstmateWriter(input.name, assignment.taskId, input.sessionId, origin))
+			return held("review_writer_refused");
+		if (!origin) return held("review_session_unbound");
+		if (!this.#firstmateOwnsCheckout(input.name, assignment)) return held("review_checkout_reassigned");
+		if ((await this.#firstmateHead(assignment.worktree.path)) !== input.headSha) return held("review_head_stale");
+		if (input.verdict === "pass" && !(await this.#firstmateGreen(assignment, input.headSha)))
+			return held("review_checks_unfinished");
+		this.#db.transaction((tx) =>
+			owner.recordReview(tx, input.name, {
+				taskId: assignment.taskId,
+				sessionId: input.sessionId,
+				headSha: input.headSha,
+				verdict: input.verdict,
+				recordedAt: this.#at(),
+			}),
+		);
+		return { recorded: true, headSha: input.headSha, verdict: input.verdict };
+	}
+
+	/**
+	 * The gateway merges the task's pull request itself, now or never: it refuses unless the owner
+	 * stored exactly one class authorization, no attempt is still running, no approval or finish
+	 * hold is open, the live check read is green at the exact head, and a session other than the
+	 * writer recorded a pass on that head after its checks finished. The writer and the reviewer
+	 * cannot ask. That head is the only one `gh pr merge --match-head-commit` may merge.
+	 */
+	async mergeFirstmate(input: WorkMergeParams): Promise<WorkMergeResult> {
+		this.#live();
+		return this.#port.runExclusive(`work/firstmate/merge/${input.name}`, () => this.#mergeFirstmate(input));
+	}
+
+	async #mergeFirstmate(input: WorkMergeParams): Promise<WorkMergeResult> {
+		const held = (reason: string): WorkMergeResult => {
+			console.error(`firstmate_merge_refused name=${input.name} reason=${reason}`);
+			return { merged: false, held: true, reason };
+		};
+		const owner = this.#db.work.firstmate;
+		const assignment = owner.assignment(input.name);
+		if (!assignment) return held("merge_assignment_missing");
+		if (owner.abandoned(input.name)) return held("merge_abandoned");
+		const origin = this.#db.bindings.originForSessionId(input.sessionId);
+		// The writer is refused whether or not its session is still bound.
+		if (this.#firstmateWriter(input.name, assignment.taskId, input.sessionId, origin))
+			return held("merge_writer_refused");
+		// An unbound caller is away: nobody is present to own the merge it asks for.
+		if (!origin) return held("merge_caller_away");
+		const reviews = owner.reviews(input.name);
+		if (reviews.some((review) => review.sessionId === input.sessionId)) return held("merge_reviewer_refused");
+		// The store keeps at most one authorization per task, copied from this assignment.
+		const authorization = owner.mergeAuthorizations(input.name)[0];
+		if (!authorization) return held("merge_authorization_missing");
+		// A merge is never queued behind work still running.
+		const latest = owner.attemptsForTask(assignment.taskId).at(-1);
+		const runtime = latest ? this.#db.work.workAttemptGet(latest.opRef) : undefined;
+		if (!runtime || runtime.settledAt === null) return held("merge_attempt_open");
+		if (
+			owner.approvalHolds(input.name).some((hold) => hold.state === "open") ||
+			owner.finishHolds(input.name).some((hold) => hold.state === "open")
+		)
+			return held("merge_hold_open");
+		if (!this.#firstmateOwnsCheckout(input.name, assignment)) return held("merge_checkout_reassigned");
+		const head = await this.#firstmateHead(assignment.worktree.path);
+		if (!head) return held("merge_head_unavailable");
+		const previous = owner.merges(input.name).find((merge) => merge.headSha === head);
+		if (previous) return { merged: true, prNumber: previous.prNumber, headSha: previous.headSha };
+		const checks = await this.#firstmateGreen(assignment, head);
+		if (!checks) return held("merge_checks_not_green");
+		const atHead = reviews.filter((review) => review.headSha === head);
+		if (atHead.some((review) => review.verdict === "fail")) return held("merge_review_failed");
+		// The caller is no reviewer (refused above), so no pass is its own.
+		const pass = atHead.find(
+			(review) =>
+				review.verdict === "pass" && !this.#firstmateWriter(input.name, assignment.taskId, review.sessionId, undefined),
+		);
+		if (!pass) return held("merge_review_missing");
+		if (!this.#firstmateOwnsCheckout(input.name, assignment)) return held("merge_checkout_reassigned");
+		let exitCode: number;
+		try {
+			const child = Bun.spawn(
+				[
+					this.#options.ghExecutable ?? "gh",
+					"pr",
+					"merge",
+					String(checks.prNumber),
+					"--merge",
+					"--match-head-commit",
+					head,
+				],
+				{
+					cwd: assignment.worktree.path,
+					stdin: "ignore",
+					stdout: "ignore",
+					stderr: "ignore",
+					timeout: 60_000,
+					killSignal: "SIGKILL",
+				},
+			);
+			exitCode = await child.exited;
+		} catch {
+			return held("merge_failed");
+		}
+		if (exitCode !== 0) return held("merge_failed");
+		const merge = this.#db.transaction((tx) =>
+			owner.recordMerge(tx, input.name, {
+				taskId: assignment.taskId,
+				prNumber: checks.prNumber,
+				headSha: head,
+				authorizationMessageId: authorization.messageId,
+				reviewSessionId: pass.sessionId,
+				requestedBy: input.sessionId,
+				mergedAt: this.#at(),
+			}),
+		);
+		console.info(`firstmate_merged name=${input.name} pr=${merge.prNumber} head=${merge.headSha}`);
+		return { merged: true, prNumber: merge.prNumber, headSha: merge.headSha };
+	}
+
 	/** Trusted local protocol composition; not Discord author ingress. */
 	async startFirstmate(assignment: FirstmateAssignment): Promise<WorkStartResult> {
 		this.#live();
@@ -1716,6 +2013,16 @@ export class WorkLaneManager {
 			);
 		});
 	}
+	/** A released or abandoned task takes no follow-up; refused before any session binds. */
+	#assertFollowUpOpen(name: string): void {
+		const owner = this.#db.work.firstmate;
+		const reason = owner.released(name) ? "task_released" : owner.abandoned(name) ? "task_abandoned" : undefined;
+		if (reason)
+			throw new ProtocolError("invalid_params", "FirstMate admission refused", {
+				reasonCode: "firstmate_admission_refused",
+				reason,
+			});
+	}
 	async startFirstmateCorrection(input: WorkFirstmateCorrectionParams): Promise<WorkStartResult> {
 		this.#live();
 		input = structuredClone(input);
@@ -1762,6 +2069,7 @@ export class WorkLaneManager {
 		};
 		const cause = evidence.cause;
 		firstmateAssert(cause.kind === "correction", "correction_cause_invalid");
+		this.#assertFollowUpOpen(assignment.name);
 		if (this.#options.lanes.preservingRelease(assignment.name))
 			throw new ProtocolError("invalid_params", "FirstMate admission refused", {
 				reasonCode: "firstmate_admission_refused",
@@ -1823,6 +2131,7 @@ export class WorkLaneManager {
 							sessionId: duplicate.sessionId,
 						};
 					}
+					this.#assertFollowUpOpen(assignment.name);
 					this.#options.lanes.assertAdmission(assignment.name);
 					this.#assertCorrectionPredecessor(evidence);
 					return this.#startLocked(
@@ -1925,7 +2234,9 @@ export class WorkLaneManager {
 		}
 		for (const row of this.#db.work.laneJobRows(true)) {
 			if (row.job_id === job?.jobId) continue;
-			if (this.#db.work.firstmate.abandoned(row.lane_key.replace(/^work-/, ""))) continue;
+			// An abandoned or released lane no longer reserves its checkout.
+			const laneName = row.lane_key.replace(/^work-/, "");
+			if (this.#db.work.firstmate.abandoned(laneName) || this.#db.work.firstmate.released(laneName)) continue;
 			firstmateAssert(
 				realpathOfPossiblyMissing(row.worktree_path) !== assignment.worktree.path,
 				"worktree_already_owned",

@@ -1071,14 +1071,13 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					break;
 				}
 				if (command === "retire" && args[0] === "--decision") {
-					const [, name, messageId, closeoutMessageId] = args;
-					if (args.length !== 4 || !name || !messageId?.trim() || !closeoutMessageId?.trim()) throw new Error(usage);
+					const [, name, messageId] = args;
+					if (args.length !== 3 || !name || !messageId?.trim()) throw new Error(usage);
 					const client = await connectGatewaySocket(parsed.socket, { requestTimeoutMs: 120_000 });
 					try {
 						const result = await client.request<WorkFirstmateRetireResult>("work.retire.decision", {
 							name,
 							messageId,
-							closeoutMessageId,
 						});
 						console.log(JSON.stringify(result));
 						if (!result.retired) process.exitCode = 1;
@@ -1088,15 +1087,13 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					break;
 				}
 				if (command === "approve" && args[0] === "--decision") {
-					const [, name, messageId, decision, ...rest] = args;
-					const scope = rest.join(" ").trim();
+					const [, name, messageId, decision] = args;
 					if (
-						args.length < 5 ||
+						args.length !== 4 ||
 						!name ||
 						!messageId?.trim() ||
 						!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) ||
-						(decision !== "accept" && decision !== "acknowledge") ||
-						!scope
+						(decision !== "accept" && decision !== "acknowledge")
 					)
 						throw new Error(usage);
 					const client = await connectGatewaySocket(parsed.socket);
@@ -1105,7 +1102,6 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							name,
 							messageId,
 							decision: decision === "accept" ? "accept_outcome" : "acknowledge_unavailable",
-							scope,
 						});
 						console.log(JSON.stringify(result));
 						if (!result.recorded) process.exitCode = 1;

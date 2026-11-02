@@ -53,11 +53,15 @@ const OTHER_PROMPT_PNG = Uint8Array.from(
 	Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAC0lEQVR4nGNgQAYAAA4AAamRc7EAAAAASUVORK5CYII=", "base64"),
 );
 afterEach(async () => {
-	await server?.stop();
+	// Detach this test's fixtures before awaiting: a stop that drains an in-flight turn can outlive the hook
+	// timeout, and its continuation must never clear or delete the next test's server and directory.
+	const stopping = server;
+	const removing = directory;
 	server = undefined;
-	workSessionIds.clear();
-	if (directory) await rm(directory, { recursive: true, force: true });
 	directory = "";
+	workSessionIds.clear();
+	await stopping?.stop();
+	if (removing) await rm(removing, { recursive: true, force: true });
 });
 
 async function connect(socketPath: string): Promise<{
@@ -305,10 +309,17 @@ test("FirstMate work.retire dispatch requires exact outcome despite confirmed un
 		await until(() => Boolean(database.work.workAttemptGet(start.opRef)?.settledAt));
 		await port.runExclusive(start.sessionKey, async () => {});
 		const runtime = database.work.workAttemptGet(start.opRef)!;
-		expect(runtime.decision).toBe("fallback");
-		expect(database.inbox.messageDisposition(parent, runtime.reportId)).toBeUndefined();
+		expect(runtime.decision).toBe("reported");
+		expect(database.inbox.messageDisposition(parent, runtime.reportId)?.message).toMatchObject({
+			message_id: runtime.reportId,
+			origin_key: parent,
+			source: "lane_report",
+		});
 		expect(database.outbox.get(runtime.deliveryId)).toMatchObject({ turnId: runtime.opRef, originKey: parent });
-		expect(port.steers).toHaveLength(0);
+		// The reported lane outcome is steered into the busy parent turn, not posted as a separate answer.
+		await until(() => port.steers.length === 1);
+		expect(port.steers[0]).toMatchObject({ sessionId: parentSend.sessionId });
+		expect(port.steers[0]!.text).toContain(database.inbox.messageDisposition(parent, runtime.reportId)!.message.body);
 		port.complete(parentSend.opRef, "Unrelated parent reply");
 		await until(() => database.inbox.messageDisposition(parent, "parent-message")?.message.turn_state === "done");
 		await port.runExclusive(parent, async () => {});
@@ -654,15 +665,32 @@ for (const { output, state, unavailable } of [
 			if (state === "done") await manager.recover();
 			const job = () => parseLaneJobRecord(database.work.laneJobJson(start.jobId)!);
 			expect(job().state).toBe(state);
-			expect(database.work.workAttemptGet(start.opRef)?.decision).toBe("fallback");
+			expect(database.work.workAttemptGet(start.opRef)?.decision).toBe("reported");
 			const sql = () => database.core.groupDb("work");
 			const initialRuntime = database.work.workAttemptGet(start.opRef)!;
 			expect(database.outbox.get(initialRuntime.deliveryId)).toMatchObject({
 				turnId: start.opRef,
 				originKey: originKey(assignment.thread),
 			});
-			expect(database.inbox.messageDisposition(originKey(assignment.thread), initialRuntime.reportId)).toBeUndefined();
-			expect(port.sends.some((send) => send.text.includes("[Internal report from another Gajae session"))).toBe(false);
+			const initialReport = database.inbox.messageDisposition(originKey(assignment.thread), initialRuntime.reportId);
+			expect(initialReport?.message).toMatchObject({
+				message_id: initialRuntime.reportId,
+				origin_key: originKey(assignment.thread),
+				source: "lane_report",
+			});
+			// The idle parent persona is woken once with the reported outcome; settle that turn before read-only checks.
+			await until(() => port.sends.some((send) => send.text.includes(initialReport!.message.body)));
+			const reportWake = port.sends.filter((send) => send.text.includes(initialReport!.message.body));
+			expect(reportWake).toHaveLength(1);
+			expect(reportWake[0]!.text).toContain("[Internal report from another Gajae session");
+			expect(reportWake[0]!.sessionId).toBe(database.bindings.getSessionRecord(originKey(assignment.thread))!.sessionId);
+			port.complete(reportWake[0]!.opRef, "Parent absorbed the report.");
+			await until(
+				() =>
+					database.inbox.messageDisposition(originKey(assignment.thread), initialRuntime.reportId)?.message.state ===
+					"done",
+			);
+			await port.runExclusive(originKey(assignment.thread), async () => {});
 			const confirmOutcomes = () =>
 				database.transaction((tx) => {
 					for (const row of database.outbox.rows())
@@ -1088,10 +1116,31 @@ for (const { output, state, unavailable } of [
 				turnId: corrected.opRef,
 				payloadJson: expect.stringContaining(corrected.opRef),
 			});
+			expect(correctedRuntime.decision).toBe("reported");
+			const correctedReport = database.inbox.messageDisposition(
+				originKey(assignment.thread),
+				correctedRuntime.reportId,
+			);
+			expect(correctedReport?.message).toMatchObject({
+				message_id: correctedRuntime.reportId,
+				origin_key: originKey(assignment.thread),
+				source: "lane_report",
+			});
+			await until(() => port.sends.some((send) => send.text.includes(correctedReport!.message.body)));
+			const correctedWake = port.sends.filter((send) => send.text.includes(correctedReport!.message.body));
+			expect(correctedWake).toHaveLength(1);
+			expect(correctedWake[0]!.opRef).not.toBe(reportWake[0]!.opRef);
 			expect(
-				database.inbox.messageDisposition(originKey(assignment.thread), correctedRuntime.reportId),
-			).toBeUndefined();
-			expect(port.sends.some((send) => send.text.includes("[Internal report from another Gajae session"))).toBe(false);
+				port.sends.filter((send) => send.text.includes("[Internal report from another Gajae session")),
+			).toHaveLength(2);
+			port.complete(correctedWake[0]!.opRef, "Parent absorbed the corrected report.");
+			await until(
+				() =>
+					database.inbox.messageDisposition(originKey(assignment.thread), correctedRuntime.reportId)?.message
+						.state === "done",
+			);
+			await port.runExclusive(originKey(assignment.thread), async () => {});
+			confirmOutcomes();
 			expect(database.outbox.get(originalRuntime.deliveryId)).toEqual(originalReport);
 			expect(database.work.workAttemptGet(start.opRef)).toEqual(originalRuntime);
 			expect(owner.initial(assignment.taskId)).toEqual(originalAttribution);
@@ -1397,12 +1446,34 @@ for (const { output, state, unavailable } of [
 			await port.runExclusive(independent.sessionKey, async () => {});
 			const independentRuntime = database.work.workAttemptGet(independent.opRef)!;
 			database.transaction((tx) => database.outbox.confirm(tx, independentRuntime.deliveryId));
-			expect(independentRuntime.decision).toBe("fallback");
+			expect(independentRuntime.decision).toBe("reported");
 			expect(independentRuntime.reportId).not.toBe(originalRuntime.reportId);
 			expect(independentRuntime.reportId).not.toBe(correctedRuntime.reportId);
 			expect(database.outbox.get(independentRuntime.deliveryId)).toMatchObject({
 				originKey: independentParentKey,
 				turnId: independent.opRef,
+			});
+			const independentReport = database.inbox.messageDisposition(independentParentKey, independentRuntime.reportId);
+			expect(independentReport?.message).toMatchObject({
+				message_id: independentRuntime.reportId,
+				origin_key: independentParentKey,
+				source: "lane_report",
+			});
+			await until(() => port.sends.some((send) => send.text.includes(independentReport!.message.body)));
+			const independentWake = port.sends.filter((send) => send.text.includes(independentReport!.message.body));
+			expect(independentWake).toHaveLength(1);
+			expect(independentWake[0]!.sessionId).toBe(independentParentSession!);
+			port.complete(independentWake[0]!.opRef, "Independent parent absorbed the report.");
+			await until(
+				() =>
+					database.inbox.messageDisposition(independentParentKey, independentRuntime.reportId)?.message.state ===
+					"done",
+			);
+			await port.runExclusive(independentParentKey, async () => {});
+			database.transaction((tx) => {
+				for (const row of database.outbox.rows())
+					if (row.origin_key === independentParentKey && row.state !== "confirmed")
+						database.outbox.confirm(tx, row.delivery_id);
 			});
 			const independentInitial = owner.initial(independentAssignment.taskId)!;
 			expect(independentInitial).toMatchObject({
