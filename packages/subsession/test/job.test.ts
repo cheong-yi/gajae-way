@@ -4,6 +4,7 @@ import {
 	applyReconciliation,
 	classifyWorkEvidence,
 	closeAttempt,
+	abortJob,
 	createLaneJobRecord,
 	type JobAttempt,
 	LANE_JOB_SCHEMA_VERSION,
@@ -543,6 +544,30 @@ describe("attempts: duplicate prevention and one deterministic continuation path
 		});
 		expect(current.state).toBe("awaiting_operator");
 		expect(current.escalations.some((entry) => entry.includes(attempt().opRef))).toBe(true);
+	});
+
+	test("abortJob ends a hold without making the lane continuable, and leaves a landed job done", () => {
+		const held = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "terminal_missing_receipt",
+			endedAt: NOW.toISOString(),
+		});
+		expect(held.state).toBe("awaiting_operator");
+		const aborted = abortJob({ record: held, at: "2026-08-27T12:02:00.000Z", note: "no outcome" });
+		expect(aborted.state).toBe("aborted");
+		expect(aborted.attempts).toEqual(held.attempts);
+		expect(planContinuation(planInput({ record: aborted, latestAttempt: aborted.attempts[0] })).action).toBe(
+			"hold_for_operator",
+		);
+		const landed = closeAttempt({
+			record: appendAttempt(record(), attempt()),
+			opRef: attempt().opRef,
+			endState: "completed",
+			endedAt: NOW.toISOString(),
+		});
+		const done = { ...landed, state: "done" as const };
+		expect(abortJob({ record: done, at: "2026-08-27T12:02:00.000Z", note: "no outcome" })).toBe(done);
 	});
 });
 
