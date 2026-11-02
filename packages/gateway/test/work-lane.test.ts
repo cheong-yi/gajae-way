@@ -1164,11 +1164,14 @@ test("FirstMate abandonment refuses a dirty checkout without touching it and aba
 	expect(await Bun.file(join(path, "tracked.txt")).text()).toBe("changed\n");
 	f.git("-C", path, "checkout", "--", "tracked.txt");
 	// A clean checkout abandons, closes the session and frees the reservation.
+	expect(f.job().state).not.toBe("aborted");
+	expect(f.job().state).not.toBe("done");
 	expect(status()).toBe("");
 	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
 	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
 	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: path }]);
 	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+	expect(f.job().state).toBe("aborted");
 	expect(f.git("-C", path, "rev-parse", "HEAD")).toBe(head);
 	expect(await Bun.file(join(path, "tracked.txt")).text()).toBe("base\n");
 });
@@ -1351,6 +1354,31 @@ test("FirstMate release and correction share one native lock; pending release bl
 	).rejects.toMatchObject({ detail: { reason: "task_released" } });
 	expect(f.port.binds).toHaveLength(binds);
 	expect(f.owner.attemptsForTask(f.assignment.taskId)).toHaveLength(1);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+});
+test("FirstMate red checks after release do not bind a session the cap would count", async () => {
+	const checks = scriptedChecks({ prNumber: 701, status: "red", failingChecks: ["parser-test"] });
+	const f = await releaseFixture();
+	const released = await f.manager.retireFirstmate(f.request);
+	if (!released.retired) throw new Error(released.reason);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+	const head = f.git("-C", f.assignment.worktree.path, "rev-parse", "HEAD");
+	const parked = {
+		...f.job(),
+		state: "awaiting_checks" as const,
+		awaitingChecks: { prNumber: 701, headSha: head, since: new Date().toISOString(), retries: 0 },
+		updatedAt: new Date().toISOString(),
+	};
+	f.db.transaction((tx) =>
+		f.db.work.putLaneJob(tx, {
+			...parked,
+			laneKey: laneJobIdentity(f.assignment.name).laneKey,
+			json: JSON.stringify(parked),
+		}),
+	);
+	const binds = f.port.binds.length;
+	await f.restart({ checkStatusClient: checks.client });
+	expect(f.port.binds).toHaveLength(binds);
 	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
 });
 

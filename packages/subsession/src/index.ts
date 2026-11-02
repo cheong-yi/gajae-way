@@ -27,6 +27,7 @@ export {
 	type AwaitingChecks,
 	type AwaitingChecksInput,
 	acknowledgeHold,
+	abortJob,
 	appendAttempt,
 	applyReconciliation,
 	type ChecksSettlement,

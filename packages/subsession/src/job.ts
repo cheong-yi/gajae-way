@@ -707,6 +707,29 @@ export type AcknowledgeHoldInput = {
  * job returns to the continuable `attempt_ended` state. `done`/`aborted`
  * jobs and records without a hold are returned unchanged.
  */
+export type AbortJobInput = {
+	readonly record: LaneJobRecord;
+	readonly at: string;
+	readonly note: string;
+};
+
+/**
+ * Operator end with no outcome. This is not a resume: `acknowledgeHold` would
+ * return the job to the continuable `attempt_ended` state. A job that already
+ * landed (`done`) keeps that fact; the abandonment row is the later decision.
+ */
+export function abortJob(input: AbortJobInput): LaneJobRecord {
+	if (input.record.state === "aborted" || input.record.state === "done") return input.record;
+	return Object.freeze({
+		...input.record,
+		state: "aborted",
+		updatedAt: input.at,
+		escalations: Object.freeze([
+			...input.record.escalations,
+			`${input.at} operator abandoned the lane: ${input.note}`,
+		]),
+	});
+}
 export function acknowledgeHold(input: AcknowledgeHoldInput): LaneJobRecord {
 	if (input.record.state !== "stalled" && input.record.state !== "awaiting_operator") {
 		return input.record;

@@ -39,6 +39,7 @@ import {
 import {
 	type AwaitingChecks,
 	acknowledgeHold,
+	abortJob,
 	appendAttempt,
 	applyReconciliation,
 	type ChecksSettlement,
@@ -1148,8 +1149,9 @@ export class WorkLaneManager {
 	}
 	/**
 	 * Abandonment is the preserving release with no outcome to approve. It closes
-	 * the session through the same lock a scoped release uses and records the row
-	 * that frees the reservation. The worktree stays; the assignment stays.
+	 * the session through the same lock a scoped release uses, records the row
+	 * that frees the reservation, and aborts the job in that same transaction.
+	 * A job that already landed stays done. The worktree stays; the assignment stays.
 	 */
 	async abandonFirstmate(
 		name: string,
@@ -1180,9 +1182,21 @@ export class WorkLaneManager {
 					},
 					persistIntent: () => {},
 					complete: () => {
+						const at = this.#at();
+						let job: LaneJobRecord | undefined;
+						try {
+							job = this.#job(name);
+						} catch (error) {
+							const detail = error instanceof ProtocolError ? error.detail : undefined;
+							const reason =
+								detail && typeof detail === "object" && "reasonCode" in detail ? detail.reasonCode : undefined;
+							if (reason !== "lane_state_corrupt") throw error;
+						}
+						const aborted = job ? abortJob({ record: job, at, note: "no outcome" }) : undefined;
 						this.#db.transaction((tx) => {
-							owner.recordAbandonment(tx, name, "no_outcome", this.#at());
+							owner.recordAbandonment(tx, name, "no_outcome", at);
 							this.#db.bindings.rotateEpoch(tx, workSessionKey(name));
+							if (aborted && aborted !== job) this.#putJob(name, aborted, tx);
 						});
 						return { abandoned: true as const, name };
 					},
@@ -2398,6 +2412,14 @@ export class WorkLaneManager {
 				state: job.state,
 				reason: "the lane is complete; retire it before creating another lane with this name",
 			};
+		if (job?.state === "aborted")
+			return {
+				started: false,
+				held: true,
+				jobId,
+				state: job.state,
+				reason: "the job was aborted by an operator; it is not resumed",
+			};
 		if (job && (job.state === "awaiting_operator" || job.state === "stalled")) {
 			if (!input.resume)
 				return {
@@ -2483,6 +2505,8 @@ export class WorkLaneManager {
 						bindAttemptStarted = true;
 						let binding: Awaited<ReturnType<SessionPort["bind"]>>;
 						try {
+							// A released or abandoned lane must not grow a session the cap would count.
+							this.#assertFollowUpOpen(input.name);
 							if (correction) {
 								const predecessor = this.#assertCorrectionPredecessor(correction);
 								if (predecessor) {
@@ -2527,7 +2551,7 @@ export class WorkLaneManager {
 								});
 							}
 						} catch (error) {
-							if (correction) throw error;
+							if (correction || error instanceof ProtocolError) throw error;
 							throw isBrokerUnavailable(error) ? error : bindFailed(error);
 						}
 						this.#live();
