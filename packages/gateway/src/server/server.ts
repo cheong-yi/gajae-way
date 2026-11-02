@@ -101,6 +101,7 @@ import {
 	markPaneClosed,
 	paneClosed,
 	paneDeliveryGuard,
+	paneKeyClosed,
 	paneOriginRecorded,
 	readChildPane,
 	readLanePane,
@@ -1113,15 +1114,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		busyStallMs: options.config.sessions?.busyStallMs,
 		unresolvedHoldMs: options.config.sessions?.unresolvedHoldMs,
 		brokerGeneration: () => options.broker?.generation ?? 0,
-		paneClosed: (key) => {
-			const raw = options.database.bindings.getSessionRecord(key)?.originRefJson;
-			if (!raw) return false;
-			try {
-				return paneClosed(options.database, JSON.parse(raw) as OriginRef);
-			} catch {
-				return false;
-			}
-		},
+		paneClosed: (key) => paneKeyClosed(options.database, key),
 		brokerAvailable: () => options.broker?.isAvailable ?? true,
 		// biome-ignore lint/style/noNonNullAssertion: broker is non-null when lambda is called
 		brokerLiveness: options.broker ? () => options.broker!.judgeLiveness() : undefined,
@@ -1945,7 +1938,7 @@ async function handleRequest(
 		}
 		case "work.approve.decision": {
 			const params = request.params;
-			const fields = ["name", "messageId", "decision", "scope"];
+			const fields = ["name", "messageId", "decision"];
 			if (
 				!workObject(params) ||
 				Object.keys(params).some((key) => !fields.includes(key)) ||
@@ -1953,17 +1946,83 @@ async function handleRequest(
 				(params.decision !== "accept_outcome" && params.decision !== "acknowledge_unavailable")
 			)
 				invalidWorkWire("decision");
-			const result = await runtime.work.approveFirstmateDecision(params as WorkApproveDecisionParams);
+			const decision: WorkApproveDecisionParams = {
+				name: params.name as string,
+				messageId: params.messageId as string,
+				decision: params.decision,
+			};
+			const result = await runtime.work.approveFirstmateDecision(decision);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
 		case "work.retire.decision": {
 			const params = request.params;
-			const fields = ["name", "messageId", "closeoutMessageId"];
-			if (!workObject(params) || Object.keys(params).some((key) => !fields.includes(key)) || fields.some((key) => !workString(params[key])))
+			const fields = ["name", "messageId"];
+			if (
+				!workObject(params) ||
+				Object.keys(params).some((key) => !fields.includes(key)) ||
+				fields.some((key) => !workString(params[key]))
+			)
 				invalidWorkWire("closeout");
-			const result = await runtime.work.closeoutFirstmateDecision(params as WorkCloseoutDecisionParams);
-			if (result.retired) await closeFirstmatePane(runtime, options.database, (params as WorkCloseoutDecisionParams).name);
+			const closeout: WorkCloseoutDecisionParams = {
+				name: params.name as string,
+				messageId: params.messageId as string,
+			};
+			const result = await runtime.work.closeoutFirstmateDecision(closeout);
+			if (result.retired) await closeFirstmatePane(runtime, options.database, closeout.name);
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "work.merge.authorize": {
+			const params = request.params;
+			const fields = ["name", "messageId"];
+			if (
+				!workObject(params) ||
+				Object.keys(params).some((key) => !fields.includes(key)) ||
+				fields.some((key) => !workString(params[key]))
+			)
+				invalidWorkWire("merge_authorize");
+			const result = await runtime.work.authorizeFirstmateMerge({
+				name: params.name as string,
+				messageId: params.messageId as string,
+			});
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "work.review": {
+			// Verdict only: no free text, command or credential crosses this verb.
+			const params = request.params;
+			const fields = ["name", "sessionId", "headSha", "verdict"];
+			if (
+				!workObject(params) ||
+				Object.keys(params).some((key) => !fields.includes(key)) ||
+				fields.some((key) => !workString(params[key])) ||
+				(params.verdict !== "pass" && params.verdict !== "fail")
+			)
+				invalidWorkWire("review");
+			const result = await runtime.work.reviewFirstmate({
+				name: params.name as string,
+				sessionId: params.sessionId as string,
+				headSha: params.headSha as string,
+				verdict: params.verdict,
+			});
+			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
+			return;
+		}
+		case "work.merge": {
+			// No auto, queue or method field: the gateway merges now at the exact green head or refuses.
+			const params = request.params;
+			const fields = ["name", "sessionId"];
+			if (
+				!workObject(params) ||
+				Object.keys(params).some((key) => !fields.includes(key)) ||
+				fields.some((key) => !workString(params[key]))
+			)
+				invalidWorkWire("merge");
+			const result = await runtime.work.mergeFirstmate({
+				name: params.name as string,
+				sessionId: params.sessionId as string,
+			});
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}

@@ -61,12 +61,13 @@ SQLite records one active private broker authority and immutable gateway-created
 | `recall_snippets` | `inbox` | `store/groups/inbox.ts` |
 | `lane_jobs` | `work` | `store/groups/work.ts` |
 | `work_attempt_runtime` | `work` | `store/groups/work.ts` |
+| `lane_reports` | `work` | `store/groups/work.ts` |
 | `firstmate_assignments` | `work` | `store/groups/work.ts` |
 | `firstmate_attempts` | `work` | `store/groups/work.ts` |
 | `firstmate_approvals` | `work` | `store/groups/work.ts` |
 | `firstmate_release_intents` | `work` | `store/groups/work.ts` |
 | `firstmate_release_receipts` | `work` | `store/groups/work.ts` |
-| `lane_reports` | `work` | `store/groups/work.ts` |
+| `firstmate_abandonments` | `work` | `store/groups/work.ts` |
 | `monitors` | `monitors` | `store/groups/monitors.ts` |
 | `monitor_events` | `monitors` | `store/groups/monitors.ts` |
 | `authored_outputs` | `monitors` | `store/groups/monitors.ts` |

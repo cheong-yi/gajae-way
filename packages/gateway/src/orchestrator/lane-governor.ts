@@ -179,6 +179,11 @@ export class LaneGovernor {
 					prepared.recheck();
 				};
 				recheck();
+				// A preserving release never discards checkout work: it refuses while the task
+				// worktree has tracked or untracked changes. Nothing is reset, deleted or merged.
+				const dirty = await dirtyCheckout(prepared.repo);
+				recheck();
+				if (dirty) return policy.held(dirty);
 				if (prepared.pending) {
 					const proof = await this.#safeLiveness(prepared.sessionId, prepared.repo);
 					recheck();
@@ -811,6 +816,25 @@ function unsettled(sessionKey: string, lane: ActiveLane): LaneRetireOutcome {
 				? `lane job record for ${sessionKey} is corrupt; reconcile it before retiring`
 				: `attempt still open on ${sessionKey}; let it end first`,
 	};
+}
+
+/**
+ * Held reason when the task checkout has tracked or untracked changes, or when its
+ * status cannot be read. A worktree that no longer exists holds no work to preserve.
+ */
+async function dirtyCheckout(repo: string): Promise<string | undefined> {
+	if (!existsSync(repo)) return undefined;
+	let status: Awaited<ReturnType<typeof runGit>>;
+	try {
+		status = await runGit(["-C", repo, "status", "--porcelain", "--untracked-files=all"]);
+	} catch (error) {
+		return `dirty checkout check failed at ${repo}: ${sanitizeDiagnostic(diagnostic(error))}`;
+	}
+	if (status.exitCode !== 0)
+		return `dirty checkout check failed at ${repo}: ${sanitizeDiagnostic(status.stderr.trim() || `git status exited ${status.exitCode}`)}`;
+	const changes = status.stdout.split("\n").filter((line) => line.trim().length > 0);
+	if (changes.length === 0) return undefined;
+	return `dirty checkout at ${repo}: ${changes.length} tracked or untracked change(s); commit or remove them before the lane is released or abandoned`;
 }
 
 function diagnostic(error: unknown): string {

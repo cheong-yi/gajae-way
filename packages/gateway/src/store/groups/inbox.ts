@@ -1282,18 +1282,37 @@ export class InboxGroup {
 		return this.#db.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ?").get(messageId) !== null;
 	}
 
-	decisionMessage(messageId: string): { readonly authorId: string; readonly body: string } | undefined {
+	/** Author, body, origin and receipt time of a recorded human message; the caller decides which origin answers. */
+	decisionMessage(
+		messageId: string,
+	):
+		| { readonly authorId: string; readonly body: string; readonly originKey: string; readonly receivedAt: string }
+		| undefined {
 		const inbound = this.#db
-			.prepare("SELECT engagement_json, body FROM inbound_messages WHERE message_id = ?")
-			.get(messageId) as { engagement_json: string | null; body: string } | null;
+			.prepare("SELECT engagement_json, body, origin_key, received_at FROM inbound_messages WHERE message_id = ?")
+			.get(messageId) as {
+			engagement_json: string | null;
+			body: string;
+			origin_key: string;
+			received_at: string;
+		} | null;
 		if (inbound) {
 			const authorId = JSON.parse(inbound.engagement_json ?? "{}").authorId;
-			return typeof authorId === "string" && authorId ? { authorId, body: inbound.body } : undefined;
+			return typeof authorId === "string" && authorId
+				? { authorId, body: inbound.body, originKey: inbound.origin_key, receivedAt: inbound.received_at }
+				: undefined;
 		}
 		const context = this.#db
-			.prepare("SELECT author_id, body FROM conversation_context WHERE message_id = ?")
-			.get(messageId) as { author_id: string | null; body: string } | null;
-		return context?.author_id ? { authorId: context.author_id, body: context.body } : undefined;
+			.prepare("SELECT author_id, body, origin_key, received_at FROM conversation_context WHERE message_id = ?")
+			.get(messageId) as { author_id: string | null; body: string; origin_key: string; received_at: string } | null;
+		return context?.author_id
+			? {
+					authorId: context.author_id,
+					body: context.body,
+					originKey: context.origin_key,
+					receivedAt: context.received_at,
+				}
+			: undefined;
 	}
 
 	hasQuarantinedTurn(opRef: string): boolean {

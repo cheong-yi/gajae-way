@@ -895,19 +895,59 @@ export type WorkApproveResult =
 	| { readonly recorded: true; readonly approval: FirstmateApproval }
 	| { readonly recorded: false; readonly held: true; readonly reason: string };
 
-/** Owner decision only. The gateway reads the owner's message in the task thread. */
+/**
+ * Owner decision only. The gateway resolves the lane's one open approval hold from the
+ * owner's message in the assignment thread; that message's body is the recorded scope.
+ */
 export interface WorkApproveDecisionParams {
 	readonly name: string;
 	readonly messageId: string;
 	readonly decision: "accept_outcome" | "acknowledge_unavailable";
-	readonly scope: string;
 }
-/** Closeout decision only. The gateway fills the release from the approval this message recorded. */
+/**
+ * Closeout decision only. The gateway resolves the lane's one open finish hold, opened by an
+ * outcome approval, from a later owner message in the assignment thread and stores its body.
+ */
 export interface WorkCloseoutDecisionParams {
 	readonly name: string;
 	readonly messageId: string;
-	readonly closeoutMessageId: string;
 }
+/**
+ * Owner decision only. The owner's message in the assignment thread stores the task's one
+ * class authorization to merge; its body is recorded. It merges nothing by itself.
+ */
+export interface WorkMergeAuthorizeParams {
+	readonly name: string;
+	readonly messageId: string;
+}
+export type WorkMergeAuthorizeResult =
+	| { readonly recorded: true; readonly messageId: string }
+	| { readonly recorded: false; readonly held: true; readonly reason: string };
+/**
+ * A review verdict, pass or fail only, from a session that did not write the change. It carries
+ * no command and grants no merge; a pass is refused until the live checks at that head are green.
+ */
+export interface WorkReviewParams {
+	readonly name: string;
+	readonly sessionId: string;
+	readonly headSha: string;
+	readonly verdict: "pass" | "fail";
+}
+export type WorkReviewResult =
+	| { readonly recorded: true; readonly headSha: string; readonly verdict: "pass" | "fail" }
+	| { readonly recorded: false; readonly held: true; readonly reason: string };
+/**
+ * Asks the gateway to merge the task's pull request now. The gateway merges only the exact head
+ * its live check read found green, never queues or defers a merge, and refuses the writer and
+ * the reviewer. A refusal merges nothing.
+ */
+export interface WorkMergeParams {
+	readonly name: string;
+	readonly sessionId: string;
+}
+export type WorkMergeResult =
+	| { readonly merged: true; readonly prNumber: number; readonly headSha: string }
+	| { readonly merged: false; readonly held: true; readonly reason: string };
 /**
  * Separate downstream preserving action. Runtime must resolve approvalId to a current
  * FirstmateOutcomeApproval with this exact identity and authority, and check obligations.
@@ -928,6 +968,8 @@ export interface FirstmateReleaseIntent {
 	readonly releaseId: string;
 	readonly request: WorkFirstmateRetireParams["firstmate"];
 	readonly requestedAt: string;
+	/** The owner's closeout message body, when an owner message closed the task out. */
+	readonly body?: string;
 }
 
 /**
@@ -1592,6 +1634,9 @@ export interface VerbCatalogV01 {
 	"work.approve": { params: WorkApproveParams; result: WorkApproveResult };
 	"work.approve.decision": { params: WorkApproveDecisionParams; result: WorkApproveResult };
 	"work.retire.decision": { params: WorkCloseoutDecisionParams; result: WorkFirstmateRetireResult };
+	"work.merge.authorize": { params: WorkMergeAuthorizeParams; result: WorkMergeAuthorizeResult };
+	"work.review": { params: WorkReviewParams; result: WorkReviewResult };
+	"work.merge": { params: WorkMergeParams; result: WorkMergeResult };
 	"work.status": { params: WorkStatusParams; result: WorkStatusResult };
 	"work.steer": { params: WorkSteerParams; result: WorkSteerResult };
 	"work.jobs": { params: WorkJobsParams | undefined; result: WorkJobsResult };
@@ -1656,6 +1701,11 @@ export const VERBS_V01 = [
 	"work.start",
 	"work.inspect",
 	"work.approve",
+	"work.approve.decision",
+	"work.retire.decision",
+	"work.merge.authorize",
+	"work.review",
+	"work.merge",
 	"work.status",
 	"work.steer",
 	"work.jobs",
