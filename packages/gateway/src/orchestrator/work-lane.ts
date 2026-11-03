@@ -2190,7 +2190,11 @@ export class WorkLaneManager {
 			),
 		);
 	}
-	#assertCorrectionPredecessor(evidence: FirstmatePrepare): void {
+	/**
+	 * Returns the prior session a correction must continue, or undefined when a close cleared the
+	 * binding (empty session, later epoch) and the correction may bind a new one.
+	 */
+	#assertCorrectionPredecessor(evidence: FirstmatePrepare): { sessionId: string; epoch: number } | undefined {
 		const { assignment, cause } = evidence;
 		firstmateAssert(cause.kind === "correction", "correction_cause_invalid");
 		this.#assertFirstmateAdmission(assignment);
@@ -2228,6 +2232,40 @@ export class WorkLaneManager {
 				(released || (binding?.sessionId === prior.sessionId && binding.epoch === prior.epoch)),
 			"correction_session_changed",
 		);
+		return released ? undefined : { sessionId: prior.sessionId, epoch: prior.epoch };
+	}
+	/**
+	 * The bound prior session must still be live or resumable before native bind runs: bind would
+	 * otherwise replace a deleted or unresumable session with a new one under the same correction.
+	 */
+	async #assertCorrectionSessionContinues(
+		prior: { sessionId: string; epoch: number },
+		sessionKey: string,
+		repo: string,
+	): Promise<void> {
+		const authority = (error: unknown) => error instanceof BrokerAuthorityError || isBrokerUnavailable(error);
+		let state: SessionLiveness | undefined;
+		try {
+			state = await this.#port.liveness?.({ sessionId: prior.sessionId, repo });
+		} catch (error) {
+			// An unavailable broker says nothing about the session; the bind wait retries.
+			if (authority(error)) throw error;
+		}
+		firstmateAssert(
+			!state?.disowned && state?.deleted !== true && (state?.workspace === undefined || state.workspace === repo),
+			"correction_session_changed",
+		);
+		if (state?.live === true) return;
+		try {
+			// Resume never creates a replacement; it restores the saved session or refuses.
+			await this.#port.resume({ sessionId: prior.sessionId, repo, originKey: sessionKey, epoch: prior.epoch });
+		} catch (error) {
+			if (authority(error)) throw error;
+			console.error(
+				`firstmate_correction_session_unresumable origin=${sessionKey} session=${prior.sessionId} detail=${sanitizeDiagnostic(error instanceof Error ? error.message : String(error))}`,
+			);
+			firstmateAssert(false, "correction_session_changed");
+		}
 	}
 	#assertFirstmateAdmission(assignment: FirstmateAssignment): void {
 		const owner = this.#db.work.firstmate;
@@ -2541,10 +2579,12 @@ export class WorkLaneManager {
 						try {
 							// A released or abandoned lane must not grow a session the cap would count.
 							this.#assertFollowUpOpen(input.name);
-							// A correction continues its bound session: native bind reuses a live one and
-							// resumes a saved-but-dead one. After close cleared it, bind starts a new session;
-							// the old attempt stays immutable either way.
-							if (correction) this.#assertCorrectionPredecessor(correction);
+							// A correction continues its bound session: a live one is reused, a saved-but-dead
+							// one resumed, a deleted or unresumable one refused before bind could replace it.
+							// Only after a close cleared the binding does bind start a new session; the old
+							// attempt stays immutable either way.
+							const continued = correction ? this.#assertCorrectionPredecessor(correction) : undefined;
+							if (continued) await this.#assertCorrectionSessionContinues(continued, sessionKey, worktreePath);
 							binding = await this.#port.bind({
 								originKey: sessionKey,
 								epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
@@ -2556,7 +2596,8 @@ export class WorkLaneManager {
 							});
 							if (correction)
 								firstmateAssert(
-									this.#db.bindings.getSessionRecord(sessionKey)?.sessionId === binding.sessionId,
+									this.#db.bindings.getSessionRecord(sessionKey)?.sessionId === binding.sessionId &&
+										(!continued || (binding.sessionId === continued.sessionId && binding.epoch === continued.epoch)),
 									"correction_session_changed",
 								);
 						} catch (error) {

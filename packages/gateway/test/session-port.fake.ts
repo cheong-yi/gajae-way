@@ -264,7 +264,12 @@ export class ScriptedSessionPort implements SessionPort {
 		const state = this.#sessionStates.get(input.sessionId);
 		if (!state) return { live: undefined, disowned: true };
 		const activity = this.#activity.get(input.sessionId);
-		return { live: state.live, disowned: false, ...(activity ? { activity } : {}) };
+		return {
+			live: state.live,
+			disowned: false,
+			...(state.deleted ? { deleted: true } : {}),
+			...(activity ? { activity } : {}),
+		};
 	}
 
 	async resume(input: { sessionId: string; repo: string; originKey: string; epoch: number }): Promise<SessionBinding> {

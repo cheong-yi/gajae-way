@@ -1043,11 +1043,17 @@ test("pane transcript stays in child while deterministic terminal outcomes stay 
 	expect(f.db.work.workAttemptGet(correction.opRef)!.deliveryId).not.toBe(runtime.deliveryId);
 });
 
-/** The persona turn finished consuming a report the native route admitted to its inbox. */
+/** The report started its own persona turn and that turn finished. */
 function consumeReport(f: Awaited<ReturnType<typeof firstmateFixture>>, reportId: string) {
 	const raw = new Database(join(f.directory, "gateway.db"));
 	try {
-		expect(raw.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ?").run(reportId).changes).toBe(1);
+		expect(
+			raw
+				.query(
+					"UPDATE inbound_messages SET state = 'done', turn_role = 'trigger', turn_epoch = 0, turn_state = 'done', turn_op_ref = ? WHERE message_id = ?",
+				)
+				.run(`gw-p-${reportId}`, reportId).changes,
+		).toBe(1);
 	} finally {
 		raw.close();
 	}
@@ -1247,6 +1253,40 @@ test("FirstMate release holds an unconsumed native report but ignores unrelated 
 	expect(f.db.inbox.messageDisposition(originKey(f.assignment.thread), "unrelated")?.message.state).toBe("pending");
 });
 
+test("FirstMate release holds a report steered into a busy parent turn until that turn finishes", async () => {
+	const f = await releaseFixture(false);
+	const report = settleReportDelivery(f, f.start.opRef, false);
+	const parentKey = originKey(f.assignment.thread);
+	const busy = "gw-p-busy-parent";
+	f.db.transaction((tx) =>
+		f.db.inbox.enqueue(tx, {
+			messageId: "busy-parent",
+			originKey: parentKey,
+			originRefJson: JSON.stringify(f.assignment.thread),
+			body: "unrelated parent turn",
+			receivedAt: new Date(Date.now() - 1_000).toISOString(),
+		}),
+	);
+	f.db.transaction((tx) =>
+		f.db.inbox.bindTurn(tx, { messageId: "busy-parent", originKey: parentKey, epoch: 0, opRef: busy, sessionId: "s" }),
+	);
+	expect(f.db.transaction((tx) => f.db.inbox.turnAccept(tx, busy))).toBe(true);
+	expect(
+		f.db.transaction((tx) => f.db.inbox.steerAccepted(tx, { messageId: report.reportId, epoch: 0, opRef: busy })),
+	).toBe(true);
+	expect(f.db.inbox.messageDisposition(parentKey, report.reportId)?.message.state).toBe("done");
+	// Steer acceptance is not consumption: the trigger turn that received the report is still running.
+	expect(await f.manager.retireFirstmate(f.request)).toMatchObject({
+		retired: false,
+		obligations: [{ id: report.reportId, reason: "report_unconsumed" }],
+	});
+	expect(f.owner.releaseForAttempt(f.start.opRef)).toBeUndefined();
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.db.transaction((tx) => f.db.inbox.turnComplete(tx, busy))).toBe(1);
+	expect((await f.manager.retireFirstmate(f.request)).retired).toBe(true);
+	expect(f.port.closes).toHaveLength(1);
+});
+
 test("FirstMate release refuses acknowledgement and mixed native envelopes without close or intent", async () => {
 	const f = await releaseFixture(true, true);
 	expect((await f.manager.retireFirstmate(f.request)).retired).toBe(false);
@@ -1296,6 +1336,59 @@ test("FirstMate failed intent has zero close; post-close transaction rollback re
 	expect(observation.receipts.approval).toEqual(f.approved);
 	if (result.retired) expect(observation.receipts.release).toEqual(result.release);
 });
+
+/** First release closed the session, then its receipt transaction rolled back: intent recorded, binding unchanged. */
+async function releaseClosedWithoutReceipt() {
+	const f = await releaseFixture();
+	const receipt = spyOn(FirstmateStore.prototype, "recordReleaseReceipt").mockImplementation(() => {
+		throw new Error("receipt failure");
+	});
+	try {
+		expect((await f.manager.retireFirstmate(f.request)).retired).toBe(false);
+	} finally {
+		receipt.mockRestore();
+	}
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path }]);
+	const pending = f.owner.releaseForAttempt(f.start.opRef)!;
+	expect(pending).toBeDefined();
+	expect(f.owner.releaseReceipt(pending.releaseId)).toBeUndefined();
+	return { ...f, pending };
+}
+
+test("FirstMate release retry with no session bound writes the receipt and closes nothing", async () => {
+	const f = await releaseClosedWithoutReceipt();
+	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, f.start.sessionKey));
+	const cleared = f.db.bindings.getSessionRecord(f.start.sessionKey);
+	expect(cleared?.sessionId).toBe("");
+	const result = await f.manager.retireFirstmate(f.request);
+	expect(result.retired).toBe(true);
+	if (!result.retired) throw new Error(result.reason);
+	expect(result.release.releaseId).toBe(f.pending.releaseId);
+	expect(f.owner.releaseReceipt(f.pending.releaseId)).toEqual(result.release);
+	expect(f.port.closes).toHaveLength(1);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)).toEqual(cleared);
+});
+
+for (const rebind of ["same epoch", "next epoch"] as const) {
+	test(`FirstMate release retry refuses a different session bound after the first close (${rebind})`, async () => {
+		const f = await releaseClosedWithoutReceipt();
+		const newer = crypto.randomUUID();
+		f.db.transaction((tx) => {
+			if (rebind === "next epoch") f.db.bindings.rotateEpoch(tx, f.start.sessionKey);
+			f.db.bindings.bind(tx, f.start.sessionKey, newer);
+		});
+		f.port.setSessionState(newer, { live: true, deleted: false, repo: f.assignment.worktree.path });
+		const bound = f.db.bindings.getSessionRecord(f.start.sessionKey);
+		expect(bound?.sessionId).toBe(newer);
+		const result = await f.manager.retireFirstmate(f.request);
+		expect(result).toMatchObject({ retired: false, reason: "release_binding_stale" });
+		// The newer session is never closed and the pending release stays unconfirmed.
+		expect(f.port.closes).toHaveLength(1);
+		expect(f.port.closes.some((close) => close.sessionId === newer)).toBe(false);
+		expect(f.db.bindings.getSessionRecord(f.start.sessionKey)).toEqual(bound);
+		expect(f.owner.releaseReceipt(f.pending.releaseId)).toBeUndefined();
+	});
+}
 
 for (const proof of [
 	{ live: true, disowned: false },
@@ -2309,13 +2402,47 @@ test("FirstMate correction refuses changed binding, worktree and native ownershi
 	}
 });
 
-test("FirstMate correction binds through the native session port on the task session", async () => {
+test("FirstMate correction resumes an inactive bound session and refuses a gone one before bind replaces it", async () => {
 	const f = await firstmateFixture();
 	const original = await f.manager.startFirstmate(f.assignment);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
-	// Session availability (live, saved-but-dead, gone) is the native bind's decision, not a FirstMate check.
+	const job = f.job();
+	const bound = f.db.bindings.getSessionRecord(original.sessionKey);
+	// Refusals run first so the shared fixture is still pristine when the admitted case runs.
+	const refuse = async () => {
+		const spies = [
+			spyOn(f.port, "bind"),
+			spyOn(f.port, "send"),
+			spyOn(f.db.work, "workAttemptPrepare"),
+			spyOn(f.manager, "recover"),
+		];
+		try {
+			await expect(f.manager.startFirstmateCorrection(input)).rejects.toMatchObject({
+				detail: { reason: "correction_session_changed" },
+			});
+			// No new session is minted: bind never runs and the binding still names the prior session.
+			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+			expect(f.db.bindings.getSessionRecord(original.sessionKey)).toEqual(bound);
+			expect(f.job()).toEqual(job);
+			expect(f.db.work.workAttemptRows()).toHaveLength(1);
+		} finally {
+			for (const spy of spies) spy.mockRestore();
+		}
+	};
+	const missing = spyOn(f.port, "liveness").mockImplementation(async () => ({ live: undefined, disowned: true }));
+	try {
+		await refuse();
+	} finally {
+		missing.mockRestore();
+	}
+	f.port.setSessionState(original.sessionId, { live: false, deleted: true, repo: f.assignment.worktree.path });
+	await refuse();
+	// Saved but bound to another workspace: resume refuses, so the correction does too.
+	f.port.setSessionState(original.sessionId, { live: false, deleted: false, repo: f.directory });
+	await refuse();
+	// Present, same repository, not deleted, merely inactive: resumed, then bound on the same session.
 	f.port.setSessionState(original.sessionId, { live: false, deleted: false, repo: f.assignment.worktree.path });
 	const assignments = f.db.core.groupDb("work").prepare("SELECT * FROM firstmate_assignments ORDER BY task_id").all();
 	const epoch = f.db.bindings.getSessionRecord(original.sessionKey)!.epoch;
@@ -2327,6 +2454,13 @@ test("FirstMate correction binds through the native session port on the task ses
 	expect(admitted.sessionId).toBe(original.sessionId);
 	expect(admitted.jobId).toBe(original.jobId);
 	expect(admitted.opRef).not.toBe(original.opRef);
+	expect(f.port.resumes).toHaveLength(resumes + 1);
+	expect(f.port.resumes.at(-1)).toMatchObject({
+		sessionId: original.sessionId,
+		originKey: original.sessionKey,
+		epoch,
+		repo: f.assignment.worktree.path,
+	});
 	expect(f.port.binds).toHaveLength(binds + 1);
 	expect(f.port.binds.at(-1)).toMatchObject({
 		originKey: original.sessionKey,
@@ -2334,7 +2468,7 @@ test("FirstMate correction binds through the native session port on the task ses
 		repo: f.assignment.worktree.path,
 		codingRegister: true,
 	});
-	expect(f.port.resumes).toHaveLength(resumes);
+	expect(f.db.bindings.getSessionRecord(original.sessionKey)).toMatchObject({ sessionId: original.sessionId, epoch });
 	expect(f.db.core.groupDb("work").prepare("SELECT * FROM firstmate_assignments ORDER BY task_id").all()).toEqual(
 		assignments,
 	);
@@ -2369,8 +2503,11 @@ test("FirstMate correction after close binds a new session and keeps the old att
 	const before = f.db.work.firstmate.attempt(original.opRef);
 	const beforeRuntime = f.db.work.workAttemptGet(original.opRef);
 	f.db.transaction((tx) => f.db.bindings.rotateEpoch(tx, workSessionKey(f.assignment.name)));
+	// The close cleared the binding, so the prior session's fate no longer decides the correction.
+	f.port.setSessionState(original.sessionId, { live: false, deleted: true, repo: f.assignment.worktree.path });
 	const input = { ...correctionInput(f, original.opRef), messageId: "follow-up-after-close" };
 	const binds = f.port.binds.length;
+	const resumes = f.port.resumes.length;
 	const admitted = await f.manager.startFirstmateCorrection(input);
 	expect(admitted.started).toBe(true);
 	if (!admitted.started) throw new Error("unexpected correction hold");
@@ -2378,6 +2515,7 @@ test("FirstMate correction after close binds a new session and keeps the old att
 	expect(admitted.opRef).not.toBe(original.opRef);
 	expect(admitted.jobId).toBe(original.jobId);
 	expect(f.port.binds).toHaveLength(binds + 1);
+	expect(f.port.resumes).toHaveLength(resumes);
 	expect(f.db.work.firstmate.attempt(original.opRef)).toEqual(before);
 	expect(f.db.work.workAttemptGet(original.opRef)).toEqual(beforeRuntime);
 	expect(f.job().attempts).toHaveLength(2);

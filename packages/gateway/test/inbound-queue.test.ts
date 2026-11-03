@@ -497,3 +497,36 @@ test("an accepted turn with a delivered steer requeues its trigger for fresh att
 	expect(db.transaction((tx) => retryInboundTurn(db, tx, retryOpRef))).toBe(2);
 	expect(freshTurnAttempt(db, ORIGIN_KEY, 0, "trigger")).toBe(2);
 });
+
+test("a report counts consumed only once the persona turn that received it has finished", async () => {
+	const db = await open();
+	const now = Date.now();
+	// Steered into a busy turn: the steer row is done at acceptance, but the turn still runs.
+	const busy = "gw-p-busy";
+	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("trigger", "parent"), receivedAt: timestamp(now, 0) }));
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "trigger", originKey: ORIGIN_KEY, epoch: 0, opRef: busy, sessionId: "s" }),
+	);
+	expect(db.transaction((tx) => db.inbox.turnAccept(tx, busy))).toBe(true);
+	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("steered", "report"), receivedAt: timestamp(now, 1) }));
+	expect(db.transaction((tx) => db.inbox.steerAccepted(tx, { messageId: "steered", epoch: 0, opRef: busy }))).toBe(
+		true,
+	);
+	expect(db.inbox.messageDisposition(ORIGIN_KEY, "steered")?.message.state).toBe("done");
+	expect(db.inbox.reportConsumed(ORIGIN_KEY, "steered")).toBe(false);
+	expect(db.transaction((tx) => db.inbox.turnComplete(tx, busy))).toBe(1);
+	expect(db.inbox.reportConsumed(ORIGIN_KEY, "steered")).toBe(true);
+	expect(db.inbox.reportConsumed("discord:dm:other", "steered")).toBe(false);
+
+	// The report started its own turn: that turn finishing is enough.
+	const own = "gw-p-own";
+	db.transaction((tx) => db.inbox.enqueue(tx, { ...message("own", "report"), receivedAt: timestamp(now, 2) }));
+	expect(db.inbox.reportConsumed(ORIGIN_KEY, "own")).toBe(false);
+	db.transaction((tx) =>
+		db.inbox.bindTurn(tx, { messageId: "own", originKey: ORIGIN_KEY, epoch: 0, opRef: own, sessionId: "s" }),
+	);
+	expect(db.transaction((tx) => db.inbox.turnAccept(tx, own))).toBe(true);
+	expect(db.inbox.reportConsumed(ORIGIN_KEY, "own")).toBe(false);
+	expect(db.transaction((tx) => db.inbox.turnComplete(tx, own))).toBe(1);
+	expect(db.inbox.reportConsumed(ORIGIN_KEY, "own")).toBe(true);
+});
