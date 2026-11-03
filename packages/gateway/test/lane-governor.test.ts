@@ -13,17 +13,9 @@ import {
 	parseLaneJobRecord,
 } from "@gajae-gateway/subsession";
 import { LaneGovernor, laneJobIdentity, workSessionKey } from "../src/orchestrator/lane-governor";
-import { BrokerAuthorityError, Store } from "../src/store";
+import { BrokerAuthorityError, type FirstmateAssignment, Store } from "../src/store";
 import type { WorkAttemptSettlement, WorkAttemptTerminalEvidence } from "../src/store/groups/work";
 import { initializeTestBrokerAuthority, ScriptedSessionPort } from "./session-port.fake";
-
-function deferred<T = void>() {
-	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((done) => {
-		resolve = done;
-	});
-	return { promise, resolve };
-}
 
 const NOW = Date.parse("2026-09-01T12:00:00.000Z");
 const SESSION_ID = "0f1e2d3c-4b5a-4678-8796-a5b4c3d2e1f0";
@@ -87,14 +79,23 @@ test("activeLanes includes only bound work origins and derives idle time from ac
 	expect(lanes.find((lane) => lane.name === "no-activity")?.idleMs).toBe(Number.POSITIVE_INFINITY);
 });
 
-test("preserving governor owns exactly one lane lock, skips recovery, and tracks close through stop", async () => {
+/** Attributes the named lanes to FirstMate without building a full assignment record. */
+function mapLanes(...names: string[]): void {
+	const owner = database.work.firstmate;
+	owner.assignment = ((name: string) =>
+		names.includes(name) ? ({ name } as FirstmateAssignment) : undefined) as typeof owner.assignment;
+}
+
+test("an owner decision enters the one native retire: recovery gate, lane lock, prepare before close, commit with the epoch", async () => {
 	database = await Store.open(":memory:");
 	bind("a", NOW);
 	persistJob("a", "done");
+	mapLanes("a");
 	const port = new ScriptedSessionPort();
 	const governor = new LaneGovernor({ database, sessionPort: port });
+	let recoveries = 0;
 	governor.setRecoveryGate(async () => {
-		throw new Error("preserving release must not recover");
+		recoveries++;
 	});
 	const exclusive = port.runExclusive.bind(port);
 	const keys: string[] = [];
@@ -108,195 +109,148 @@ test("preserving governor owns exactly one lane lock, skips recovery, and tracks
 		events.push("close");
 		await close(input);
 	};
-	const result = await governor.retirePreserving("a", {
-		held: (reason) => reason,
-		prepare: () => ({
-			sessionId: "sess-a",
-			repo: "/tmp/worker-repo",
-			pending: false,
-			recheck: () => {
-				events.push("check");
-			},
-			persistIntent: () => {
-				events.push("intent");
-			},
-			complete: () => {
-				events.push("receipt");
-				database.transaction((tx) => database.bindings.rotateEpoch(tx, "work/task/a"));
-				return "released";
-			},
-		}),
+	// Ordinary work.retire never skips the owner's decision for a mapped lane.
+	expect(await governor.retire("a", "operator")).toEqual({
+		retired: false,
+		sessionKey: "work/task/a",
+		reason: "firstmate_scoped_release_required",
 	});
-	expect(result).toBe("released");
+	expect(events).toEqual([]);
+	const outcome = await governor.retire("a", "firstmate_released", undefined, {
+		prepare: async () => {
+			events.push("prepare");
+			return undefined;
+		},
+		commit: () => {
+			events.push(`commit:${database.bindings.getSessionRecord("work/task/a")?.sessionId}`);
+		},
+	});
+	expect(outcome).toEqual({ retired: true, sessionKey: "work/task/a", sessionId: "sess-a", closed: true });
+	expect(events).toEqual(["prepare", "close", "commit:sess-a"]);
+	expect(recoveries).toBe(1);
 	expect(keys).toEqual(["work/task/a"]);
-	expect(events.indexOf("intent")).toBeLessThan(events.indexOf("close"));
-	expect(events.indexOf("close")).toBeLessThan(events.indexOf("receipt"));
-	expect(events.slice(events.indexOf("close") + 1)).toContain("check");
-	await governor.stop();
-	expect(
-		await governor.retirePreserving("a", {
-			held: (reason) => reason,
-			prepare: () => {
-				throw new Error("stopped");
-			},
-		}),
-	).toBe("gateway is stopping");
+	expect(database.bindings.getSessionRecord("work/task/a")?.sessionId).toBe("");
+	// The decision never discards the task checkout the way an operator retire of a managed lane does.
+	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
 });
 
-for (const proof of [
-	{ live: false, disowned: false },
-	{ live: undefined, disowned: true },
-	{ live: true, disowned: false },
-	{ live: undefined, disowned: false },
-]) {
-	test(`preserving pending intent retries native close unless already gone ${JSON.stringify(proof)}`, async () => {
-		database = await Store.open(":memory:");
-		bind("a", NOW);
-		const port = new ScriptedSessionPort();
-		const governor = new LaneGovernor({ database, sessionPort: port });
-		const queries: unknown[] = [];
-		port.liveness = async (input) => {
-			queries.push(input);
-			return proof;
-		};
-		let completions = 0;
-		let intents = 0;
-		const gone = proof.live === false || proof.disowned;
-		const result = await governor.retirePreserving("a", {
-			held: () => false,
-			prepare: () => ({
-				sessionId: "exact-old-session",
-				repo: "/exact/repo",
-				pending: true,
-				recheck: () => {},
-				persistIntent: () => {
-					intents++;
-				},
-				complete: () => {
-					completions++;
-					return true;
-				},
-			}),
-		});
-		expect(result).toBe(true);
-		expect(completions).toBe(1);
-		expect(intents).toBe(0);
-		expect(queries).toEqual([{ sessionId: "exact-old-session", repo: "/exact/repo" }]);
-		expect(port.closes).toEqual(gone ? [] : [{ sessionId: "exact-old-session", repo: "/exact/repo" }]);
-		expect(governor.preservingRelease("a")).toBe(false);
-	});
-}
-
-test("a second preserving release rejects without queueing while the first still holds the marker", async () => {
+test("an owner decision holds before close, and a live session that will not close holds without commit", async () => {
 	database = await Store.open(":memory:");
 	bind("a", NOW);
 	persistJob("a", "done");
-	const port = new ScriptedSessionPort();
-	const governor = new LaneGovernor({ database, sessionPort: port });
-	const entered = deferred<void>();
-	const release = deferred<void>();
-	const exclusive = port.runExclusive.bind(port);
-	let locks = 0;
-	port.runExclusive = (key, action) =>
-		exclusive(key, async () => {
-			locks++;
-			return action();
-		});
-	port.close = async (input) => {
-		port.closes.push(input);
-		entered.resolve();
-		await release.promise;
-	};
-	const policy = {
-		held: (reason: string) => reason,
-		prepare: () => ({
-			sessionId: "sess-a",
-			repo: "/tmp/worker-repo",
-			pending: false,
-			recheck: () => {},
-			persistIntent: () => {},
-			complete: () => "released",
-		}),
-	};
-	const first = governor.retirePreserving("a", policy);
-	await entered.promise;
-	expect(governor.preservingRelease("a")).toBe(true);
-	const second = governor.retirePreserving("a", {
-		...policy,
-		prepare: () => {
-			throw new Error("second release must not enter the lock");
-		},
-	});
-	expect(await second).toBe("task_release_pending_or_completed");
-	expect(locks).toBe(1);
-	expect(port.closes).toHaveLength(1);
-	release.resolve();
-	expect(await first).toBe("released");
-	expect(governor.preservingRelease("a")).toBe(false);
-});
-
-test("pending release retries a failed close and keeps the lane bound while live", async () => {
-	database = await Store.open(":memory:");
-	bind("a", NOW);
+	mapLanes("a");
 	const before = database.bindings.getSessionRecord("work/task/a");
 	const port = new ScriptedSessionPort();
-	const logs: string[] = [];
-	const governor = new LaneGovernor({ database, sessionPort: port, log: (line) => logs.push(line) });
+	const governor = new LaneGovernor({ database, sessionPort: port, log: () => {} });
+	let commits = 0;
+	const decision = (held?: string) => ({
+		prepare: async () => held,
+		commit: () => {
+			commits++;
+		},
+	});
+	expect(await governor.retire("a", "firstmate_abandoned", undefined, decision("dirty checkout"))).toEqual({
+		retired: false,
+		sessionKey: "work/task/a",
+		reason: "dirty checkout",
+	});
+	expect(port.closes).toEqual([]);
 	port.close = async (input) => {
 		port.closes.push(input);
 		throw new Error("close response lost");
 	};
 	port.liveness = async () => ({ live: true, disowned: false });
-	const prepared = {
-		sessionId: "sess-a",
-		repo: "/tmp/worker-repo",
-		pending: true,
-		recheck: () => {},
-		persistIntent: () => {
-			throw new Error("pending intent must not be rewritten");
-		},
-		complete: () => true,
-	};
-	expect(
-		await governor.retirePreserving<string | boolean>("a", { held: (reason) => reason, prepare: () => prepared }),
-	).toMatch(/not proven gone/);
-	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
+	const outcome = await governor.retire("a", "firstmate_abandoned", undefined, decision());
+	expect(outcome).toMatchObject({ retired: false, reason: expect.stringMatching(/not proven gone/) });
+	expect(commits).toBe(0);
 	expect(database.bindings.getSessionRecord("work/task/a")).toEqual(before);
-	expect(logs.some((line) => line.includes("name=a") && line.endsWith("action=retained"))).toBe(true);
-	port.liveness = async () => ({ live: false, disowned: false });
-	expect(
-		await governor.retirePreserving<string | boolean>("a", { held: (reason) => reason, prepare: () => prepared }),
-	).toBe(true);
-	expect(port.closes).toHaveLength(1);
 });
 
-test("preserving close rechecks after awaited status before recording intent", async () => {
+test("an owner decision cannot bypass quarantine or an open attempt", async () => {
 	database = await Store.open(":memory:");
-	bind("a", NOW);
-	persistJob("a", "done");
+	bind("open", NOW, SESSION_ID);
+	persistJob("open", "running", true);
+	mapLanes("open");
 	const port = new ScriptedSessionPort();
 	const governor = new LaneGovernor({ database, sessionPort: port });
-	let checks = 0;
-	let intents = 0;
-	await expect(
-		governor.retirePreserving("a", {
-			held: () => false,
-			prepare: () => ({
-				sessionId: "sess-a",
-				repo: "/tmp/worker-repo",
-				pending: false,
-				recheck: () => {
-					if (++checks === 2) throw new Error("binding changed");
-				},
-				persistIntent: () => {
-					intents++;
-				},
-				complete: () => true,
-			}),
+	let prepares = 0;
+	const decision = {
+		prepare: async () => {
+			prepares++;
+			return undefined;
+		},
+		commit: () => {},
+	};
+	expect(await governor.retire("open", "firstmate_abandoned", undefined, decision)).toMatchObject({
+		retired: false,
+		reason: expect.stringContaining("attempt still open"),
+	});
+	database.transaction((tx) =>
+		database.bindings.cutoverBrokerAuthority(tx, {
+			expectedAuthority: null,
+			targetAuthority: { canonicalAgentDir: "/tmp/global-agent", identity: "shared-broker" },
+			evidence: "test operator quarantined old work",
+			disposition: "quarantine",
 		}),
-	).rejects.toThrow("binding changed");
-	expect(intents).toBe(0);
-	expect(port.closes).toHaveLength(0);
+	);
+	expect(await governor.retire("open", "firstmate_abandoned", undefined, decision)).toEqual({
+		retired: false,
+		sessionKey: "work/task/open",
+		reason: "broker_authority_quarantined",
+	});
+	expect(prepares).toBe(0);
+	expect(port.closes).toEqual([]);
+});
+
+test("an owner decision for an already-closed lane commits with nothing left to close", async () => {
+	database = await Store.open(":memory:");
+	database.transaction((tx) => database.bindings.bind(tx, "work/task/a", "sess-a"));
+	database.transaction((tx) => database.bindings.rotateEpoch(tx, "work/task/a"));
+	persistJob("a", "done");
+	mapLanes("a");
+	const port = new ScriptedSessionPort();
+	const governor = new LaneGovernor({ database, sessionPort: port });
+	const events: string[] = [];
+	const outcome = await governor.retire("a", "firstmate_released", undefined, {
+		prepare: async () => {
+			events.push("prepare");
+			return undefined;
+		},
+		commit: () => {
+			events.push("commit");
+		},
+	});
+	expect(outcome).toEqual({ retired: true, sessionKey: "work/task/a", sessionId: "", closed: false });
+	expect(events).toEqual(["prepare", "commit"]);
+	expect(port.closes).toEqual([]);
+	expect(await governor.retire("a", "operator")).toMatchObject({ retired: false });
+});
+
+test("a proven-dead mapped lane is reclaimed by native force retire; a live one is not swept and capacity names its owner", async () => {
+	database = await Store.open(":memory:");
+	bind("dead", NOW - 10 * 60 * 60_000);
+	persistJob("dead", "done");
+	bind("live", NOW - 10 * 60 * 60_000);
+	persistJob("live", "done");
+	mapLanes("dead", "live");
+	const port = new ScriptedSessionPort();
+	port.liveness = async ({ sessionId }) => ({ live: sessionId !== "sess-dead", disowned: false });
+	const governor = new LaneGovernor({ database, sessionPort: port, maxLanes: 2, now: () => NOW });
+	expect(await governor.sweep()).toBe(0);
+	expect(port.closes).toEqual([]);
+	try {
+		governor.assertAdmission("next");
+		throw new Error("admission should be refused at capacity");
+	} catch (error) {
+		expect((error as ProtocolError).message).toContain("release or abandon one through its owner");
+		expect((error as ProtocolError).message).not.toContain("work.retire");
+	}
+	expect(await governor.retireAllDead()).toEqual({ count: 1, names: ["dead"] });
+	expect(database.bindings.getSessionRecord("work/task/dead")?.sessionId).toBe("");
+	expect(await governor.forceRetire("live")).toMatchObject({
+		retired: false,
+		reason: "session is still live; cannot force retire",
+	});
 });
 
 test("admission admits existing lanes at capacity and reports new-name candidates idlest first", async () => {

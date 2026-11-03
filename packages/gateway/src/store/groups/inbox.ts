@@ -1318,6 +1318,15 @@ export class InboxGroup {
 		);
 	}
 
+	/** A report admitted to this origin that its persona turn has finished consuming. */
+	reportConsumed(originKey: string, messageId: string): boolean {
+		return (
+			this.#db
+				.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND state = 'done'")
+				.get(messageId, originKey) !== null
+		);
+	}
+
 	messageExists(messageId: string): boolean {
 		return this.#db.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ?").get(messageId) !== null;
 	}

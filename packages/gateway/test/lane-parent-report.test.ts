@@ -316,7 +316,7 @@ test("settled persona wakes for a lane report while a running persona receives o
 	);
 	expect(chatMessages(f).map((frame) => frame.payload.text)).toEqual(["The lane found the answer."]);
 });
-test("settled FirstMate lane routes its complete finding as an inbound lane_report wake while the outcome status notice stays a status delivery", async () => {
+test("settled FirstMate lane reports once through the native lane_report wake; the finding stays behind inspect", async () => {
 	const origin: OriginRef = {
 		platform: "discord",
 		kind: "thread",
@@ -370,33 +370,34 @@ test("settled FirstMate lane routes its complete finding as an inbound lane_repo
 	expect(start.result.started).toBe(true);
 	const finding = "FM-FINDING chunked surrogate pairs dropped at the flush boundary";
 	await settleLane(f, start.result.opRef, finding);
-	// The retained FirstMate outcome status delivery still reaches the parent thread.
-	await eventually(
-		() => chatMessages(f),
-		(messages) => messages.some((frame) => frame.payload.text.includes("[FirstMate fmreport]")),
-		"firstmate outcome status delivery",
-	);
-	// The complete finding arrives as the inbound lane_report wake, never as the status notice body.
+	// One native persona report carries the FirstMate pointer; there is no second status post.
 	const sends = await eventually(
 		() => f.port.sends.filter((send) => send.sessionId === persona.sessionId),
 		(items) => items.length === 2,
 		"firstmate lane_report wake",
 	);
-	expect(sends[1]!.text).toContain(finding);
-	expect(sends[1]!.text).not.toContain("[FirstMate fmreport]");
+	expect(sends[1]!.text).toContain("[FirstMate fmreport]");
+	expect(sends[1]!.text).toContain(`inspect: work inspect fmreport --task fmreport-task --op ${start.result.opRef}`);
+	expect(sends[1]!.text).not.toContain(finding);
 	expect(sends[1]!.opRef).not.toBe(persona.opRef);
-	const reportId = f.database.work.workAttemptGet(start.result.opRef)!.reportId;
+	const settled = f.database.work.workAttemptGet(start.result.opRef)!;
+	expect(settled.decision).toBe("reported");
+	expect(f.database.outbox.get(settled.deliveryId)).toBeUndefined();
 	const reportRow = await eventually(
 		() => f.database.inbox.turnRows(sends[1]!.opRef),
-		(rows) => rows.some((row) => row.message_id === reportId && row.source === "lane_report"),
+		(rows) => rows.some((row) => row.message_id === settled.reportId && row.source === "lane_report"),
 		"firstmate lane_report inbound row",
 	);
-	expect(reportRow.find((row) => row.message_id === reportId)).toMatchObject({ source: "lane_report" });
-	const findingRow = reportRow.find((row) => row.message_id === reportId)!;
-	expect(findingRow.body).toContain(finding);
-	expect(findingRow.body).not.toContain("[FirstMate fmreport]");
-	// The lane itself never posts the finding; only the persona relay may.
-	expect(chatMessages(f).some((frame) => frame.payload.text.includes(finding))).toBe(false);
+	expect(reportRow.find((row) => row.message_id === settled.reportId)!.body).not.toContain(finding);
+	// The exact finding is the inspect evidence; the lane never posts it.
+	const inspected = await f.client.request("work.inspect", {
+		name: "fmreport",
+		taskId: "fmreport-task",
+		opRef: start.result.opRef,
+	});
+	expect(inspected.error).toBeUndefined();
+	expect(inspected.result.evidence).toMatchObject({ completeness: "complete", text: finding });
+	expect(chatMessages(f)).toHaveLength(0);
 	const relay = `Verified finding: ${finding}`;
 	f.port.complete(sends[1]!.opRef, relay);
 	await eventually(

@@ -16,30 +16,30 @@ import {
 	ProtocolError,
 	parseOriginKey,
 	validateOriginRef,
-	type WorkApproveParams,
 	type WorkApproveDecisionParams,
-	type WorkCloseoutDecisionParams,
+	type WorkApproveParams,
 	type WorkApproveResult,
+	type WorkCloseoutDecisionParams,
 	type WorkDirective,
 	type WorkDirectiveResult,
+	type WorkFirstmateCorrectionParams,
+	type WorkFirstmateRetireParams,
+	type WorkFirstmateRetireResult,
+	type WorkInspectionReceipts,
 	type WorkMergeAuthorizeParams,
 	type WorkMergeAuthorizeResult,
 	type WorkMergeParams,
 	type WorkMergeResult,
 	type WorkReviewParams,
 	type WorkReviewResult,
-	type WorkFirstmateCorrectionParams,
-	type WorkFirstmateRetireParams,
-	type WorkFirstmateRetireResult,
-	type WorkInspectionReceipts,
 	type WorkStartResult,
 	type WorkStatusResult,
 	type WorkSteerResult,
 } from "@gajae-gateway/protocol";
 import {
 	type AwaitingChecks,
-	acknowledgeHold,
 	abortJob,
+	acknowledgeHold,
 	appendAttempt,
 	applyReconciliation,
 	type ChecksSettlement,
@@ -64,7 +64,7 @@ import {
 	BrokerAuthorityError,
 	type FirstmateAssignment,
 	type FirstmatePrepare,
-	FirstmateStore,
+	type FirstmateStore,
 	firstmateAssert,
 	type Store,
 } from "../store";
@@ -95,6 +95,7 @@ import { readFailedTransportCause } from "./failed-turn-evidence";
 import { paneDeliveryGuard, readLanePane } from "./firstmate-pane";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
+	dirtyCheckout,
 	type LaneForceRetireReason,
 	type LaneGovernor,
 	laneJobIdentity,
@@ -305,6 +306,8 @@ export interface WorkLaneManagerOptions {
 	readonly hostLostGraceMs?: number;
 	readonly now?: () => number;
 	readonly checkStatusClient?: CheckStatusClient;
+	/** Closes a FirstMate lane's pane before its owner decision reaches the native retire. */
+	readonly closePane?: (name: string) => Promise<void>;
 	/** The `gh` executable the gateway's own FirstMate merge runs; defaults to `gh` on PATH. */
 	readonly ghExecutable?: string;
 	/** Bounded wait for a restarting broker before a lane bind fails; defaults to {@link WORK_BIND_BROKER_WAIT}. */
@@ -508,8 +511,9 @@ export class WorkLaneManager {
 			const current = this.#db.work.workAttemptGet(opRef);
 			if (!current || current.version !== expectedVersion || current.settledAt !== null) return undefined;
 			const attribution = this.#db.work.firstmate.attempt(opRef);
-			let outcome: ChatMessagePayload | undefined;
-			if (attribution) {
+			// A FirstMate attempt reports through the same native route; only its body is the FirstMate pointer.
+			if (attribution && admission) {
+				workAssert(admission.kind === "persona");
 				const name = current.sessionKey.slice("work/task/".length);
 				const assignment = this.#db.work.firstmate.assignment(name);
 				workAssert(
@@ -523,15 +527,10 @@ export class WorkLaneManager {
 					`[FirstMate ${name}] task=${attribution.taskId} op=${opRef} state=${record.state} attempt=${record.attempts.at(-1)?.endState ?? "ended"} reason=${terminal?.reasonCode ?? "unavailable"} output=${(patch.output ?? current.output).disposition}\nworktree=${current.cwd}${pane ? `\npane=${originKey(pane.childOrigin)}` : "\npane=unavailable"}\ninspect: work inspect ${name} --task ${attribution.taskId} --op ${opRef}`,
 					2048,
 				);
-				outcome = buildDeliveryPayload(
-					opRef,
-					assignment.thread,
-					text,
-					current.deliveryId,
-					undefined,
-					true,
-					paneDeliveryGuard(this.#db, assignment.thread),
-				)!;
+				const origin = admission.fallbackPayload.origin;
+				const guard = paneDeliveryGuard(this.#db, origin);
+				const payload = buildDeliveryPayload(opRef, origin, text, current.deliveryId, undefined, true, guard)!;
+				admission = { ...admission, row: { ...admission.row, body: text }, fallbackPayload: payload };
 			}
 			const checks = {
 				...(admission?.kind === "persona"
@@ -562,7 +561,7 @@ export class WorkLaneManager {
 					}),
 				);
 			}
-			for (const payload of [outcome ?? settled.fallbackPayload, settled.childFallback]) {
+			for (const payload of [settled.fallbackPayload, settled.childFallback]) {
 				if (!payload) continue;
 				workAssert(typeof payload.deliveryId === "string");
 				this.#db.outbox.enqueue(tx, {
@@ -572,7 +571,7 @@ export class WorkLaneManager {
 					payloadJson: JSON.stringify(payload),
 				});
 			}
-			return outcome ? { ...settled, fallbackPayload: outcome } : settled;
+			return settled;
 		});
 	}
 
@@ -1156,53 +1155,71 @@ export class WorkLaneManager {
 	async abandonFirstmate(
 		name: string,
 	): Promise<{ abandoned: true; name: string } | { abandoned: false; reason: string }> {
-		const owner = this.#db.work.firstmate;
-		const assignment = owner.assignment(name);
-		if (!assignment) return { abandoned: false, reason: "unknown assignment" };
-		const runtime = this.#db.work.workAttemptGet(owner.attemptsForTask(assignment.taskId).at(-1)?.opRef ?? "");
-		if (!runtime || runtime.settledAt === null)
-			return { abandoned: false, reason: "abandon requires a settled attempt" };
 		const held = (reason: string): { abandoned: false; reason: string } => ({ abandoned: false, reason });
-		return this.#options.lanes.retirePreserving<
-			{ abandoned: true; name: string } | { abandoned: false; reason: string }
-		>(name, {
-			held,
-			prepare: () => {
+		try {
+			this.#live();
+			const owner = this.#db.work.firstmate;
+			const assignment = owner.assignment(name);
+			if (!assignment) return held("unknown assignment");
+			const settled = () => {
 				const current = owner.assignment(name);
-				if (!current) return { result: held("unknown assignment") };
-				const attempt = this.#db.work.workAttemptGet(owner.attemptsForTask(current.taskId).at(-1)?.opRef ?? "");
-				if (!attempt || attempt.settledAt === null) return { result: held("abandon requires a settled attempt") };
-				const binding = this.#db.bindings.getSessionRecord(workSessionKey(name));
-				return {
-					sessionId: binding?.sessionId ?? attempt.sessionId,
-					repo: current.worktree.path,
-					pending: binding === undefined || binding.sessionId === "",
-					recheck: () => {
-						if (!owner.assignment(name)) throw new Error("assignment disappeared during abandonment");
-					},
-					persistIntent: () => {},
-					complete: () => {
-						const at = this.#at();
-						let job: LaneJobRecord | undefined;
-						try {
-							job = this.#job(name);
-						} catch (error) {
-							const detail = error instanceof ProtocolError ? error.detail : undefined;
-							const reason =
-								detail && typeof detail === "object" && "reasonCode" in detail ? detail.reasonCode : undefined;
-							if (reason !== "lane_state_corrupt") throw error;
-						}
-						const aborted = job ? abortJob({ record: job, at, note: "no outcome" }) : undefined;
-						this.#db.transaction((tx) => {
-							owner.recordAbandonment(tx, name, "no_outcome", at);
-							this.#db.bindings.rotateEpoch(tx, workSessionKey(name));
-							if (aborted && aborted !== job) this.#putJob(name, aborted, tx);
-						});
-						return { abandoned: true as const, name };
-					},
+				const opRef = current ? owner.attemptsForTask(current.taskId).at(-1)?.opRef : undefined;
+				const runtime = opRef ? this.#db.work.workAttemptGet(opRef) : undefined;
+				return runtime !== undefined && runtime.settledAt !== null;
+			};
+			if (!settled()) return held("abandon requires a settled attempt");
+			// Abandonment never discards checkout work.
+			const dirty = await dirtyCheckout(assignment.worktree.path);
+			if (dirty) return held(dirty);
+			// No outcome and the aborted end: upstream has no such end, so FirstMate records it, through
+			// the native checks settlement when a cycle is still open.
+			const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
+				this.#live();
+				if (!settled()) return held("abandon requires a settled attempt");
+				const at = this.#at();
+				const abort = (tx: WriteTx, record: LaneJobRecord | undefined): LaneJobRecord | undefined => {
+					owner.recordAbandonment(tx, name, "no_outcome", at);
+					// An aborted job never keeps an open checks cycle.
+					return record && clearAwaitingChecks(abortJob({ record, at, note: "no outcome" }));
 				};
-			},
-		});
+				const job = this.#job(name);
+				if (job?.state === "awaiting_checks")
+					return this.#settleChecks(
+						name,
+						job,
+						{ kind: "ended", reason: "lane abandoned before checks settled" },
+						undefined,
+						at,
+						(tx, record) => abort(tx, record)!,
+					);
+				this.#db.transaction((tx) => {
+					const aborted = abort(tx, job);
+					if (aborted && aborted !== job) this.#putJob(name, aborted, tx);
+				});
+				return undefined;
+			});
+			if (effects && "abandoned" in effects) return effects;
+			if (effects) await this.#dispatchChecksEffects(effects);
+			await this.#options.closePane?.(name);
+			// The one native retire closes the session; abandonment is only the decision in front of it.
+			const outcome = await this.#options.lanes.retire(name, "firstmate_abandoned", undefined, {
+				prepare: async () => {
+					if (!owner.abandoned(name)) return "abandonment_missing";
+					return await dirtyCheckout(assignment.worktree.path);
+				},
+				commit: () => {},
+			});
+			return outcome.retired ? { abandoned: true, name } : held(outcome.reason);
+		} catch (error) {
+			const detail = error instanceof ProtocolError ? workBindErrorRecord(error.detail) : undefined;
+			return held(
+				String(
+					detail?.reason ??
+						detail?.reasonCode ??
+						(error instanceof BrokerAuthorityError ? "broker_authority_unavailable" : failureReason(error)),
+				),
+			);
+		}
 	}
 
 	/** Separate explicit preserving release; the governor alone owns the native lane lock. */
@@ -1270,139 +1287,143 @@ export class WorkLaneManager {
 			);
 			validateOriginRef(request.thread);
 			const owner = this.#db.work.firstmate;
-			return await this.#options.lanes.retirePreserving<WorkFirstmateRetireResult>(request.name, {
-				held,
-				prepare: () => {
-					this.#live();
-					const previous = owner.releaseForMessage(request.ownerId, request.messageId);
-					if (previous) {
-						firstmateAssert(
-							isDeepStrictEqual(previous.request, request) && previous.body === closeout?.body,
-							"release_conflict",
-						);
-						const completed = owner.releaseReceipt(previous.releaseId);
-						if (completed) return { result: { retired: true, release: completed } };
-					}
-					const assignment = owner.assignment(request.name);
-					const approval = owner.approval(request.approvalId);
-					firstmateAssert(assignment && approval, "release_approval_missing");
-					let intent: FirstmateReleaseIntent = previous ?? {
-						releaseId: newOpRef("firstmate-release"),
-						request,
-						requestedAt: this.#at(),
-						...(closeout ? { body: closeout.body } : {}),
-					};
-					const sessionKey = workSessionKey(request.name);
-					const check = () => {
-						this.#live();
-						firstmateAssert(
-							isDeepStrictEqual(owner.assignment(request.name), assignment) &&
-								isDeepStrictEqual(owner.approval(request.approvalId), approval) &&
-								assignment.taskId === request.identity.taskId &&
-								assignment.ownerId === request.ownerId &&
-								assignment.mandate.id === request.mandateId &&
-								isDeepStrictEqual(assignment.thread, request.thread) &&
-								approval.decision === "accept_outcome" &&
-								["complete", "partial"].includes(approval.evidence.completeness) &&
-								approval.name === request.name &&
-								isDeepStrictEqual(approval.identity, request.identity) &&
-								approval.ownerId === request.ownerId &&
-								approval.mandateId === request.mandateId &&
-								isDeepStrictEqual(approval.thread, request.thread) &&
-								approval.scope === request.scope &&
-								approval.messageId !== request.messageId &&
-								owner.approvalCurrent(request.approvalId),
-							"release_approval_mismatch",
-						);
-						const binding = this.#db.bindings.getSessionRecord(sessionKey);
-						// A closed lane (empty binding) releases the approved attempt; a live one must be that attempt's.
-						firstmateAssert(
-							binding !== undefined &&
-								(binding.sessionId === "" ||
-									(binding.sessionId === request.identity.sessionId && binding.epoch === request.identity.epoch)),
-							"release_binding_stale",
-						);
-						firstmateAssert(
-							!this.#db.bindings.isQuarantined("work", request.identity.jobId),
-							"broker_authority_quarantined",
-						);
-						const attempts = owner.attemptsForTask(request.identity.taskId);
-						const last = attempts.at(-1);
-						firstmateAssert(
-							last &&
-								last.opRef === request.identity.opRef &&
-								last.jobId === request.identity.jobId &&
-								last.sessionId === request.identity.sessionId &&
-								last.epoch === request.identity.epoch &&
-								last.ordinal === request.identity.ordinal,
-							"release_attempt_mismatch",
-						);
-						for (const attempt of attempts) {
-							const other = owner.releaseForAttempt(attempt.opRef);
-							firstmateAssert(!other || other.releaseId === intent.releaseId, "release_conflict");
-						}
-						const job = this.#job(request.name);
-						const runtime = this.#db.work.workAttemptGet(request.identity.opRef);
-						firstmateAssert(
-							job &&
-								job.jobId === request.identity.jobId &&
-								(job.state === "done" || job.state === "attempt_ended") &&
-								!job.awaitingChecks &&
-								job.attempts.length === request.identity.ordinal + 1 &&
-								attempts.length === job.attempts.length &&
-								attempts.every((attempt, ordinal) => attempt.ordinal === ordinal) &&
-								job.attempts.every((attempt) => attempt.endedAt !== undefined) &&
-								job.attempts.at(-1)?.endState === "completed" &&
-								job.lane.branch === assignment.worktree.branch &&
-								job.lane.worktreePath === assignment.worktree.path &&
-								runtime &&
-								hasAcceptanceEvidence(runtime) &&
-								runtime.terminal?.reasonCode === "end_turn" &&
-								runtime.settledAt !== null &&
-								runtime.output.disposition !== "pending",
-							"release_execution_unsettled",
-						);
-						if (closeout) {
-							// The closeout answers exactly this approval's finish hold, still open.
-							const open = owner.finishHolds(request.name).filter((hold) => hold.state === "open");
-							firstmateAssert(
-								open.length === 1 && open[0]!.approvalId === request.approvalId,
-								"release_finish_hold_changed",
-							);
-						}
-						obligations = this.#firstmateReleaseObligations(assignment, attempts);
-						firstmateAssert(obligations.length === 0, "release_obligations_unsettled");
-					};
+			const previous = owner.releaseForMessage(request.ownerId, request.messageId);
+			if (previous) {
+				firstmateAssert(
+					isDeepStrictEqual(previous.request, request) && previous.body === closeout?.body,
+					"release_conflict",
+				);
+				const completed = owner.releaseReceipt(previous.releaseId);
+				if (completed) {
+					await this.#options.closePane?.(request.name);
+					return { retired: true, release: completed };
+				}
+			}
+			const assignment = owner.assignment(request.name);
+			const approval = owner.approval(request.approvalId);
+			firstmateAssert(assignment && approval, "release_approval_missing");
+			let intent: FirstmateReleaseIntent = previous ?? {
+				releaseId: newOpRef("firstmate-release"),
+				request,
+				requestedAt: this.#at(),
+				...(closeout ? { body: closeout.body } : {}),
+			};
+			const sessionKey = workSessionKey(request.name);
+			const check = () => {
+				this.#live();
+				firstmateAssert(
+					isDeepStrictEqual(owner.assignment(request.name), assignment) &&
+						isDeepStrictEqual(owner.approval(request.approvalId), approval) &&
+						assignment.taskId === request.identity.taskId &&
+						assignment.ownerId === request.ownerId &&
+						assignment.mandate.id === request.mandateId &&
+						isDeepStrictEqual(assignment.thread, request.thread) &&
+						approval.decision === "accept_outcome" &&
+						["complete", "partial"].includes(approval.evidence.completeness) &&
+						approval.name === request.name &&
+						isDeepStrictEqual(approval.identity, request.identity) &&
+						approval.ownerId === request.ownerId &&
+						approval.mandateId === request.mandateId &&
+						isDeepStrictEqual(approval.thread, request.thread) &&
+						approval.scope === request.scope &&
+						approval.messageId !== request.messageId &&
+						owner.approvalCurrent(request.approvalId),
+					"release_approval_mismatch",
+				);
+				const binding = this.#db.bindings.getSessionRecord(sessionKey);
+				// A closed lane (empty binding) releases the approved attempt; a live one must be that attempt's.
+				firstmateAssert(
+					binding !== undefined &&
+						(binding.sessionId === "" ||
+							(binding.sessionId === request.identity.sessionId && binding.epoch === request.identity.epoch)),
+					"release_binding_stale",
+				);
+				firstmateAssert(
+					!this.#db.bindings.isQuarantined("work", request.identity.jobId),
+					"broker_authority_quarantined",
+				);
+				const attempts = owner.attemptsForTask(request.identity.taskId);
+				const last = attempts.at(-1);
+				firstmateAssert(
+					last &&
+						last.opRef === request.identity.opRef &&
+						last.jobId === request.identity.jobId &&
+						last.sessionId === request.identity.sessionId &&
+						last.epoch === request.identity.epoch &&
+						last.ordinal === request.identity.ordinal,
+					"release_attempt_mismatch",
+				);
+				for (const attempt of attempts) {
+					const other = owner.releaseForAttempt(attempt.opRef);
+					firstmateAssert(!other || other.releaseId === intent.releaseId, "release_conflict");
+				}
+				const job = this.#job(request.name);
+				const runtime = this.#db.work.workAttemptGet(request.identity.opRef);
+				firstmateAssert(
+					job &&
+						job.jobId === request.identity.jobId &&
+						(job.state === "done" || job.state === "attempt_ended") &&
+						!job.awaitingChecks &&
+						job.attempts.length === request.identity.ordinal + 1 &&
+						attempts.length === job.attempts.length &&
+						attempts.every((attempt, ordinal) => attempt.ordinal === ordinal) &&
+						job.attempts.every((attempt) => attempt.endedAt !== undefined) &&
+						job.attempts.at(-1)?.endState === "completed" &&
+						job.lane.branch === assignment.worktree.branch &&
+						job.lane.worktreePath === assignment.worktree.path &&
+						runtime &&
+						hasAcceptanceEvidence(runtime) &&
+						runtime.terminal?.reasonCode === "end_turn" &&
+						runtime.settledAt !== null &&
+						runtime.output.disposition !== "pending",
+					"release_execution_unsettled",
+				);
+				if (closeout) {
+					// The closeout answers exactly this approval's finish hold, still open.
+					const open = owner.finishHolds(request.name).filter((hold) => hold.state === "open");
+					firstmateAssert(
+						open.length === 1 && open[0]!.approvalId === request.approvalId,
+						"release_finish_hold_changed",
+					);
+				}
+				obligations = this.#firstmateReleaseObligations(assignment, attempts);
+				firstmateAssert(obligations.length === 0, "release_obligations_unsettled");
+			};
+			check();
+			// A preserving release never discards checkout work: it refuses while the task
+			// worktree has tracked or untracked changes. Nothing is reset, deleted or merged.
+			const dirty = await dirtyCheckout(assignment.worktree.path);
+			if (dirty) return held(dirty);
+			check();
+			await this.#options.closePane?.(request.name);
+			// The decision sits in front of the one native retire: its recovery gate, quarantine,
+			// settlement proof, close and checks settlement are the upstream ones.
+			const outcome = await this.#options.lanes.retire(request.name, "firstmate_released", undefined, {
+				prepare: async () => {
 					check();
-					return {
-						sessionId: request.identity.sessionId,
-						repo: assignment.worktree.path,
-						pending: previous !== undefined,
-						recheck: check,
-						persistIntent: () => {
-							this.#db.transaction((tx) => {
-								check();
-								owner.recordReleaseIntent(tx, intent);
-							});
-							intent = owner.releaseForMessage(request.ownerId, request.messageId)!;
-							firstmateAssert(intent && isDeepStrictEqual(intent.request, request), "release_intent_missing");
-						},
-						complete: () =>
-							this.#db.transaction((tx) => {
-								check();
-								const receipt: FirstmateReleaseReceipt = {
-									...intent,
-									releasedAt: this.#at(),
-									sessionKey,
-									preserved: true,
-								};
-								this.#db.bindings.rotateEpoch(tx, sessionKey);
-								owner.recordReleaseReceipt(tx, receipt);
-								return { retired: true as const, release: owner.releaseReceipt(intent.releaseId)! };
-							}),
-					};
+					const changed = await dirtyCheckout(assignment.worktree.path);
+					check();
+					if (changed) return changed;
+					if (!previous)
+						this.#db.transaction((tx) => {
+							check();
+							owner.recordReleaseIntent(tx, intent);
+						});
+					const recorded = owner.releaseForMessage(request.ownerId, request.messageId);
+					firstmateAssert(recorded && isDeepStrictEqual(recorded.request, request), "release_intent_missing");
+					intent = recorded;
+					return undefined;
+				},
+				// A thrown transaction cannot undo native close. The durable intent remains.
+				commit: (tx) => {
+					check();
+					owner.recordReleaseReceipt(tx, { ...intent, releasedAt: this.#at(), sessionKey, preserved: true });
 				},
 			});
+			if (!outcome.retired) return held(outcome.reason);
+			const release = owner.releaseReceipt(intent.releaseId);
+			firstmateAssert(release, "release_receipt_missing");
+			return { retired: true, release };
 		} catch (error) {
 			const detail = error instanceof ProtocolError ? workBindErrorRecord(error.detail) : undefined;
 			return held(
@@ -1430,6 +1451,9 @@ export class WorkLaneManager {
 			const row = this.#db.outbox.get(id);
 			if (!row || row.turnId !== turnId || row.originKey !== target) hold(id, "delivery_missing_or_mismatched");
 			else if (row.state !== "confirmed") hold(id, `delivery_${row.state}`);
+		};
+		const report = (id: string, target: string) => {
+			if (!this.#db.inbox.reportConsumed(target, id)) hold(id, "report_unconsumed");
 		};
 		if (!attempts.length) hold(assignment.taskId, "task_attempts_missing");
 		for (const attempt of attempts) {
@@ -1466,8 +1490,10 @@ export class WorkLaneManager {
 			)
 				hold(attempt.opRef, "attempt_unsettled");
 			if (runtime.decision === "suppressed" && !runtime.output.knownSilence) hold(attempt.opRef, "silence_unproven");
-			// Neither inbox insertion nor an unrelated model reply proves this debt.
-			delivery(runtime.deliveryId, runtime.opRef, runtime.parent.originKey);
+			// The one native route settled this outcome: a reported result is owed until its persona
+			// turn consumed it, a refused one until its fallback delivery confirmed.
+			if (runtime.decision === "reported") report(runtime.reportId, runtime.parent.originKey);
+			else if (runtime.decision === "fallback") delivery(runtime.deliveryId, runtime.opRef, runtime.parent.originKey);
 		}
 		for (const report of this.#db.work.laneReportsByParent(assignment.name)) {
 			const child = this.#db.work.workAttemptGet(report.child_op_ref);
@@ -1499,17 +1525,20 @@ export class WorkLaneManager {
 				const outcome = JSON.parse(this.#db.core.metaGet(key)!) as {
 					taskId: string;
 					opRef: string;
-					deliveryId: string;
+					route: "persona" | "fallback";
+					id: string;
 					turnId: string;
 				};
 				if (
 					outcome.taskId !== assignment.taskId ||
 					!operations.has(outcome.opRef) ||
-					typeof outcome.deliveryId !== "string" ||
+					!["persona", "fallback"].includes(outcome.route) ||
+					typeof outcome.id !== "string" ||
 					typeof outcome.turnId !== "string"
 				)
 					hold(key, "outcome_attribution_unavailable");
-				else delivery(outcome.deliveryId, outcome.turnId, originKey(assignment.thread));
+				else if (outcome.route === "persona") report(outcome.id, originKey(assignment.thread));
+				else delivery(outcome.id, outcome.turnId, originKey(assignment.thread));
 			} catch {
 				hold(key, "outcome_attribution_unavailable");
 			}
@@ -1881,7 +1910,7 @@ export class WorkLaneManager {
 	 */
 	async mergeFirstmate(input: WorkMergeParams): Promise<WorkMergeResult> {
 		this.#live();
-		return this.#port.runExclusive(`work/firstmate/merge/${input.name}`, () => this.#mergeFirstmate(input));
+		return this.#port.runExclusive(workSessionKey(input.name), () => this.#mergeFirstmate(input));
 	}
 
 	async #mergeFirstmate(input: WorkMergeParams): Promise<WorkMergeResult> {
@@ -1975,6 +2004,10 @@ export class WorkLaneManager {
 		this.#live();
 		assignment = structuredClone(assignment);
 		this.#assertFirstmateAdmission(assignment);
+		const admitted = assignment;
+		return this.#admit(admitted.name, () => this.#startFirstmateAdmitted(admitted));
+	}
+	async #startFirstmateAdmitted(assignment: FirstmateAssignment): Promise<WorkStartResult> {
 		return this.#port.runExclusive(`work/firstmate/${assignment.worktree.path}`, async () => {
 			this.#assertFirstmateAdmission(assignment);
 			const duplicate = this.#db.work.firstmate.initial(assignment.taskId);
@@ -2084,83 +2117,80 @@ export class WorkLaneManager {
 		const cause = evidence.cause;
 		firstmateAssert(cause.kind === "correction", "correction_cause_invalid");
 		this.#assertFollowUpOpen(assignment.name);
-		if (this.#options.lanes.preservingRelease(assignment.name))
-			throw new ProtocolError("invalid_params", "FirstMate admission refused", {
-				reasonCode: "firstmate_admission_refused",
-				reason: "task_release_pending_or_completed",
-			});
 		const sessionKey = workSessionKey(assignment.name);
 		const held = new Set(this.#heldSessionKeys.getStore());
 		held.add(sessionKey);
-		return this.#heldSessionKeys.run(held, () =>
-			this.#port.runExclusive(`work/firstmate/${assignment.worktree.path}`, () =>
-				this.#port.runExclusive(sessionKey, async (): Promise<WorkStartResult> => {
-					this.#live();
-					this.#assertFirstmateAdmission(assignment);
-					// Resolve message identity before asking whether its predecessor is still latest.
-					const duplicate = owner.correction(assignment.taskId, cause, input.text);
-					if (duplicate) {
-						const job = this.#job(assignment.name)!;
-						const attempt = job.attempts[duplicate.ordinal];
-						firstmateAssert(
-							job.jobId === duplicate.jobId &&
-								attempt?.opRef === duplicate.opRef &&
-								attempt.sessionId === duplicate.sessionId &&
-								attempt.startedAt === duplicate.preparedAt,
-							"attempt_lineage_missing",
-						);
-						const binding = this.#db.bindings.getSessionRecord(workSessionKey(assignment.name));
-						firstmateAssert(
-							binding?.sessionId === duplicate.sessionId && binding.epoch === duplicate.epoch,
-							"correction_session_changed",
-						);
-						const runtime = this.#db.work.workAttemptGet(duplicate.opRef);
-						if (runtime) {
+		return this.#admit(assignment.name, () =>
+			this.#heldSessionKeys.run(held, () =>
+				this.#port.runExclusive(`work/firstmate/${assignment.worktree.path}`, () =>
+					this.#port.runExclusive(sessionKey, async (): Promise<WorkStartResult> => {
+						this.#live();
+						this.#assertFirstmateAdmission(assignment);
+						// Resolve message identity before asking whether its predecessor is still latest.
+						const duplicate = owner.correction(assignment.taskId, cause, input.text);
+						if (duplicate) {
+							const job = this.#job(assignment.name)!;
+							const attempt = job.attempts[duplicate.ordinal];
 							firstmateAssert(
-								runtime.jobId === duplicate.jobId &&
-									runtime.sessionKey === workSessionKey(assignment.name) &&
-									runtime.startedAt === duplicate.preparedAt &&
-									runtime.settledAt === (attempt.endedAt ?? null) &&
-									runtime.sessionId === duplicate.sessionId &&
-									runtime.epoch === duplicate.epoch &&
-									runtime.cwd === assignment.worktree.path &&
-									runtime.parent?.kind === "persona" &&
-									runtime.parent.originKey === originKey(assignment.thread),
-								"attempt_attribution_changed",
+								job.jobId === duplicate.jobId &&
+									attempt?.opRef === duplicate.opRef &&
+									attempt.sessionId === duplicate.sessionId &&
+									attempt.startedAt === duplicate.preparedAt,
+								"attempt_lineage_missing",
 							);
-						}
-						if (!runtime || !hasAcceptanceEvidence(runtime))
+							const binding = this.#db.bindings.getSessionRecord(workSessionKey(assignment.name));
+							firstmateAssert(
+								binding?.sessionId === duplicate.sessionId && binding.epoch === duplicate.epoch,
+								"correction_session_changed",
+							);
+							const runtime = this.#db.work.workAttemptGet(duplicate.opRef);
+							if (runtime) {
+								firstmateAssert(
+									runtime.jobId === duplicate.jobId &&
+										runtime.sessionKey === workSessionKey(assignment.name) &&
+										runtime.startedAt === duplicate.preparedAt &&
+										runtime.settledAt === (attempt.endedAt ?? null) &&
+										runtime.sessionId === duplicate.sessionId &&
+										runtime.epoch === duplicate.epoch &&
+										runtime.cwd === assignment.worktree.path &&
+										runtime.parent?.kind === "persona" &&
+										runtime.parent.originKey === originKey(assignment.thread),
+									"attempt_attribution_changed",
+								);
+							}
+							if (!runtime || !hasAcceptanceEvidence(runtime))
+								return {
+									started: false,
+									held: true,
+									jobId: duplicate.jobId,
+									state: job.state,
+									reason: `correction attempt ${duplicate.opRef} acceptance is unproven; no execution was replayed`,
+								};
 							return {
-								started: false,
-								held: true,
+								started: true,
 								jobId: duplicate.jobId,
-								state: job.state,
-								reason: `correction attempt ${duplicate.opRef} acceptance is unproven; no execution was replayed`,
+								opRef: duplicate.opRef,
+								sessionKey: workSessionKey(assignment.name),
+								sessionId: duplicate.sessionId,
 							};
-						return {
-							started: true,
-							jobId: duplicate.jobId,
-							opRef: duplicate.opRef,
-							sessionKey: workSessionKey(assignment.name),
-							sessionId: duplicate.sessionId,
-						};
-					}
-					this.#assertFollowUpOpen(assignment.name);
-					this.#options.lanes.assertAdmission(assignment.name);
-					this.#assertCorrectionPredecessor(evidence);
-					return this.#startLocked(
-						{ name: assignment.name, text: input.text, cwd: assignment.worktree.path, resume: false },
-						"start",
-						{
-							parent: { kind: "persona", originKey: originKey(assignment.thread), origin: assignment.thread },
-							firstmate: evidence,
-						},
-					);
-				}),
+						}
+						this.#assertFollowUpOpen(assignment.name);
+						this.#options.lanes.assertAdmission(assignment.name);
+						this.#assertCorrectionPredecessor(evidence);
+						return this.#startLocked(
+							{ name: assignment.name, text: input.text, cwd: assignment.worktree.path, resume: false },
+							"start",
+							{
+								parent: { kind: "persona", originKey: originKey(assignment.thread), origin: assignment.thread },
+								firstmate: evidence,
+							},
+						);
+					}),
+				),
 			),
 		);
 	}
-	#assertCorrectionPredecessor(evidence: FirstmatePrepare) {
+	#assertCorrectionPredecessor(evidence: FirstmatePrepare): void {
 		const { assignment, cause } = evidence;
 		firstmateAssert(cause.kind === "correction", "correction_cause_invalid");
 		this.#assertFirstmateAdmission(assignment);
@@ -2198,9 +2228,6 @@ export class WorkLaneManager {
 				(released || (binding?.sessionId === prior.sessionId && binding.epoch === prior.epoch)),
 			"correction_session_changed",
 		);
-		return released
-			? undefined
-			: { sessionId: prior.sessionId, epoch: prior.epoch, originKey: sessionKey, repo: assignment.worktree.path };
 	}
 	#assertFirstmateAdmission(assignment: FirstmateAssignment): void {
 		const owner = this.#db.work.firstmate;
@@ -2294,28 +2321,35 @@ export class WorkLaneManager {
 		this.#live();
 		this.#db.work.firstmate.assertUnmapped(input.name, input.cwd);
 		const parent = this.#resolveCaller(input, mode);
-		if (this.#job(input.name)) return await this.#startAdmitted(input, mode, { parent, runCall });
-		const admitting = this.#admissions.get(input.name);
+		return this.#admit(input.name, () => this.#startAdmitted(input, mode, { parent, runCall }));
+	}
+	/**
+	 * The one start admission: a fresh lane is `admitting` until its durable record
+	 * exists and `admission_failed` when it does not, for plain and FirstMate starts alike.
+	 */
+	async #admit(name: string, start: () => Promise<WorkStartResult>): Promise<WorkStartResult> {
+		if (this.#job(name)) return await start();
+		const admitting = this.#admissions.get(name);
 		// A same-name retry (for example after a caller timeout) must not queue a
 		// second clone, bind or send behind the admission still in progress.
 		if (admitting && admitting.failedAt === undefined)
 			return {
 				started: false,
 				held: true,
-				jobId: laneJobIdentity(input.name).jobId,
+				jobId: laneJobIdentity(name).jobId,
 				state: "admitting",
 				reason: "the lane start is still being admitted; check work.status",
 			};
 		const admission = { startedAt: this.#at() };
-		this.#admissions.set(input.name, admission);
+		this.#admissions.set(name, admission);
 		try {
-			const result = await this.#startAdmitted(input, mode, { parent, runCall });
-			if (this.#admissions.get(input.name) === admission) this.#admissions.delete(input.name);
+			const result = await start();
+			if (this.#admissions.get(name) === admission) this.#admissions.delete(name);
 			return result;
 		} catch (error) {
-			if (this.#admissions.get(input.name) === admission) {
-				if (this.#job(input.name)) this.#admissions.delete(input.name);
-				else this.#admissions.set(input.name, { ...admission, failedAt: this.#at(), reason: failureReason(error) });
+			if (this.#admissions.get(name) === admission) {
+				if (this.#job(name)) this.#admissions.delete(name);
+				else this.#admissions.set(name, { ...admission, failedAt: this.#at(), reason: failureReason(error) });
 			}
 			throw error;
 		}
@@ -2507,51 +2541,25 @@ export class WorkLaneManager {
 						try {
 							// A released or abandoned lane must not grow a session the cap would count.
 							this.#assertFollowUpOpen(input.name);
-							if (correction) {
-								const predecessor = this.#assertCorrectionPredecessor(correction);
-								if (predecessor) {
-									binding = predecessor;
-									const session = await this.#port.inspect({ sessionId: binding.sessionId, repo: worktreePath });
-									firstmateAssert(
-										session?.sessionId === binding.sessionId &&
-											session.repo === worktreePath &&
-											session.deleted !== true,
-										"correction_session_unavailable",
-									);
-									// Resume only the existing owned session; never bind a replacement.
-									binding = this.#assertCorrectionPredecessor(correction) ?? binding;
-									if (!session.live) await this.#port.resume(binding);
-									binding = this.#assertCorrectionPredecessor(correction) ?? binding;
-								} else {
-									// Close cleared the predecessor. A new session continues the task; the old attempt stays immutable.
-									binding = await this.#port.bind({
-										originKey: sessionKey,
-										epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
-										repo: worktreePath,
-										codingRegister: true,
-										...((input.model ?? this.#options.sessionModel)
-											? { model: input.model ?? this.#options.sessionModel }
-											: {}),
-									});
-									firstmateAssert(
-										binding.sessionId !== correction.cause.priorOpRef &&
-											this.#db.bindings.getSessionRecord(sessionKey)?.sessionId === binding.sessionId,
-										"correction_session_changed",
-									);
-								}
-							} else {
-								binding = await this.#port.bind({
-									originKey: sessionKey,
-									epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
-									repo: worktreePath,
-									codingRegister: true,
-									...((input.model ?? this.#options.sessionModel)
-										? { model: input.model ?? this.#options.sessionModel }
-										: {}),
-								});
-							}
+							// A correction continues its bound session: native bind reuses a live one and
+							// resumes a saved-but-dead one. After close cleared it, bind starts a new session;
+							// the old attempt stays immutable either way.
+							if (correction) this.#assertCorrectionPredecessor(correction);
+							binding = await this.#port.bind({
+								originKey: sessionKey,
+								epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
+								repo: worktreePath,
+								codingRegister: true,
+								...((input.model ?? this.#options.sessionModel)
+									? { model: input.model ?? this.#options.sessionModel }
+									: {}),
+							});
+							if (correction)
+								firstmateAssert(
+									this.#db.bindings.getSessionRecord(sessionKey)?.sessionId === binding.sessionId,
+									"correction_session_changed",
+								);
 						} catch (error) {
-							if (correction) throw error;
 							const detail = error instanceof ProtocolError ? error.detail : undefined;
 							const reason =
 								detail && typeof detail === "object" && "reasonCode" in detail ? detail.reasonCode : undefined;
@@ -2600,7 +2608,7 @@ export class WorkLaneManager {
 					}),
 				{ ...WORK_BIND_BROKER_WAIT, ...this.#options.brokerWait },
 			).catch((error: unknown) => {
-				if (correction || !isBrokerUnavailable(error)) throw error;
+				if (!isBrokerUnavailable(error)) throw error;
 				throw bindFailed(error);
 			});
 		} catch (error) {
@@ -2888,8 +2896,6 @@ export class WorkLaneManager {
 		this.#live();
 		return this.#port.runExclusive(workSessionKey(name), async (): Promise<WorkSteerResult> => {
 			this.#live();
-			if (this.#options.lanes.preservingRelease(name))
-				return { steered: false, reason: "task_release_pending_or_completed" };
 			const current = this.#job(name, true)!;
 			const open = current.attempts.at(-1);
 			if (open?.opRef !== captured.opRef || open.endedAt !== undefined)
@@ -3793,8 +3799,6 @@ export class WorkLaneManager {
 		const observed = this.#job(name);
 		const cycle = observed?.awaitingChecks;
 		if (observed?.state !== "awaiting_checks" || !cycle) return;
-		const assignment = this.#db.work.firstmate.assignment(name);
-		if (assignment) this.#assertFirstmateAdmission(assignment);
 		const facts = await collectRepoFacts(
 			observed.lane.worktreePath,
 			this.#gitTimeouts(),
@@ -3805,7 +3809,6 @@ export class WorkLaneManager {
 		);
 		const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
 			if (this.#stopped) return undefined;
-			if (assignment) this.#assertFirstmateAdmission(assignment);
 			let job = this.#job(name);
 			// Another writer moved the lane on while the checks were read.
 			const currentCycle = job?.awaitingChecks;
@@ -3947,6 +3950,8 @@ export class WorkLaneManager {
 		outcome: ChecksSettlement,
 		facts: Awaited<ReturnType<typeof collectRepoFacts>>,
 		at = this.#at(),
+		/** A later decision written in this same settlement transaction (FirstMate abandonment). */
+		amend?: (tx: WriteTx, settled: LaneJobRecord) => LaneJobRecord,
 	): ChecksReportEffects {
 		const cycle = job.awaitingChecks!;
 		const settled = settleAwaitingChecks(job, at, outcome);
@@ -3967,17 +3972,18 @@ export class WorkLaneManager {
 		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
 		const deliveryId = workAttemptDeliveryId(this.#db.instanceId, job.jobId, reportRef);
 		const effects = this.#db.transaction((tx): ChecksReportEffects => {
-			this.#putJob(name, settled, tx);
+			this.#putJob(name, amend ? amend(tx, settled) : settled, tx);
 			if (parent?.kind === "persona") {
-				if (assignment) {
+				// FirstMate records which native route carried this outcome; it never chooses another one.
+				const record = (route: "persona" | "fallback") => {
+					if (!assignment) return;
 					workAssert(last && parent.originKey === originKey(assignment.thread));
-					const fallback = this.#enqueueFallback(tx, reportRef, parent.origin, text, deliveryId);
+					const id = route === "persona" ? reportId : deliveryId;
 					this.#db.core.metaSet(
-						checksOutcomePrefix(assignment.taskId) + deliveryId,
-						JSON.stringify({ taskId: assignment.taskId, opRef: last.opRef, deliveryId, turnId: reportRef }),
+						checksOutcomePrefix(assignment.taskId) + reportRef,
+						JSON.stringify({ taskId: assignment.taskId, opRef: last.opRef, route, id, turnId: reportRef }),
 					);
-					return { fallback };
-				}
+				};
 				const refused =
 					Boolean(this.#options.personaHold?.(parent.originKey)) ||
 					this.#db.bindings.getSessionRecord(parent.originKey) === undefined;
@@ -3992,8 +3998,10 @@ export class WorkLaneManager {
 							source: "lane_report",
 						}),
 					);
+					record("persona");
 					return { persona: parent.originKey };
 				}
+				record("fallback");
 				return { fallback: this.#enqueueFallback(tx, reportRef, parent.origin, text, deliveryId) };
 			}
 			if (parent?.kind === "lane") {
@@ -4359,13 +4367,9 @@ export class WorkLaneManager {
 				let job: LaneJobRecord | undefined;
 				try {
 					job = this.#job(name);
-					const assignment = this.#db.work.firstmate.assignment(name);
-					if (assignment) {
-						this.#assertFirstmateAdmission(assignment);
-						// Attribution is never recovered by synthesizing a historical prepare.
-						const last = job?.attempts.at(-1);
-						if (last && !this.#db.work.workAttemptGet(last.opRef)) return;
-					}
+					// Attribution is never recovered by synthesizing a historical prepare.
+					const last = job?.attempts.at(-1);
+					if (last && this.#db.work.firstmate.attempt(last.opRef) && !this.#db.work.workAttemptGet(last.opRef)) return;
 				} catch {
 					return;
 				}
@@ -4408,13 +4412,6 @@ export class WorkLaneManager {
 			const nextAfter = invalidAfter > lastValid ? invalidAfter : lastValid;
 			if (!rows.length && nextAfter === after) break;
 			for (const runtime of rows) {
-				try {
-					const assignment = this.#db.work.firstmate.assignment(runtime.sessionKey.slice("work/task/".length));
-					if (assignment) this.#assertFirstmateAdmission(assignment);
-				} catch {
-					// A stale mapped resource must not block unrelated healthy lanes.
-					continue;
-				}
 				const prior = this.#observers.get(runtime.opRef);
 				if (prior && this.#writeCurrent(prior)) continue;
 				if (prior) {

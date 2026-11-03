@@ -331,8 +331,14 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		await until(() => Boolean(db.work.workAttemptGet(start.opRef)?.settledAt));
 		await port.runExclusive(start.sessionKey, async () => {});
 		const attempt = db.work.workAttemptGet(start.opRef)!;
-		await until(() => db.outbox.get(attempt.deliveryId) !== undefined);
-		db.transaction((tx) => db.outbox.confirm(tx, attempt.deliveryId));
+		// The settled outcome is one native persona report to the task's parent thread, not a second post.
+		expect(attempt.decision).toBe("reported");
+		expect(db.outbox.get(attempt.deliveryId)).toBeUndefined();
+		expect(db.inbox.messageDisposition(originKey(assignment.thread), attempt.reportId)?.message).toMatchObject({
+			source: "lane_report",
+			body: expect.stringContaining(`inspect: work inspect pane --task pane-task --op ${start.opRef}`),
+		});
+		await until(() => db.inbox.reportConsumed(originKey(assignment.thread), attempt.reportId));
 		const observed = await client.workInspect({
 			name: assignment.name,
 			taskId: assignment.taskId,

@@ -5,6 +5,7 @@ import { type LaneCapacityDetail, ProtocolError } from "@gajae-gateway/protocol"
 import { type LaneJobRecord, parseLaneJobRecord } from "@gajae-gateway/subsession";
 import { DEFAULT_WORK_IDLE_RETIRE_MS, DEFAULT_WORK_MAX_LANES } from "../config";
 import type { Store } from "../store";
+import type { WriteTx } from "../store/tx";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
 import type { SessionPort } from "./session-port";
@@ -88,19 +89,18 @@ export interface SweepNomination {
 export type LaneForceRetireReason = "session_dead" | "session_disowned" | "operator_retired" | "operator_abandoned";
 type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceRetireReason, endedAt: string) => boolean;
 
-export interface PreservingRetirement<T> {
-	/** All hooks execute under the governor's one native lane lock. */
-	readonly prepare: () =>
-		| { readonly result: T }
-		| {
-				readonly sessionId: string;
-				readonly repo: string;
-				readonly pending: boolean;
-				readonly recheck: () => void;
-				readonly persistIntent: () => void;
-				readonly complete: () => T;
-		  };
-	readonly held: (reason: string) => T;
+/**
+ * An owner's decision in front of the one native retire, for a lane native retire would
+ * otherwise refuse (a FirstMate-mapped lane). It decides; it never closes or settles.
+ */
+export interface LaneOwnerDecision {
+	/**
+	 * Under the native lane lock, after native settlement proof and before close.
+	 * Returns a held reason, or undefined to let the native close proceed.
+	 */
+	readonly prepare: () => Promise<string | undefined>;
+	/** Runs in the transaction that retires the binding, before the epoch rotates; throws to hold. */
+	readonly commit: (tx: WriteTx) => void;
 }
 
 export interface LaneGovernorOptions {
@@ -134,7 +134,6 @@ export class LaneGovernor {
 	#recoveryGate?: () => Promise<void>;
 	#forceRetireSettlement?: ForceRetireSettlement;
 	#stopped = false;
-	readonly #preserving = new Set<string>();
 	readonly #mutations = new Set<Promise<unknown>>();
 
 	constructor(options: LaneGovernorOptions) {
@@ -156,67 +155,6 @@ export class LaneGovernor {
 	/** Installed by the attempt owner so forced retirement settles history and runtime atomically. */
 	setForceRetireSettlement(settle: ForceRetireSettlement): void {
 		this.#forceRetireSettlement = settle;
-	}
-
-	preservingRelease(name: string): boolean {
-		return this.#preserving.has(name);
-	}
-
-	/**
-	 * Policy composition, not recovery or filesystem cleanup.
-	 * A second release for a lane already marked does not queue on the native lock.
-	 */
-	retirePreserving<T>(name: string, policy: PreservingRetirement<T>): Promise<T> {
-		if (this.#preserving.has(name)) return Promise.resolve(policy.held("task_release_pending_or_completed"));
-		this.#preserving.add(name);
-		const task = this.#port
-			.runExclusive(workSessionKey(name), async () => {
-				if (this.#stopped) return policy.held("gateway is stopping");
-				const prepared = policy.prepare();
-				if ("result" in prepared) return prepared.result;
-				const recheck = () => {
-					if (this.#stopped) throw new Error("gateway is stopping");
-					prepared.recheck();
-				};
-				recheck();
-				// A preserving release never discards checkout work: it refuses while the task
-				// worktree has tracked or untracked changes. Nothing is reset, deleted or merged.
-				const dirty = await dirtyCheckout(prepared.repo);
-				recheck();
-				if (dirty) return policy.held(dirty);
-				if (prepared.pending) {
-					const proof = await this.#safeLiveness(prepared.sessionId, prepared.repo);
-					recheck();
-					if (proof.live !== false && !proof.disowned) {
-						// Same journaled close the first attempt used. Do not invent a second close path.
-						const closed = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
-						recheck();
-						if (!closed.released) return policy.held(closed.reason);
-					}
-				} else {
-					const job = this.#job(name);
-					if (!job || job === "corrupt") return policy.held("lane_job_unavailable");
-					const runtime = await this.#runtimeSettled(job, prepared.sessionId, prepared.repo);
-					recheck();
-					if (!runtime.settled) return policy.held(runtime.reason);
-					prepared.persistIntent();
-					recheck();
-					const proof = await this.#closeOwnedSession(name, prepared.sessionId, prepared.repo);
-					recheck();
-					if (!proof.released) return policy.held(proof.reason);
-				}
-				// A thrown transaction cannot undo native release. The durable intent remains.
-				return prepared.complete();
-			})
-			.finally(() => {
-				this.#preserving.delete(name);
-			});
-		this.#mutations.add(task);
-		void task.then(
-			() => this.#mutations.delete(task),
-			() => this.#mutations.delete(task),
-		);
-		return task;
 	}
 
 	#mapped(name: string): boolean {
@@ -281,9 +219,17 @@ export class LaneGovernor {
 					state: lane.state,
 				})),
 		};
+		// work.retire cannot reclaim a live FirstMate lane; only its owner's release or abandonment can.
+		const mapped = lanes.filter((lane) => this.#mapped(lane.name)).length;
+		const remedy =
+			mapped === 0
+				? "retire one with work.retire"
+				: mapped === lanes.length
+					? "every lane is a FirstMate lane; release or abandon one through its owner"
+					: "retire an ordinary lane with work.retire, or release or abandon a FirstMate lane through its owner";
 		throw new ProtocolError(
 			"lane_capacity",
-			`work lanes are at capacity (${lanes.length}/${this.maxLanes}); retire one with work.retire before starting ${name}`,
+			`work lanes are at capacity (${lanes.length}/${this.maxLanes}); ${remedy} before starting ${name}`,
 			detail,
 		);
 	}
@@ -299,8 +245,14 @@ export class LaneGovernor {
 	 * reused on the same session (no longer idle, job no longer terminal) or
 	 * rebound to a new one is left alone.
 	 */
-	retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
-		if (this.#mapped(name))
+	retire(
+		name: string,
+		reason: string,
+		expected?: SweepNomination,
+		decision?: LaneOwnerDecision,
+	): Promise<LaneRetireOutcome> {
+		// A live mapped lane retires only behind its owner's decision; the sweep never nominates one.
+		if (!decision && this.#mapped(name))
 			return Promise.resolve({
 				retired: false,
 				sessionKey: workSessionKey(name),
@@ -318,7 +270,7 @@ export class LaneGovernor {
 			await this.#recoveryGate?.();
 			if (this.#stopped)
 				return { retired: false as const, sessionKey: workSessionKey(name), reason: "gateway is stopping" };
-			return this.#retire(name, reason, expected);
+			return this.#retire(name, reason, expected, decision);
 		})();
 		this.#mutations.add(task);
 		void task.then(
@@ -328,7 +280,12 @@ export class LaneGovernor {
 		return task;
 	}
 
-	#retire(name: string, reason: string, expected?: SweepNomination): Promise<LaneRetireOutcome> {
+	#retire(
+		name: string,
+		reason: string,
+		expected?: SweepNomination,
+		decision?: LaneOwnerDecision,
+	): Promise<LaneRetireOutcome> {
 		const sessionKey = workSessionKey(name);
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({ retired: false, sessionKey, reason: "broker_authority_quarantined" });
@@ -338,13 +295,15 @@ export class LaneGovernor {
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (preflight?.attemptOpen) return Promise.resolve(unsettled(sessionKey, preflight));
 		return this.#port.runExclusive(sessionKey, async () => {
-			if (this.#mapped(name)) return { retired: false, sessionKey, reason: "firstmate_scoped_release_required" };
+			if (!decision && this.#mapped(name))
+				return { retired: false, sessionKey, reason: "firstmate_scoped_release_required" };
 			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
 			const lane = this.activeLanes(expected ? Math.max(expected.now, this.#now()) : undefined).find(
 				(candidate) => candidate.name === name,
 			);
+			if (!lane && decision) return this.#retireUnbound(name, decision);
 			if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
 			if (expected && lane.sessionId !== expected.sessionId)
 				return { retired: false, sessionKey, reason: `lane was rebound to ${lane.sessionId} since it was selected` };
@@ -377,6 +336,11 @@ export class LaneGovernor {
 			// or a crash-left attempt may still be running.
 			const runtime = await this.#runtimeSettled(record, lane.sessionId, repo);
 			if (!runtime.settled) return { retired: false, sessionKey, reason: runtime.reason };
+			if (decision) {
+				const held = await decision.prepare();
+				if (held) return { retired: false, sessionKey, reason: held };
+				if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
+			}
 			const proof = await this.#closeOwnedSession(name, lane.sessionId, repo);
 			if (!proof.released) return { retired: false, sessionKey, reason: proof.reason };
 			const closed = proof.closed;
@@ -384,20 +348,14 @@ export class LaneGovernor {
 			// poller keeps re-steering red checks into a fresh session after retirement.
 			// Settle it only once the session is closed or proven gone: a retained lane
 			// must keep its checks monitoring.
-			const lastAttempt = record?.attempts.at(-1);
-			if (record?.state === "awaiting_checks" && lastAttempt) {
-				const endedAt = new Date(this.#now()).toISOString();
-				if (!this.#forceRetireSettlement?.(name, lastAttempt.opRef, "operator_retired", endedAt)) {
-					const detail = "awaiting_checks cycle could not be settled";
-					this.#log(`lane_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
-					return { retired: false, sessionKey, reason: detail };
-				}
-			}
+			const checks = this.#settleOpenChecks(name, sessionKey);
+			if (checks) return checks;
 			// Only a non-forced operator retirement (no sweep nomination) deletes the
 			// runtime-created worktree and branch. Unattended sweep/force retirement keeps
-			// the durable lane path and its unpushed commits resumable.
+			// the durable lane path and its unpushed commits resumable, and an owner
+			// decision never discards its task checkout.
 			const repositoryPath = record?.lane.repositoryPath ?? record?.lane.repository;
-			if (!expected && record?.lane.worktreePath && repositoryPath) {
+			if (!expected && !decision && record?.lane.worktreePath && repositoryPath) {
 				try {
 					await this.#cleanupWorktree(
 						name,
@@ -413,7 +371,10 @@ export class LaneGovernor {
 				}
 			}
 
-			this.#database.transaction((tx) => this.#database.bindings.rotateEpoch(tx, sessionKey));
+			this.#database.transaction((tx) => {
+				decision?.commit(tx);
+				this.#database.bindings.rotateEpoch(tx, sessionKey);
+			});
 			this.#log(`lane_retired name=${name} session=${lane.sessionId} reason=${reason} closed=${closed}`, "info");
 			return { retired: true, sessionKey, sessionId: lane.sessionId, closed };
 		});
@@ -430,6 +391,8 @@ export class LaneGovernor {
 		if (this.#stopped) return 0;
 		let retired = 0;
 		for (const lane of this.activeLanes(now)) {
+			// A live mapped lane ends only through its owner's release or abandonment.
+			if (this.#mapped(lane.name)) continue;
 			const reason = this.#sweepReason(lane);
 			if (!reason) continue;
 			try {
@@ -450,12 +413,6 @@ export class LaneGovernor {
 	 * the epoch with reason operator_force.
 	 */
 	forceRetire(name: string): Promise<LaneRetireOutcome> {
-		if (this.#mapped(name))
-			return Promise.resolve({
-				retired: false,
-				sessionKey: workSessionKey(name),
-				reason: "firstmate_scoped_release_required",
-			});
 		if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 			return Promise.resolve({
 				retired: false,
@@ -493,7 +450,6 @@ export class LaneGovernor {
 		const preflight = this.activeLanes().find((candidate) => candidate.name === name);
 		if (!preflight) return Promise.resolve({ retired: false, sessionKey, reason: "no bound lane for that name" });
 		return this.#port.runExclusive(sessionKey, async () => {
-			if (this.#mapped(name)) return { retired: false, sessionKey, reason: "firstmate_scoped_release_required" };
 			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(name).jobId))
 				return { retired: false, sessionKey, reason: "broker_authority_quarantined" };
 			if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
@@ -682,7 +638,6 @@ export class LaneGovernor {
 		if (this.#stopped) return { count: 0, names: [] };
 		const retired: string[] = [];
 		for (const lane of this.activeLanes(now)) {
-			if (this.#mapped(lane.name)) continue;
 			if (this.#database.bindings.isQuarantined("work", laneJobIdentity(lane.name).jobId)) continue;
 			const job = this.#job(lane.name);
 			const record = job === "corrupt" ? undefined : job;
@@ -775,6 +730,43 @@ export class LaneGovernor {
 			// Conservative: assume session still alive if we can't probe.
 			return { live: undefined, disowned: false };
 		}
+	}
+
+	/**
+	 * A settled attempt can still own an open checks cycle. Left open, the checks
+	 * poller keeps re-steering red checks into a fresh session after retirement.
+	 * Settle it only once the session is closed or proven gone: a retained lane
+	 * must keep its checks monitoring. Returns the held outcome when it cannot settle.
+	 */
+	#settleOpenChecks(name: string, sessionKey: string): LaneRetireOutcome | undefined {
+		const job = this.#job(name);
+		const record = job === "corrupt" ? undefined : job;
+		const lastAttempt = record?.attempts.at(-1);
+		if (record?.state !== "awaiting_checks" || !lastAttempt) return undefined;
+		const endedAt = new Date(this.#now()).toISOString();
+		if (this.#forceRetireSettlement?.(name, lastAttempt.opRef, "operator_retired", endedAt)) return undefined;
+		const detail = "awaiting_checks cycle could not be settled";
+		this.#log(`lane_retire_failed name=${name} opRef=${lastAttempt.opRef} reason=${detail}`);
+		return { retired: false, sessionKey, reason: detail };
+	}
+
+	/**
+	 * An owner decision for a lane whose session was already closed or reclaimed:
+	 * nothing is left to close, so only checks settlement and the decision remain.
+	 */
+	async #retireUnbound(name: string, decision: LaneOwnerDecision): Promise<LaneRetireOutcome> {
+		const sessionKey = workSessionKey(name);
+		const job = this.#job(name);
+		if (job === "corrupt" || job?.attempts.some((attempt) => attempt.endedAt === undefined))
+			return { retired: false, sessionKey, reason: "lane has an unsettled attempt" };
+		const held = await decision.prepare();
+		if (held) return { retired: false, sessionKey, reason: held };
+		if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
+		const checks = this.#settleOpenChecks(name, sessionKey);
+		if (checks) return checks;
+		this.#database.transaction((tx) => decision.commit(tx));
+		this.#log(`lane_retired name=${name} session=none reason=owner_decision closed=false`, "info");
+		return { retired: true, sessionKey, sessionId: "", closed: false };
 	}
 
 	async #closeOwnedSession(
@@ -942,7 +934,7 @@ function unsettled(sessionKey: string, lane: ActiveLane): LaneRetireOutcome {
  * Held reason when the task checkout has tracked or untracked changes, or when its
  * status cannot be read. A worktree that no longer exists holds no work to preserve.
  */
-async function dirtyCheckout(repo: string): Promise<string | undefined> {
+export async function dirtyCheckout(repo: string): Promise<string | undefined> {
 	if (!existsSync(repo)) return undefined;
 	let status: Awaited<ReturnType<typeof runGit>>;
 	try {
