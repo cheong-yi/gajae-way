@@ -45,8 +45,8 @@ import {
 	validateOriginRef,
 	WORK_JOBS_DEFAULT_LIMIT,
 	WORK_JOBS_MAX_LIMIT,
-	type WorkApproveParams,
 	type WorkApproveDecisionParams,
+	type WorkApproveParams,
 	type WorkCloseoutDecisionParams,
 	type WorkFirstmateAssignmentParams,
 	type WorkFirstmateCorrectionParams,
@@ -139,7 +139,7 @@ import {
 import { getServiceDirectory, laneLastCommits, utf8Prefix, WorkLaneManager } from "../orchestrator/work-lane";
 import { buildSessionBootstrap } from "../persona/bootstrap";
 import { PersonaLoader } from "../persona/persona";
-import { type Store } from "../store";
+import type { Store } from "../store";
 import {
 	editedOriginalId,
 	type InboundMessageRow,
@@ -1292,6 +1292,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		},
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
+		closePane: (name) => closeFirstmatePane(runtime, options.database, name),
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {
@@ -1576,16 +1577,6 @@ async function handleFrame(
 		}
 		if (frame.type === "request") {
 			if (isStopping()) throw new ProtocolError("gateway_shutting_down", "gateway is stopping");
-			// A pane open waits on this connection for the adapter's reply. Awaiting the
-			// request here would hold that reply behind the request that is waiting for it.
-			if (frame.verb === "work.start") {
-				void handleRequest(connection, frame, options, runtime, stop).catch((error) => {
-					if (!(error instanceof ProtocolError))
-						console.error(`gateway request failed (${frame.verb}): ${diagnostic(error)}`);
-					writeError(connection, error, frame.id);
-				});
-				return;
-			}
 			await handleRequest(connection, frame, options, runtime, stop);
 		}
 	} catch (error) {
@@ -1969,7 +1960,6 @@ async function handleRequest(
 				messageId: params.messageId as string,
 			};
 			const result = await runtime.work.closeoutFirstmateDecision(closeout);
-			if (result.retired) await closeFirstmatePane(runtime, options.database, closeout.name);
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 			return;
 		}
@@ -2152,7 +2142,6 @@ async function handleRequest(
 				const result = await runtime.work.abandonFirstmate(name);
 				if (!result.abandoned)
 					throw new ProtocolError("verb_failed", result.reason, { reasonCode: "firstmate_abandon_held" });
-				await closeFirstmatePane(runtime, options.database, name);
 				console.info(`firstmate_abandoned name=${name} reason=no_outcome`);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 				return;
@@ -2160,7 +2149,6 @@ async function handleRequest(
 			if (workObject(request.params) && Object.hasOwn(request.params, "firstmate")) {
 				const params = request.params as unknown as WorkFirstmateRetireParams;
 				const result = await runtime.work.retireFirstmate(params);
-				if (result.retired) await closeFirstmatePane(runtime, options.database, params.firstmate.name);
 				connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result });
 				return;
 			}

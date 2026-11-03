@@ -691,9 +691,11 @@ async function approvalInput(
 	};
 }
 
-async function approvalFixture(text = "done", unavailable = false) {
+/** `personaBound` decides the native report route: the persona inbox, or its fallback delivery. */
+async function approvalFixture(text = "done", unavailable = false, personaBound = true) {
 	const f = await firstmateFixture();
-	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(f.assignment.thread), crypto.randomUUID()));
+	if (personaBound)
+		f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(f.assignment.thread), crypto.randomUUID()));
 	Object.assign(f.assignment.mandate, { checkRetries: false });
 	const start = await f.manager.startFirstmate(f.assignment);
 	if (!start.started) throw new Error("unexpected hold");
@@ -843,17 +845,17 @@ test("pane queued steer rechecks the captured terminal attempt under the existin
 	expect(f.port.steers).toHaveLength(0);
 });
 
-test("pane silent terminal retains native silence evidence and still delivers one gateway outcome", async () => {
+test("pane silent terminal retains native silence evidence and posts nothing beside the native suppression", async () => {
 	const f = await paneFixture();
 	f.port.complete(f.start.opRef, "[SILENT]");
 	await until(() => Boolean(f.db.work.workAttemptGet(f.start.opRef)?.settledAt));
 	const runtime = f.db.work.workAttemptGet(f.start.opRef)!;
 	expect(runtime.output.knownSilence).not.toBeNull();
 	expect(runtime.decision).toBe("suppressed");
-	expect(f.db.outbox.get(runtime.deliveryId)).toMatchObject({
-		turnId: runtime.opRef,
-		originKey: originKey(f.assignment.thread),
-	});
+	expect(f.db.outbox.get(runtime.deliveryId)).toBeUndefined();
+	expect(f.db.outbox.rows().filter((row) => row.origin_key === originKey(f.assignment.thread))).toEqual([]);
+	// The settled result is still the one answer an owner approval may resolve.
+	expect(f.owner.approvalHolds(f.assignment.name).map((hold) => hold.state)).toEqual(["open"]);
 	expect(f.db.inbox.messageDisposition(originKey(f.assignment.thread), runtime.reportId)).toBeUndefined();
 	const before = f.notices.filter((payload) => payload.deliveryId === runtime.deliveryId).length;
 	await f.manager.recover();
@@ -917,7 +919,12 @@ test("FirstMate merge refuses unfinished checks and the writer, then the gateway
 	const f = await firstmateFixture({ checkStatusClient: checks.client, ghExecutable: ghPath });
 	const merger = crypto.randomUUID();
 	const reviewer = crypto.randomUUID();
-	const reviewOrigin = originKey({ platform: "discord", kind: "thread", conversationId: "review", parentId: "cockpit" });
+	const reviewOrigin = originKey({
+		platform: "discord",
+		kind: "thread",
+		conversationId: "review",
+		parentId: "cockpit",
+	});
 	f.db.transaction((tx) => {
 		f.db.bindings.bind(tx, originKey(f.assignment.thread), merger);
 		f.db.bindings.bind(tx, reviewOrigin, reviewer);
@@ -940,7 +947,7 @@ test("FirstMate merge refuses unfinished checks and the writer, then the gateway
 	expect(await f.manager.mergeFirstmate({ name, sessionId: merger })).toMatchObject({ reason: "merge_hold_open" });
 	const approval = await f.manager.approveFirstmate(await approvalInput(f, start.opRef));
 	if (!approval.recorded) throw new Error(approval.reason);
-	for (const row of f.db.outbox.rows()) f.db.transaction((tx) => f.db.outbox.confirm(tx, row.delivery_id));
+	settleReportDelivery(f, start.opRef);
 	const closed = await f.manager.retireFirstmate({
 		firstmate: {
 			name,
@@ -993,32 +1000,21 @@ test("FirstMate merge refuses unfinished checks and the writer, then the gateway
 		reason: "merge_reviewer_refused",
 	});
 	expect(await merges()).toBe("");
-	expect(await f.manager.mergeFirstmate({ name, sessionId: merger })).toEqual({ merged: true, prNumber: 700, headSha: head });
+	expect(await f.manager.mergeFirstmate({ name, sessionId: merger })).toEqual({
+		merged: true,
+		prNumber: 700,
+		headSha: head,
+	});
 	expect(await merges()).toBe(`pr merge 700 --merge --match-head-commit ${head}`);
 	expect(f.owner.merges(name)).toMatchObject([
-		{ prNumber: 700, headSha: head, authorizationMessageId: "merge-class", reviewSessionId: reviewer, requestedBy: merger },
+		{
+			prNumber: 700,
+			headSha: head,
+			authorizationMessageId: "merge-class",
+			reviewSessionId: reviewer,
+			requestedBy: merger,
+		},
 	]);
-});
-
-test("pane queued steer refuses a preserving release without using a persona mailbox lock", async () => {
-	const f = await paneFixture();
-	const entered = deferred<void>();
-	const release = deferred<void>();
-	const held = f.port.runExclusive(f.start.sessionKey, async () => {
-		entered.resolve();
-		await release.promise;
-	});
-	await entered.promise;
-	const steer = f.manager.steer({ name: f.assignment.name, text: f.input.text });
-	const pending = spyOn(f.lanes, "preservingRelease").mockReturnValue(true);
-	try {
-		release.resolve();
-		await held;
-		expect(await steer).toEqual({ steered: false, reason: "task_release_pending_or_completed" });
-		expect(f.port.steers).toHaveLength(0);
-	} finally {
-		pending.mockRestore();
-	}
 });
 
 test("pane transcript stays in child while deterministic terminal outcomes stay in the single parent", async () => {
@@ -1047,15 +1043,34 @@ test("pane transcript stays in child while deterministic terminal outcomes stay 
 	expect(f.db.work.workAttemptGet(correction.opRef)!.deliveryId).not.toBe(runtime.deliveryId);
 });
 
+/** The persona turn finished consuming a report the native route admitted to its inbox. */
+function consumeReport(f: Awaited<ReturnType<typeof firstmateFixture>>, reportId: string) {
+	const raw = new Database(join(f.directory, "gateway.db"));
+	try {
+		expect(raw.query("UPDATE inbound_messages SET state = 'done' WHERE message_id = ?").run(reportId).changes).toBe(1);
+	} finally {
+		raw.close();
+	}
+}
+
+/** Settles the one native route that carried the outcome: the persona inbox, or its fallback delivery. */
 function settleReportDelivery(f: Awaited<ReturnType<typeof firstmateFixture>>, opRef: string, confirm = true) {
 	const runtime = f.db.work.workAttemptGet(opRef)!;
-	expect(f.db.outbox.get(runtime.deliveryId)).toBeDefined();
-	if (confirm) f.db.transaction((tx) => f.db.outbox.confirm(tx, runtime.deliveryId));
+	if (runtime.decision === "reported") {
+		// One delivery, not a second post beside the inbox report.
+		expect(f.db.outbox.get(runtime.deliveryId)).toBeUndefined();
+		expect(f.db.inbox.messageExists(runtime.reportId)).toBe(true);
+		if (confirm) consumeReport(f, runtime.reportId);
+	} else {
+		expect(runtime.decision).toBe("fallback");
+		expect(f.db.outbox.get(runtime.deliveryId)).toBeDefined();
+		if (confirm) f.db.transaction((tx) => f.db.outbox.confirm(tx, runtime.deliveryId));
+	}
 	return { turnId: runtime.opRef, deliveryId: runtime.deliveryId, reportId: runtime.reportId };
 }
 
-async function releaseFixture(delivered = true, unavailable = false) {
-	const f = await approvalFixture("done", unavailable);
+async function releaseFixture(delivered = true, unavailable = false, personaBound = true) {
+	const f = await approvalFixture("done", unavailable, personaBound);
 	const input = await approvalInput(f, f.start.opRef);
 	const approved = await f.manager.approveFirstmate(input);
 	if (!approved.recorded) throw new Error(approved.reason);
@@ -1107,7 +1122,8 @@ test("FirstMate separate release refuses a dirty checkout, preserves Git and ret
 	expect(result.retired).toBe(true);
 	if (!result.retired) throw new Error(result.reason);
 	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path }]);
-	expect(recover).not.toHaveBeenCalled();
+	// The release is a decision in front of the native retire, so its recovery gate runs.
+	expect(recover).toHaveBeenCalledTimes(1);
 	recover.mockRestore();
 	expect(gitSnapshot()).toEqual(before);
 	expect(await Bun.file(untracked).text()).toBe("preserve this\n");
@@ -1176,20 +1192,49 @@ test("FirstMate abandonment refuses a dirty checkout without touching it and aba
 	expect(await Bun.file(join(path, "tracked.txt")).text()).toBe("base\n");
 });
 
-test("FirstMate release holds handed-off and pending delivery debt but ignores unrelated same-thread inbox", async () => {
+test("FirstMate abandonment settles an open checks cycle through the native report and native retire", async () => {
+	const checks = scriptedChecks({ prNumber: 613, status: "pending", failingChecks: [] });
+	const f = await firstmateFixture({ checkStatusClient: checks.client });
+	const parentKey = originKey(f.assignment.thread);
+	f.db.transaction((tx) => f.db.bindings.bind(tx, parentKey, crypto.randomUUID()));
+	const start = await f.manager.startFirstmate(f.assignment);
+	if (!start.started) throw new Error("unexpected hold");
+	await settleFirstmateSetup(f, start.opRef);
+	expect(f.job().state).toBe("awaiting_checks");
+	const recover = spyOn(f.manager, "recover");
+	try {
+		expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
+		// Native retire ran its recovery gate.
+		expect(recover).toHaveBeenCalled();
+	} finally {
+		recover.mockRestore();
+	}
+	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
+	expect(f.job().state).toBe("aborted");
+	expect(f.job().awaitingChecks).toBeUndefined();
+	expect(f.port.closes).toEqual([{ sessionId: start.sessionId, repo: f.assignment.worktree.path }]);
+	expect(f.db.bindings.getSessionRecord(start.sessionKey)?.sessionId).toBe("");
+	// The checks outcome is one native persona report; nothing is posted beside it.
+	const reports = f.db.core
+		.groupDb("work")
+		.prepare("SELECT message_id, body FROM inbound_messages WHERE origin_key = ? AND source = 'lane_report'")
+		.all(parentKey) as { message_id: string; body: string }[];
+	const checksReports = reports.filter((row) => row.body.includes("checks=ended"));
+	expect(checksReports).toHaveLength(1);
+	expect(checksReports[0]!.body).toContain("lane abandoned before checks settled");
+	expect(f.db.outbox.rows().filter((row) => row.payload_json.includes("checks=ended"))).toHaveLength(0);
+});
+
+test("FirstMate release holds an unconsumed native report but ignores unrelated same-thread inbox", async () => {
 	const f = await releaseFixture(false);
+	const report = settleReportDelivery(f, f.start.opRef, false);
 	expect(await f.manager.retireFirstmate(f.request)).toMatchObject({
 		retired: false,
-		obligations: [{ id: f.db.work.workAttemptGet(f.start.opRef)!.deliveryId, reason: "delivery_pending" }],
+		obligations: [{ id: report.reportId, reason: "report_unconsumed" }],
 	});
 	expect(f.owner.releaseForAttempt(f.start.opRef)).toBeUndefined();
-	const delivery = settleReportDelivery(f, f.start.opRef, false);
-	expect(await f.manager.retireFirstmate(f.request)).toMatchObject({
-		retired: false,
-		obligations: [{ id: delivery.deliveryId, reason: "delivery_pending" }],
-	});
+	consumeReport(f, report.reportId);
 	f.db.transaction((tx) => {
-		f.db.outbox.confirm(tx, delivery.deliveryId);
 		f.db.inbox.enqueue(tx, {
 			messageId: "unrelated",
 			originKey: originKey(f.assignment.thread),
@@ -1238,7 +1283,8 @@ test("FirstMate failed intent has zero close; post-close transaction rollback re
 	await f.restart({}, true);
 	const result = await f.currentManager().retireFirstmate(f.request);
 	expect(result.retired).toBe(true);
-	expect(f.port.closes).toHaveLength(1);
+	// The retry is the same native retire: it closes the still-bound session again, then records the receipt.
+	expect(f.port.closes).toHaveLength(2);
 	expect(await f.currentManager().retireFirstmate(f.request)).toEqual(result);
 	const observation = await f.currentManager().inspectFirstmate({
 		name: "a",
@@ -1275,7 +1321,8 @@ for (const proof of [
 			f.port.liveness = async () => ({ live: false, disowned: false });
 			expect((await f.currentManager().retireFirstmate(f.request)).retired).toBe(true);
 		}
-		expect(closes).toBe(proof.disowned ? 1 : 2);
+		// Every attempt is the native retire, which closes before it accepts liveness proof.
+		expect(closes).toBe(proof.disowned ? 1 : 3);
 	});
 }
 
@@ -1300,7 +1347,7 @@ test("FirstMate correction debts cover older attempts and retained inspection co
 	expect((await f.manager.retireFirstmate(f.request)).retired).toBe(false);
 	expect(await f.manager.retireFirstmate(request)).toMatchObject({
 		retired: false,
-		obligations: [{ id: f.db.work.workAttemptGet(f.start.opRef)!.deliveryId }],
+		obligations: [{ id: f.db.work.workAttemptGet(f.start.opRef)!.reportId, reason: "report_unconsumed" }],
 	});
 	settleReportDelivery(f, f.start.opRef);
 	const result = await f.manager.retireFirstmate(request);
@@ -1325,7 +1372,7 @@ test("FirstMate correction debts cover older attempts and retained inspection co
 	read.mockRestore();
 });
 
-test("FirstMate release and correction share one native lock; pending release blocks correction", async () => {
+test("FirstMate release and correction share one native lock; a queued correction sees the release", async () => {
 	const f = await releaseFixture();
 	const entered = deferred<void>();
 	const resume = deferred<void>();
@@ -1336,12 +1383,14 @@ test("FirstMate release and correction share one native lock; pending release bl
 	const releasing = f.manager.retireFirstmate(f.request);
 	await entered.promise;
 	const correcting = f.manager.startFirstmateCorrection(correctionInput(f, f.start.opRef));
-	const rejected = expect(correcting).rejects.toMatchObject({
-		detail: { reason: "task_release_pending_or_completed" },
-	});
+	// The correction queues on the same native lane lock and sees the release once it lands.
+	const refused = correcting.then(
+		() => undefined,
+		(error: unknown) => error,
+	);
 	resume.resolve();
 	expect((await releasing).retired).toBe(true);
-	await rejected;
+	expect(await refused).toMatchObject({ detail: { reason: "task_released" } });
 	expect(f.owner.attemptsForTask(f.assignment.taskId)).toHaveLength(1);
 	// A confirmed release refuses a follow-up before any session binds, also after restart.
 	const binds = f.port.binds.length;
@@ -1438,28 +1487,37 @@ test("FirstMate confirmed release frees its clean checkout and thread for a new 
 	).rejects.toMatchObject({ detail: { reason: "immutable_assignment_conflict" } });
 });
 
-test("FirstMate mapped ordinary force all-dead and idle retirement cannot bypass scoped release", async () => {
+test("FirstMate mapped lane needs its owner decision for ordinary and idle retirement; a proven-dead session uses native force retire", async () => {
 	const f = await releaseFixture();
-	const recover = spyOn(f.manager, "recover");
 	expect(await f.lanes.retire("a", "operator")).toMatchObject({
 		retired: false,
 		reason: "firstmate_scoped_release_required",
 	});
-	expect(await f.lanes.forceRetire("a")).toMatchObject({ retired: false, reason: "firstmate_scoped_release_required" });
-	f.port.liveness = async () => ({ live: false, disowned: false });
-	expect(await f.lanes.retireAllDead()).toEqual({ count: 0, names: [] });
 	expect(await f.lanes.sweep(Date.now() + 24 * 60 * 60_000)).toBe(0);
+	expect(await f.lanes.forceRetire("a")).toMatchObject({
+		retired: false,
+		reason: "session is still live; cannot force retire",
+	});
 	expect(f.port.closes).toHaveLength(0);
-	expect(recover).not.toHaveBeenCalled();
-	recover.mockRestore();
+	f.port.liveness = async () => ({ live: false, disowned: false });
+	expect(await f.lanes.retireAllDead()).toEqual({ count: 1, names: ["a"] });
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path }]);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+	// Reclaiming a dead session records no owner decision.
+	expect(f.owner.released("a")).toBe(false);
+	expect(f.owner.abandoned("a")).toBe(false);
+	// The owner's release still completes through the native retire, with nothing left to close.
+	expect((await f.manager.retireFirstmate(f.request)).retired).toBe(true);
+	expect(f.owner.released("a")).toBe(true);
+	expect(f.port.closes).toHaveLength(1);
 	// Unmapped native lanes keep their ordinary retirement behavior.
 	f.db.transaction((tx) => f.db.bindings.bind(tx, workSessionKey("unmapped"), "unmapped-session"));
 	expect((await f.lanes.forceRetire("unmapped")).retired).toBe(true);
 });
 
 for (const state of ["pending", "inflight", "failed_ambiguous", "expired", "missing"] as const) {
-	test(`FirstMate exact delivery ${state} never counts fulfilled`, async () => {
-		const f = await releaseFixture(false);
+	test(`FirstMate exact fallback delivery ${state} never counts fulfilled`, async () => {
+		const f = await releaseFixture(false, false, false);
 		const linked = settleReportDelivery(f, f.start.opRef, false);
 		const get = f.db.outbox.get.bind(f.db.outbox);
 		const row = get(linked.deliveryId)!;
@@ -1477,9 +1535,37 @@ for (const state of ["pending", "inflight", "failed_ambiguous", "expired", "miss
 	});
 }
 
+for (const state of ["pending", "processing", "missing"] as const) {
+	test(`FirstMate native persona report ${state} never counts consumed`, async () => {
+		const f = await releaseFixture(false);
+		const linked = settleReportDelivery(f, f.start.opRef, false);
+		if (state !== "pending") {
+			const raw = new Database(join(f.directory, "gateway.db"));
+			try {
+				raw
+					.query(
+						state === "missing"
+							? "DELETE FROM inbound_messages WHERE message_id = ?"
+							: "UPDATE inbound_messages SET state = 'processing' WHERE message_id = ?",
+					)
+					.run(linked.reportId);
+			} finally {
+				raw.close();
+			}
+		}
+		const result = await f.manager.retireFirstmate(f.request);
+		expect(result).toMatchObject({
+			retired: false,
+			obligations: [{ id: linked.reportId, reason: "report_unconsumed" }],
+		});
+		expect(f.owner.releaseForAttempt(f.start.opRef)).toBeUndefined();
+		expect(f.port.closes).toHaveLength(0);
+	});
+}
+
 for (const state of ["missing", "pending", "wrong_turn", "wrong_origin"] as const) {
-	test(`FirstMate outcome ${state} cannot be mistaken for delivery`, async () => {
-		const f = await releaseFixture();
+	test(`FirstMate fallback outcome ${state} cannot be mistaken for delivery`, async () => {
+		const f = await releaseFixture(true, false, false);
 		const runtime = f.db.work.workAttemptGet(f.start.opRef)!;
 		const get = f.db.outbox.get.bind(f.db.outbox);
 		const row = get(runtime.deliveryId)!;
@@ -1600,15 +1686,17 @@ test("FirstMate release rejects every changed authority and exact attempt field 
 });
 
 test("FirstMate post-close obligation change preserves pending intent and original binding", async () => {
-	const f = await releaseFixture();
+	const f = await releaseFixture(true, false, false);
 	const binding = f.db.bindings.getSessionRecord(f.start.sessionKey);
 	const close = f.port.close.bind(f.port);
 	const get = f.db.outbox.get.bind(f.db.outbox);
 	let lost = false;
+	let closed = 0;
 	const spy = spyOn(f.db.outbox, "get").mockImplementation((id) => (lost ? undefined : get(id)));
 	f.port.close = async (input) => {
 		await close(input);
-		lost = true;
+		// Only the first native close loses the delivery evidence.
+		if (closed++ === 0) lost = true;
 	};
 	try {
 		expect((await f.manager.retireFirstmate(f.request)).retired).toBe(false);
@@ -1618,7 +1706,8 @@ test("FirstMate post-close obligation change preserves pending intent and origin
 		expect(f.db.bindings.getSessionRecord(f.start.sessionKey)).toEqual(binding);
 		lost = false;
 		expect((await f.manager.retireFirstmate(f.request)).retired).toBe(true);
-		expect(f.port.closes).toHaveLength(1);
+		// The retry is the native retire again: it re-closes the still-bound session before the receipt.
+		expect(f.port.closes).toHaveLength(2);
 	} finally {
 		spy.mockRestore();
 	}
@@ -2005,11 +2094,9 @@ for (const state of ["attempt_ended", "done"] as const) {
 			origin_key: parentKey,
 			source: "lane_report",
 		});
-		expect(report).toMatchObject({
-			originKey: parentKey,
-			turnId: original.opRef,
-			payloadJson: expect.stringContaining(original.opRef),
-		});
+		// The persona inbox carries the one FirstMate pointer; nothing is posted beside it.
+		expect(report).toBeUndefined();
+		expect(priorInbox?.body).toContain(`inspect: work inspect a --task ${f.assignment.taskId} --op ${original.opRef}`);
 		const priorAnswer = await inspectWithoutExecution(f, original.opRef);
 		f.port.setSessionState(original.sessionId, { live: true, deleted: false, repo: f.assignment.worktree.path });
 		const input = correctionInput(f, original.opRef);
@@ -2019,7 +2106,8 @@ for (const state of ["attempt_ended", "done"] as const) {
 		let correction: WorkStartResult;
 		try {
 			correction = await f.manager.startFirstmateCorrection(input);
-			expect(bind).not.toHaveBeenCalled();
+			// Native bind reuses the live bound session; nothing resumes or replaces it.
+			expect(bind).toHaveBeenCalledTimes(1);
 			expect(recover).not.toHaveBeenCalled();
 			expect(resume).not.toHaveBeenCalled();
 		} finally {
@@ -2068,13 +2156,11 @@ for (const state of ["attempt_ended", "done"] as const) {
 			source: "lane_report",
 		});
 		expect(f.db.inbox.messageDisposition(parentKey, priorRuntime!.reportId)?.message).toEqual(priorInbox);
-		const correctedOutcome = f.db.outbox.get(f.db.work.workAttemptGet(correction.opRef)!.deliveryId)!;
-		expect(correctedOutcome).toMatchObject({
-			originKey: parentKey,
-			turnId: correction.opRef,
-		});
-		expect(correctedOutcome.payloadJson).not.toContain("Corrected exact answer.");
-		expect(f.db.outbox.get(priorRuntime!.deliveryId)).toEqual(report);
+		expect(f.db.outbox.get(f.db.work.workAttemptGet(correction.opRef)!.deliveryId)).toBeUndefined();
+		expect(f.db.inbox.messageDisposition(parentKey, correctedReportId)?.message.body).not.toContain(
+			"Corrected exact answer.",
+		);
+		expect(f.db.outbox.get(priorRuntime!.deliveryId)).toBeUndefined();
 		expect(f.db.work.workAttemptGet(original.opRef)).toEqual(priorRuntime);
 		expect(f.owner.attempt(original.opRef)).toEqual(priorAttribution);
 		expect(
@@ -2088,7 +2174,7 @@ for (const state of ["attempt_ended", "done"] as const) {
 			correction,
 		);
 		expect(f.port.sendAttempts).toHaveLength(2);
-		expect(f.port.binds).toHaveLength(1);
+		expect(f.port.binds).toHaveLength(2);
 	});
 }
 
@@ -2223,46 +2309,16 @@ test("FirstMate correction refuses changed binding, worktree and native ownershi
 	}
 });
 
-test("FirstMate correction resumes inactive sessions and refuses unavailable sessions", async () => {
+test("FirstMate correction binds through the native session port on the task session", async () => {
 	const f = await firstmateFixture();
 	const original = await f.manager.startFirstmate(f.assignment);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
-	const job = f.job();
 	const input = correctionInput(f, original.opRef);
-	// Refusals run first so the shared fixture is still pristine when the admitted case runs.
-	const refuse = async () => {
-		const spies = [
-			spyOn(f.port, "bind"),
-			spyOn(f.port, "resume"),
-			spyOn(f.port, "send"),
-			spyOn(f.db.work, "workAttemptPrepare"),
-			spyOn(f.manager, "recover"),
-		];
-		try {
-			await expect(f.manager.startFirstmateCorrection(input)).rejects.toMatchObject({
-				detail: { reason: "correction_session_unavailable" },
-			});
-			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
-			expect(f.job()).toEqual(job);
-			expect(f.db.work.workAttemptRows()).toHaveLength(1);
-		} finally {
-			for (const spy of spies) spy.mockRestore();
-		}
-	};
-	const missing = spyOn(f.port, "inspect").mockImplementation(async () => undefined);
-	try {
-		await refuse();
-	} finally {
-		missing.mockRestore();
-	}
-	f.port.setSessionState(original.sessionId, { live: true, deleted: true, repo: f.assignment.worktree.path });
-	await refuse();
-	f.port.setSessionState(original.sessionId, { live: true, deleted: false, repo: f.directory });
-	await refuse();
-	// Present, same repository, not deleted, merely inactive: admitted on the bound session.
+	// Session availability (live, saved-but-dead, gone) is the native bind's decision, not a FirstMate check.
 	f.port.setSessionState(original.sessionId, { live: false, deleted: false, repo: f.assignment.worktree.path });
 	const assignments = f.db.core.groupDb("work").prepare("SELECT * FROM firstmate_assignments ORDER BY task_id").all();
+	const epoch = f.db.bindings.getSessionRecord(original.sessionKey)!.epoch;
 	const binds = f.port.binds.length;
 	const resumes = f.port.resumes.length;
 	const admitted = await f.manager.startFirstmateCorrection(input);
@@ -2271,18 +2327,39 @@ test("FirstMate correction resumes inactive sessions and refuses unavailable ses
 	expect(admitted.sessionId).toBe(original.sessionId);
 	expect(admitted.jobId).toBe(original.jobId);
 	expect(admitted.opRef).not.toBe(original.opRef);
-	expect(f.port.binds).toHaveLength(binds);
-	expect(f.port.resumes).toHaveLength(resumes + 1);
-	expect(f.port.resumes.at(-1)).toMatchObject({
-		sessionId: original.sessionId,
+	expect(f.port.binds).toHaveLength(binds + 1);
+	expect(f.port.binds.at(-1)).toMatchObject({
 		originKey: original.sessionKey,
+		epoch,
 		repo: f.assignment.worktree.path,
+		codingRegister: true,
 	});
+	expect(f.port.resumes).toHaveLength(resumes);
 	expect(f.db.core.groupDb("work").prepare("SELECT * FROM firstmate_assignments ORDER BY task_id").all()).toEqual(
 		assignments,
 	);
 	expect(f.owner.assignment("a")).toEqual(f.assignment);
 	expect(f.job().attempts.at(-1)).toMatchObject({ opRef: admitted.opRef, sessionId: original.sessionId });
+});
+
+test("FirstMate correction maps a non-broker bind failure to bind_failed", async () => {
+	const f = await firstmateFixture();
+	const original = await f.manager.startFirstmate(f.assignment);
+	if (!original.started) throw new Error("unexpected hold");
+	await settleFirstmateSetup(f, original.opRef);
+	const job = f.job();
+	const failing = spyOn(f.port, "bind").mockImplementation(async () => {
+		throw new Error("session create refused");
+	});
+	try {
+		await expect(f.manager.startFirstmateCorrection(correctionInput(f, original.opRef))).rejects.toMatchObject({
+			detail: { reasonCode: "bind_failed" },
+		});
+	} finally {
+		failing.mockRestore();
+	}
+	expect(f.job()).toEqual(job);
+	expect(f.db.work.workAttemptRows()).toHaveLength(1);
 });
 test("FirstMate correction after close binds a new session and keeps the old attempt", async () => {
 	const f = await firstmateFixture();
@@ -2338,7 +2415,8 @@ test("FirstMate lost correction acceptance holds exact duplicate and cannot be b
 			}),
 		).rejects.toMatchObject({ detail: { reason: "correction_predecessor_not_settled" } });
 	});
-	expect(f.port.binds).toHaveLength(1);
+	// The original start and the accepted-but-lost correction each bound natively once.
+	expect(f.port.binds).toHaveLength(2);
 	expect(f.port.sendAttempts).toHaveLength(2);
 	await f.restart({ pollMs: 60_000 });
 	const repeated = await withoutFirstmateEffects(f, () => f.currentManager().startFirstmateCorrection(input));
@@ -2458,7 +2536,7 @@ test("FirstMate correction prepared interruption remains held without transport 
 	if (held.started) throw new Error("unexpected replay");
 	expect(held.reason).toContain(prepared.opRef);
 	expect(f.port.sendAttempts).toHaveLength(1);
-	expect(f.port.binds).toHaveLength(1);
+	expect(f.port.binds).toHaveLength(2);
 });
 
 test("FirstMate correction cannot bypass ordinary start run or steer guards", async () => {
