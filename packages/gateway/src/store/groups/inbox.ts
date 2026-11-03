@@ -1318,11 +1318,17 @@ export class InboxGroup {
 		);
 	}
 
-	/** A report admitted to this origin that its persona turn has finished consuming. */
+	/**
+	 * A report admitted to this origin whose receiving persona turn has finished. A report that
+	 * started its own turn is its trigger; one steered into a running turn is done at steer
+	 * acceptance, so it counts only once that turn's trigger is done too.
+	 */
 	reportConsumed(originKey: string, messageId: string): boolean {
 		return (
 			this.#db
-				.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND state = 'done'")
+				.prepare(
+					"SELECT 1 FROM inbound_messages r WHERE r.message_id = ? AND r.origin_key = ? AND r.state = 'done' AND r.turn_op_ref IS NOT NULL AND r.turn_state = 'done' AND EXISTS (SELECT 1 FROM inbound_messages t WHERE t.turn_op_ref = r.turn_op_ref AND t.origin_key = r.origin_key AND t.turn_role = 'trigger' AND t.turn_state = 'done')",
+				)
 				.get(messageId, originKey) !== null
 		);
 	}

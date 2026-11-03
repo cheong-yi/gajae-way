@@ -225,7 +225,7 @@ async function startDeliveryServer(
 	return { client, config, database, sessionPort };
 }
 
-test("FirstMate work.retire dispatch releases once the steered native report is consumed", async () => {
+test("FirstMate work.retire dispatch holds a steered native report until its parent turn finishes", async () => {
 	directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-firstmate-closeout-")));
 	const repo = join(directory, "repo");
 	await mkdir(repo);
@@ -350,7 +350,22 @@ test("FirstMate work.retire dispatch releases once the steered native report is 
 				action: "release_session_preserve_work",
 			},
 		};
-		// Steering the report into the parent turn is the native consumption; no separate outcome post is owed.
+		// Steer acceptance marks the report row done, but the parent turn that received it is still running.
+		expect(database.inbox.messageDisposition(parent, runtime.reportId)?.message).toMatchObject({
+			state: "done",
+			turn_role: "steer",
+			turn_op_ref: parentSend.opRef,
+		});
+		expect(database.inbox.reportConsumed(parent, runtime.reportId)).toBe(false);
+		expect(await request("retire-held", "work.retire", retire)).toMatchObject({
+			retired: false,
+			obligations: [{ id: runtime.reportId, reason: "report_unconsumed" }],
+		});
+		expect(port.closes).toHaveLength(0);
+		expect(database.work.firstmate.releaseForAttempt(start.opRef)).toBeUndefined();
+		// The parent turn finishing is the native consumption; no separate outcome post is owed.
+		port.complete(parentSend.opRef, "Unrelated parent reply");
+		await until(() => database.inbox.messageDisposition(parent, "parent-message")?.message.turn_state === "done");
 		expect(database.inbox.reportConsumed(parent, runtime.reportId)).toBe(true);
 		const recover = spyOn(WorkLaneManager.prototype, "recover");
 		const dispatch = spyOn(WorkLaneManager.prototype, "retireFirstmate");
@@ -367,8 +382,6 @@ test("FirstMate work.retire dispatch releases once the steered native report is 
 		expect(port.closes).toHaveLength(1);
 		expect(database.work.firstmate.releaseForAttempt(start.opRef)).toBeDefined();
 		expect(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD")).toBe(assignment.worktree.branch);
-		port.complete(parentSend.opRef, "Unrelated parent reply");
-		await until(() => database.inbox.messageDisposition(parent, "parent-message")?.message.turn_state === "done");
 	} finally {
 		client?.close();
 		checks.mockRestore();
