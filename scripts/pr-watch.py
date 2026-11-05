@@ -243,6 +243,7 @@ def self_test():
     assert fingerprint(base) == fingerprint(other)
     ignored = dict(base, checks=[{"name": "(github.event_name == 'pull_request')", "conclusion": "FAILURE"}])
     assert failed_names(ignored["checks"]) == []
+    base["fingerprint"] = fingerprint(base)
     assert decide({}, base) == "introduced"
     assert decide({"fingerprint": fingerprint(base)}, base) == "quiet"
     assert decide({"fingerprint": "stale"}, base) == "delta"
