@@ -33,9 +33,9 @@ export async function startScript(
 				env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
 			});
 			const timer = setTimeout(() => child.kill(), 30_000);
-			const output = await new Response(child.stdout).text();
+			const output = (await new Response(child.stdout).text()).slice(0, 64 * 1024);
 			clearTimeout(timer);
-			fire(output.slice(0, 64 * 1024));
+			if (output.trim()) fire(output);
 		} finally {
 			running = false;
 			if (queued) {

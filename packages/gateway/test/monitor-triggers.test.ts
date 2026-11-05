@@ -245,6 +245,21 @@ test("watcher and script honor allowlists and ActionGuard", async () => {
 		await rm(outside, { recursive: true, force: true });
 	}
 });
+test("a blank script result does not submit an event", async () => {
+	const root = await mkdtemp(join(tmpdir(), "gajaeway-script-quiet-"));
+	try {
+		const script = join(root, "quiet.sh");
+		await writeFile(script, "#!/bin/sh\nexit 0\n");
+		await chmod(script, 0o755);
+		const output: string[] = [];
+		const stop = await startScript([script], 100_000, root, (text) => output.push(text));
+		await Bun.sleep(200);
+		stop();
+		expect(output).toEqual([]);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
 
 test("catch-all origin retains undeclared event identity", () => {
 	expect(originKey(CATCH_ALL_EVENT_ORIGIN)).toBe("monitor/eventtype/catch-all");
