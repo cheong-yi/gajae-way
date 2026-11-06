@@ -222,8 +222,9 @@ def note(kind, body, mention, previous=None, owner=None, max_age=MAX_AGE_SECONDS
             f"Review decision is {body['review'] or 'none'}. Failed checks: {failed}. "
             f"Review comments: {len(body['review_comments'])}. Reviews: {len(body['reviews'])}.\n\n"
             "Please address review claims on that pull request, and tell the owner only when a claim needs an owner decision. "
-            "Please do not merge it or restart a service. This watch posts again only when the head, a review, a comment, "
-            "a failed check, or the open state changes. It stops when the pull request closes or merges, or after "
+            "Please do not merge it or restart a service. This watch mentions you again only for a new "
+            "change request, a new inline comment, or a check that newly failed. A head change, a dismissal, "
+            "an approval, or an issue comment does not mention you. It stops when the pull request closes or merges, or after "
             f"{age_label(max_age)}, whichever comes first."
         )
     old_reviews = {item.get("id") for item in (previous or {}).get("reviews", [])}
@@ -258,6 +259,32 @@ def post(token, state, channel, thread_name, mention, text):
     if not SNOWFLAKE.fullmatch(str(message.get("id") or "")) or mention not in mentions:
         raise WatchError("discord_mention_missing")
     return thread
+
+
+def needs_mention(previous, body):
+    """A mention wakes a model, so use it only when the change can require a code edit."""
+    old_reviews = {
+        item.get("id"): item.get("state")
+        for item in previous.get("reviews") or []
+        if isinstance(item, dict)
+    }
+    for item in body["reviews"]:
+        if isinstance(item, dict) and item.get("state") == "CHANGES_REQUESTED" and old_reviews.get(item.get("id")) != "CHANGES_REQUESTED":
+            return True
+    old_comments = {item.get("id") for item in previous.get("review_comments") or [] if isinstance(item, dict)}
+    for item in body["review_comments"]:
+        if isinstance(item, dict) and item.get("id") not in old_comments:
+            return True
+    if "failed" in previous and set(failed_names(body["checks"])) - set(previous.get("failed") or []):
+        return True
+    return False
+
+
+def remember(state, body):
+    state["fingerprint"] = body["fingerprint"]
+    state["reviews"] = body["reviews"]
+    state["review_comments"] = body["review_comments"]
+    state["failed"] = failed_names(body["checks"])
 
 
 def decide(state, body, now, max_age):
@@ -304,6 +331,27 @@ def self_test():
     assert "Affected path validation" in text and "github.event" not in text
     timeout = note("timeout", base, "1557246454714736723", owner="163670548818296832")
     assert "<@163670548818296832>" in timeout and "has not merged" in timeout and "one day" in timeout
+    previous = {
+        "reviews": [{"id": 1, "state": "CHANGES_REQUESTED"}],
+        "review_comments": [],
+        "failed": ["Affected path validation"],
+    }
+    assert needs_mention(previous, base) is False
+    assert needs_mention(previous, dict(base, head="b" * 40)) is False
+    assert needs_mention(previous, dict(base, reviews=[{"id": 2, "state": "DISMISSED"}])) is False
+    assert needs_mention(previous, dict(base, reviews=[{"id": 3, "state": "APPROVED"}])) is False
+    assert needs_mention(previous, dict(base, issue_comments=[{"id": 5, "user": "x"}])) is False
+    assert needs_mention(previous, dict(base, reviews=[{"id": 4, "state": "CHANGES_REQUESTED"}])) is True
+    assert needs_mention(
+        {"reviews": [{"id": 1, "state": "COMMENTED"}], "failed": []},
+        dict(base, reviews=[{"id": 1, "state": "CHANGES_REQUESTED"}]),
+    ) is True
+    assert needs_mention(previous, dict(base, review_comments=[{"id": 9, "path": "a.ts"}])) is True
+    assert needs_mention(previous, dict(base, checks=checks + [{"name": "lint", "conclusion": "FAILURE"}])) is True
+    assert needs_mention(
+        {"reviews": [{"id": 1, "state": "CHANGES_REQUESTED"}], "review_comments": []},
+        dict(base, checks=checks + [{"name": "lint", "conclusion": "FAILURE"}]),
+    ) is False
     print("self-test=ok")
 
 
@@ -359,6 +407,12 @@ def main(argv):
     state = load_state(state_path, args.repo, args.pr)
     clock_missing = ensure_clock(state, now, args.max_age_seconds)
     action = decide(state, body, now, args.max_age_seconds)
+    if action == "delta" and not needs_mention(state, body):
+        remember(state, body)
+        if not args.dry_run:
+            save_state(state_path, state)
+        print(f"action=recorded head={body['head'][:12]}")
+        return
     if state.get("closed_posted") or state.get("timeout_posted"):
         if not args.dry_run:
             stop_timer(args.timer)
@@ -378,9 +432,7 @@ def main(argv):
         token, state, args.channel, args.thread_name, expected,
         note(action, body, args.mention, state, owner=args.owner, max_age=args.max_age_seconds),
     )
-    state["fingerprint"] = body["fingerprint"]
-    state["reviews"] = body["reviews"]
-    state["review_comments"] = body["review_comments"]
+    remember(state, body)
     if action == "closed":
         state["closed_posted"] = True
     if action == "timeout":
