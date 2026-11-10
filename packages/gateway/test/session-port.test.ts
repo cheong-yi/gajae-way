@@ -9,8 +9,8 @@ import {
 	BrokerSessionPort,
 	MAX_POISONED_CREATE_ROTATIONS,
 	ModelNotSelectedError,
-	SessionBusyStalledError,
 	parseWorkerOutputResponse,
+	SessionBusyStalledError,
 	SessionRequestTimeoutError,
 	type WorkerOutputEvidence,
 } from "../src/orchestrator/session-port";
@@ -749,6 +749,136 @@ test("model thinking suffix is applied on create and explicit model changes", as
 	expect(calls.findIndex((args) => args.includes("inspect"))).toBeLessThan(
 		calls.findIndex((args) => args.includes("thinking.set")),
 	);
+});
+
+test("only a lane bind asks for switchAfterEdit, as exactly one create env entry", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-switch-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const calls: string[][] = [];
+	const run: CliRunner = async (args) => {
+		if (!args.includes("session.create")) throw new Error(`unexpected command ${args.join(" ")}`);
+		calls.push([...args]);
+		return {
+			exitCode: 0,
+			stdout: JSON.stringify({ ok: true, result: { sessionId: `sdk-${calls.length}` } }),
+			stderr: "",
+		};
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await port.bind({ originKey: "work/task/a", epoch: 0, repo, codingRegister: true, switchAfterEdit: true });
+	await port.bind({ originKey: "discord/dm/persona", epoch: 0, repo });
+	const createInput = (index: number) => {
+		const args = calls[index]!;
+		return JSON.parse(args[args.indexOf("--json-input") + 1]!) as Record<string, unknown>;
+	};
+	expect(calls).toHaveLength(2);
+	expect(createInput(0)).toMatchObject({ cwd: repo, env: { GAJAEWAY_LANE_SWITCH: "1" } });
+	expect(createInput(0).env).toEqual({ GAJAEWAY_LANE_SWITCH: "1" });
+	expect(createInput(1)).not.toHaveProperty("env");
+});
+
+test("a journaled create replays its own env instead of the current switchAfterEdit flag", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-switch-replay-"));
+	const store = await Store.open(join(home, "gateway.db"));
+	database = store;
+	const authority = initializeTestBrokerAuthority(store, join(home, "agent"));
+	const repo = join(home, "workspace");
+	// What an earlier attempt journaled: capture the port's own create request for
+	// an enabled and a plain lane before simulating the crash that left it behind.
+	const journaled: string[] = [];
+	const capture: CliRunner = async (args) => {
+		if (args.includes("session.create")) {
+			journaled.push(args[args.indexOf("--json-input") + 1]!);
+			return {
+				exitCode: 0,
+				stdout: JSON.stringify({ ok: true, result: { sessionId: `sdk-capture-${journaled.length}` } }),
+				stderr: "",
+			};
+		}
+		if (args.includes("inspect"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { session: { live: true } } }), stderr: "" };
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const capturePort = new BrokerSessionPort({
+		authority,
+		database: store,
+		cli: capture,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	await capturePort.bind({ originKey: "work/task/journal-on", epoch: 0, repo, switchAfterEdit: true });
+	await capturePort.bind({ originKey: "work/task/journal-off", epoch: 0, repo });
+	const enabledRequest = journaled[0]!;
+	const plainRequest = journaled[1]!;
+	expect(JSON.parse(enabledRequest)).toMatchObject({ cwd: repo, env: { GAJAEWAY_LANE_SWITCH: "1" } });
+	expect(JSON.parse(plainRequest)).not.toHaveProperty("env");
+
+	const calls: string[][] = [];
+	const run: CliRunner = async (args) => {
+		calls.push([...args]);
+		if (args.includes("session.create"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "sdk-replayed" } }), stderr: "" };
+		if (args.includes("inspect"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { session: { live: true } } }), stderr: "" };
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database: store,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const seedCreate = (originKey: string, operationRef: string, requestJson: string) =>
+		store.transaction((tx) =>
+			store.bindings.beginBrokerOperation(tx, authority, {
+				operation: "session.create",
+				scope: JSON.stringify([originKey, 0]),
+				operationRef,
+				requestJson,
+			}),
+		);
+
+	// Enabled create left pending, then a restart reads switchAfterEdit=false: the
+	// journaled env wins, so the original session is neither closed nor replaced.
+	const enabledOrigin = "work/task/replay-on";
+	const enabledScope = JSON.stringify([enabledOrigin, 0]);
+	await createOwnedSessionFixture(store, authority, {
+		sessionId: "sdk-original",
+		originKey: enabledOrigin,
+		epoch: 0,
+		repo,
+	});
+	seedCreate(enabledOrigin, "gw-bind-journal-on", enabledRequest);
+	await expect(port.bind({ originKey: enabledOrigin, epoch: 0, repo, switchAfterEdit: false })).resolves.toMatchObject({
+		sessionId: "sdk-original",
+		epoch: 0,
+	});
+	expect(calls.filter((args) => args.includes("session.create"))).toHaveLength(0);
+	expect(calls.some((args) => args.some((arg) => arg.includes("session.close")))).toBe(false);
+	expect(store.bindings.brokerOperation(authority, "session.create", enabledScope)).toBeUndefined();
+	expect(store.bindings.getSessionRecord(enabledOrigin)?.epoch).toBe(0);
+
+	// Plain create left pending, then a restart reads switchAfterEdit=true: the
+	// ambiguous intent replays under its original request, with no close.
+	const plainOrigin = "work/task/replay-off";
+	const plainScope = JSON.stringify([plainOrigin, 0]);
+	seedCreate(plainOrigin, "gw-bind-journal-off", plainRequest);
+	await expect(port.bind({ originKey: plainOrigin, epoch: 0, repo, switchAfterEdit: true })).resolves.toMatchObject({
+		sessionId: "sdk-replayed",
+		epoch: 0,
+	});
+	const creates = calls.filter((args) => args.includes("session.create"));
+	expect(creates).toHaveLength(1);
+	expect(creates[0]![creates[0]!.indexOf("--json-input") + 1]).toBe(plainRequest);
+	expect(calls.some((args) => args.some((arg) => arg.includes("session.close")))).toBe(false);
+	expect(store.bindings.brokerOperation(authority, "session.create", plainScope)).toBeUndefined();
+	expect(store.bindings.getSessionRecord(plainOrigin)?.epoch).toBe(0);
 });
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {

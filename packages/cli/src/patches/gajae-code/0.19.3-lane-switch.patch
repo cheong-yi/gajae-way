@@ -1,0 +1,190 @@
+diff --git a/agent-core/src/agent-loop.ts b/agent-core/src/agent-loop.ts
+index 8ab5817b8..4fd3d45cf 100644
+--- a/agent-core/src/agent-loop.ts
++++ b/agent-core/src/agent-loop.ts
+@@ -4109,6 +4109,7 @@ async function runLoopBody(
+ 						? undefined
+ 						: { value: getLogicalTurnToolChoice() },
+ 					attemptTransaction,
++					commitMessages,
+ 				);
+ 				const detection = detectHarmonyLeakInAssistantMessage(message);
+ 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
+@@ -4770,8 +4771,12 @@ async function streamAssistantResponse(
+ 	provisionalToolTransaction?: ManagedAttemptTransaction,
+ 	toolChoiceOverride?: { value: ToolChoice | undefined },
+ 	managedAttemptTransaction?: ManagedAttemptTransaction,
++	commitPolicyMessages?: (messages: AgentMessage[], scope?: AttemptScope) => void,
+ ): Promise<AssistantMessage> {
+ 	const managedDegradedFieldDiagnostics = new Set<string>();
++	const policyMessages = await config.beforeModelCall?.(context.messages);
++	config = { ...config, model: config.getModel?.() ?? config.model };
++	if (policyMessages?.length) commitPolicyMessages?.(policyMessages, scope);
+ 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
+ 	let messages = context.messages;
+ 	// Revoke before invoking any caller-controlled transform so it cannot retain
+diff --git a/agent-core/src/agent.ts b/agent-core/src/agent.ts
+index 0d8678868..bbf6d2f95 100644
+--- a/agent-core/src/agent.ts
++++ b/agent-core/src/agent.ts
+@@ -644,6 +644,7 @@ export class Agent {
+ 	}
+ 
+ 	streamFn: StreamFn;
++	beforeModelCall?: AgentLoopConfig["beforeModelCall"];
+ 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+ 	getAuthCredentialType?: (provider: string) => "api_key" | "oauth" | undefined;
+ 	/**
+@@ -2206,6 +2207,8 @@ export class Agent {
+ 			onHarmonyLeak: this.#onHarmonyLeak,
+ 			getToolChoice,
+ 			getReasoning: () => this.#state.thinkingLevel,
++			getModel: () => this.#state.model,
++			beforeModelCall: messages => this.beforeModelCall?.(messages) ?? Promise.resolve(undefined),
+ 			getSteeringMessages: async () => {
+ 				if (this.#activeRunId !== runId) {
+ 					return [];
+diff --git a/agent-core/src/types.ts b/agent-core/src/types.ts
+index d09600580..1e80cb7cf 100644
+--- a/agent-core/src/types.ts
++++ b/agent-core/src/types.ts
+@@ -526,6 +526,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
+ 	 * the next model call instead of waiting for the next prompt.
+ 	 */
+ 	getReasoning?: () => Effort | undefined;
++	/** Await session policy before reading the live model for a provider call. */
++	beforeModelCall?: (messages: AgentMessage[]) => Promise<AgentMessage[] | undefined>;
++	getModel?: () => Model | undefined;
+ 
+ 	/**
+ 	 * Called after a tool call has been validated and is about to execute.
+diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/session/agent-session.ts
+index b28f94b80..5d425f3c1 100644
+--- a/coding-agent/src/session/agent-session.ts
++++ b/coding-agent/src/session/agent-session.ts
+@@ -543,6 +543,7 @@ import {
+ 	FoldCoordinator,
+ 	type ForegroundFoldOutcome,
+ } from "./fold-coordinator";
++import { installLaneModelSwitch } from "./lane-model-switch";
+ import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
+ import {
+ 	type BashExecutionMessage,
+@@ -6798,6 +6799,38 @@ export class AgentSession {
+ 		// (session persistence, hooks, auto-compaction, retry logic)
+ 		this.#unsubscribeAgent = this.agent.subscribe(this.#trackAgentEvent);
+ 
++		installLaneModelSwitch({
++			agent: this.agent,
++			// Reopen uses the native recorded default, never reconstructs a dead run's policy.
++			enabled: process.env.GAJAEWAY_LANE_SWITCH === "1" && this.agent.state.messages.length === 0,
++			resolveExecutor: async () => {
++				const resolved = this.#resolveRoleModelFull(
++					"executor",
++					this.#modelRegistry.getAvailable(this.credentialSessionId),
++					undefined,
++				);
++				if (!resolved.model) return undefined;
++				if (!(await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId))) {
++					throw new Error("Executor assignment has no API key");
++				}
++				return { model: resolved.model, thinkingLevel: resolved.thinkingLevel };
++			},
++			record: async (model, thinkingLevel) => {
++				await this.sessionManager.flush();
++				const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
++				this.sessionManager.appendModelChange(selector, "default", {
++					reason: `lane_model_switch ${selector}`,
++					thinkingLevel: thinkingLevel ?? null,
++				});
++			},
++			activate: (model, thinkingLevel) => {
++				this.#setModelAuthoritatively(model, "user-selection");
++				this.#thinkingLevel = resolveThinkingLevelForModel(model, thinkingLevel);
++				this.agent.setThinkingLevel(toReasoningEffort(this.#thinkingLevel));
++			},
++			warn: message => logger.warn(message),
++		});
++
+ 		// Re-evaluate append-only context mode when the setting changes at runtime.
+ 		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
+ 		// SDK ToolSession callbacks capture the just-constructed session. Defer the
+diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/session/lane-model-switch.ts
+new file mode 100644
+index 000000000..2ad701246
+--- /dev/null
++++ b/coding-agent/src/session/lane-model-switch.ts
+@@ -0,0 +1,73 @@
++import type { Agent, AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
++import type { Model } from "@gajae-code/ai/core";
++
++export const LANE_PLAN = "Plan the change in text only. Do not call edit, write, apply_patch, or ast_edit yet.";
++export const LANE_CHECKLIST = "Implementation model is active. Complete the remaining edits. Do not change the model.";
++
++/** Session policy only. The agent owns tool execution and follow-up delivery. */
++export function installLaneModelSwitch(options: {
++	agent: Agent;
++	enabled: boolean;
++	resolveExecutor: () => Promise<{ model: Model; thinkingLevel?: ThinkingLevel } | undefined>;
++	record: (model: Model, thinkingLevel: ThinkingLevel | undefined) => Promise<void>;
++	activate: (model: Model, thinkingLevel: ThinkingLevel | undefined) => void;
++	warn: (message: string) => void;
++}): void {
++	if (!options.enabled) return;
++	const { agent } = options;
++	let todoSucceeded = false;
++	let editSucceeded = false;
++	let planSent = false;
++	let firstReply = true;
++	let finished = false;
++	const user = (text: string): AgentMessage => ({
++		role: "user",
++		content: [{ type: "text", text }],
++		timestamp: Date.now(),
++	});
++	agent.subscribe(event => {
++		if (finished) return;
++		if (event.type === "tool_execution_end" && !event.isError) {
++			if (event.toolName === "todo_write") todoSucceeded = true;
++			else if (todoSucceeded && ["edit", "write", "apply_patch", "ast_edit"].includes(event.toolName)) {
++				editSucceeded = true;
++			}
++		}
++		if (planSent && firstReply && event.type === "message_end" && event.message.role === "assistant") {
++			firstReply = false;
++			if (!event.message.content.some(part => part.type === "toolCall")) agent.followUp(user("Continue."));
++		}
++	});
++	agent.beforeModelCall = async messages => {
++		if (finished) return;
++		if (editSucceeded) {
++			// One attempt only, including a rejected record. Never switch on a failed write.
++			finished = true;
++			try {
++				const target = await options.resolveExecutor();
++				if (!target) {
++					options.warn("lane_model_switch executor assignment is missing; keeping the current model");
++					return;
++				}
++				await options.record(target.model, target.thinkingLevel);
++				options.activate(target.model, target.thinkingLevel);
++				// Replace the committed plan in the actual provider context, not a queued steer.
++				for (const message of messages) {
++					if (message.role !== "user" || typeof message.content === "string") continue;
++					for (const part of message.content) {
++						if (part.type === "text" && part.text === LANE_PLAN) part.text = "Planning phase is complete.";
++					}
++				}
++				return [user(LANE_CHECKLIST)];
++			} catch (error) {
++				options.warn(`lane_model_switch failed; keeping the current model: ${String(error)}`);
++				return;
++			}
++		}
++		if (!planSent) {
++			planSent = true;
++			// Commit once at the call boundary; replace its restriction after switching.
++			return [user(LANE_PLAN)];
++		}
++	};
++}

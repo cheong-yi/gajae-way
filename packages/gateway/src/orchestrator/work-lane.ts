@@ -296,6 +296,8 @@ export interface WorkLaneManagerOptions {
 	readonly laneRoot?: string;
 	readonly ownerTarget?: () => OriginRef | undefined;
 	readonly allowNested?: () => boolean;
+	/** Lane creates only: ask the new host to switch models after an edit; never applied to persona binds. */
+	readonly switchAfterEdit?: () => boolean;
 	readonly personaHold?: (originKey: string) => string | undefined;
 	readonly notifyPersona?: (originKey: string) => void;
 	readonly deliverFallback?: (payload: ChatMessagePayload) => void;
@@ -2590,6 +2592,7 @@ export class WorkLaneManager {
 								epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
 								repo: worktreePath,
 								codingRegister: true,
+								switchAfterEdit: this.#options.switchAfterEdit?.() === true,
 								...((input.model ?? this.#options.sessionModel)
 									? { model: input.model ?? this.#options.sessionModel }
 									: {}),

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
 	access,
 	chmod,
@@ -6,6 +6,7 @@ import {
 	mkdir,
 	mkdtemp,
 	readdir,
+	readFile,
 	readlink,
 	rename,
 	rm,
@@ -14,6 +15,8 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
+// Bun inlines this packaged text asset into the dist bundle and compiled binary.
+import laneSwitchPatch from "./patches/gajae-code/0.19.3-lane-switch.patch" with { type: "text" };
 
 export interface GjcInstallRunResult {
 	readonly exitCode: number;
@@ -24,6 +27,9 @@ export interface GjcInstallRunResult {
 export type GjcInstallRunner = (command: readonly string[], cwd: string) => Promise<GjcInstallRunResult>;
 
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const LANE_SWITCH_VERSION = "0.19.3";
+const LANE_SWITCH_RECEIPT = ".lane-switch-patch.sha256";
+const laneSwitchDigest = createHash("sha256").update(laneSwitchPatch).digest("hex");
 
 async function defaultRunner(command: readonly string[], cwd: string): Promise<GjcInstallRunResult> {
 	const child = Bun.spawn([...command], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -56,6 +62,34 @@ async function verifyGjc(path: string, cwd: string, version: string, runner: Gjc
 	const reported = versionFromOutput(`${result.stdout}\n${result.stderr}`);
 	if (reported !== version)
 		throw new Error(`gjc version verification failed: expected ${version}, got ${reported ?? "unknown"}`);
+}
+
+/**
+ * Apply the pinned lane-switch patch inside the installed package tree. The patch
+ * paths are relative to `node_modules/@gajae-code`. Unlike git apply, patch does
+ * not silently skip paths when staging is inside a Git checkout. A patch that does not apply
+ * cleanly fails the install; staging is discarded and `current` never moves.
+ */
+async function applyInstallPatch(staging: string, version: string, runner: GjcInstallRunner): Promise<void> {
+	if (version !== LANE_SWITCH_VERSION) return;
+	const patchPath = join(staging, ".gjc-lane-switch.patch");
+	await writeFile(patchPath, laneSwitchPatch, { mode: 0o600 });
+	try {
+		const command = [
+			"patch",
+			"--batch",
+			"--forward",
+			"--fuzz=0",
+			"--strip=1",
+			"--directory=node_modules/@gajae-code",
+			"--input",
+			patchPath,
+		];
+		assertSuccessful(command, await runner(command, staging));
+		await writeFile(join(staging, LANE_SWITCH_RECEIPT), laneSwitchDigest, { mode: 0o600 });
+	} finally {
+		await rm(patchPath, { force: true });
+	}
 }
 
 async function currentVersion(prefix: string, current: string): Promise<string | undefined> {
@@ -121,6 +155,7 @@ export async function installPinnedGjc(options: {
 			);
 			const installCommand = ["bun", "install", "--production"];
 			assertSuccessful(installCommand, await runner(installCommand, staging));
+			await applyInstallPatch(staging, version, runner);
 			const installedBin = join(staging, "node_modules", ".bin", "gjc");
 			await access(installedBin);
 			const binDir = join(staging, "bin");
@@ -130,6 +165,12 @@ export async function installPinnedGjc(options: {
 			await rename(staging, versionDir);
 			staging = undefined;
 		} else {
+			if (
+				version === LANE_SWITCH_VERSION &&
+				(await readFile(join(versionDir, LANE_SWITCH_RECEIPT), "utf8").catch(() => undefined)) !== laneSwitchDigest
+			) {
+				throw new Error(`existing gjc ${version} lacks the required lane-switch patch; use a fresh private prefix`);
+			}
 			await verifyGjc(join(versionDir, "bin", "gjc"), versionDir, version, runner);
 		}
 

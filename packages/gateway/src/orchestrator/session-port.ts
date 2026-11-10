@@ -252,6 +252,12 @@ export interface SessionBindInput {
 	readonly model?: GjcModelSelection;
 	/** The SDK host's default coding register is retained when true. */
 	readonly codingRegister?: boolean;
+	/**
+	 * Lane binds only: the created host switches models after an edit. It is part
+	 * of the create request (an env entry), so a persona or monitor bind that
+	 * omits it never inherits the behaviour.
+	 */
+	readonly switchAfterEdit?: boolean;
 	/** Internal recursion fence: one poisoned create key may advance to one fresh epoch per bind call. */
 	readonly epochRecovery?: boolean;
 }
@@ -636,7 +642,8 @@ export class BrokerSessionPort implements SessionPort {
 				if (typeof createdRepo !== "string")
 					throw new Error("pending session.create intent does not contain a valid workspace");
 				this.#assertOwned({ sessionId: existing.sessionId, repo: createdRepo });
-				if (pendingCreate.requestJson !== sessionCreateInput(input.repo, input.model)) {
+				const request = sessionCreateInput(input.repo, input.model, createRequestEnv(pendingCreate.requestJson));
+				if (pendingCreate.requestJson !== request) {
 					assertControlAllowed("session.close", { operatorApproval: true });
 					try {
 						await this.#closeSessionOperation(existing.sessionId);
@@ -737,7 +744,17 @@ export class BrokerSessionPort implements SessionPort {
 		// completes leaves the intent pending; retries replay an ambiguous create
 		// or wait on its durably recorded binding. Release it only after the
 		// binding is ready, so a later bind never inherits an unfinished create.
-		const requestJson = sessionCreateInput(input.repo, input.model);
+		//
+		// A journaled create owns its per-session env for the rest of its replay:
+		// recomposing it from live config would close and replace the original
+		// session on a flag toggle. Repository and model stay live request data,
+		// so a genuine mismatch still retires the old attempt below.
+		const journaled = this.#database.bindings.brokerOperation(this.#authority, "session.create", createScope(input));
+		let requestJson = sessionCreateInput(
+			input.repo,
+			input.model,
+			journaled ? createRequestEnv(journaled.requestJson) : switchAfterEditEnv(input.switchAfterEdit === true),
+		);
 		let intent = this.#beginOperation(
 			"session.create",
 			createScope(input),
@@ -778,6 +795,9 @@ export class BrokerSessionPort implements SessionPort {
 				}
 				this.#releaseOperation(intent);
 			}
+			// The replacement is a new session, so it takes the live flag rather than
+			// the retired create's env.
+			requestJson = sessionCreateInput(input.repo, input.model, switchAfterEditEnv(input.switchAfterEdit === true));
 			intent = this.#beginOperation("session.create", createScope(input), `gw-bind-${randomUUID()}`, () => requestJson);
 			if (intent.requestJson !== requestJson) {
 				throw new Error(
@@ -2774,7 +2794,33 @@ function createScope(input: SessionBindInput): string {
 	return JSON.stringify([input.originKey, input.epoch]);
 }
 
-function sessionCreateInput(repo: string, model: GjcModelSelection | undefined): string {
+/**
+ * The per-session env a create request will carry. A journaled request keeps
+ * its own env through every replay, so this is read back from that request
+ * instead of recomposed from live config.
+ */
+function createRequestEnv(requestJson: string): Record<string, string> | undefined {
+	try {
+		const env = recordOf(recordOf(JSON.parse(requestJson))?.env);
+		if (!env) return undefined;
+		const entries = Object.entries(env);
+		return entries.every(([, value]) => typeof value === "string")
+			? (Object.fromEntries(entries) as Record<string, string>)
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function switchAfterEditEnv(switchAfterEdit: boolean): Record<string, string> | undefined {
+	return switchAfterEdit ? { GAJAEWAY_LANE_SWITCH: "1" } : undefined;
+}
+
+function sessionCreateInput(
+	repo: string,
+	model: GjcModelSelection | undefined,
+	env: Record<string, string> | undefined,
+): string {
 	return JSON.stringify({
 		cwd: repo,
 		// A fresh session host boots the full agent (~10s measured on the persona
@@ -2782,6 +2828,7 @@ function sessionCreateInput(repo: string, model: GjcModelSelection | undefined):
 		// cold start into spawn_failed. Use the maximum budget: create is idempotent
 		// under its key either way.
 		readinessTimeoutMs: SESSION_CREATE_READINESS_MS,
+		...(env ? { env } : {}),
 		// session.create takes a bare model id; a `:level` suffix is applied with
 		// thinking.set once the host is up (see bind()).
 		...(typeof model === "string"

@@ -89,6 +89,8 @@ With `--no-restart`, stale service definitions for missing binaries are left alo
 
 A source checkout upgrades through `git`, `bun run build`, and `gajaeway services repair`; when running under Bun, pass `--bin-dir DIR` to update. The release update requires Bun to install the pinned GJC package.
 
+Installing GJC 0.19.3 also requires GNU `patch`. The installer applies `patches/gajae-code/0.19.3-lane-switch.patch` to the staged npm tree before version verification, without changing the version string. It refuses an existing 0.19.3 prefix without the matching patch receipt rather than modifying that prefix in place. Such an installation requires a fresh private prefix.
+
 ### Gateway and adapter rollout for `chat.images`
 
 For a staged rollout, install and restart the gateway before installing or restarting adapters that require `chat.images`. Verify that the gateway advertises `chat.images` in its negotiated capabilities, then start the new Discord, Slack, or Telegram adapters. An older gateway rejects a new adapter during negotiation before any messages are accepted, including text-only messages; there is intentionally no text-only fallback.

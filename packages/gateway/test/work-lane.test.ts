@@ -192,6 +192,30 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	return result;
 }
 
+test("work.start asks for switchAfterEdit on the lane bind only when configured", async () => {
+	const enabled = await fixture({ switchAfterEdit: () => true });
+	const binds: SessionBindInput[] = [];
+	const bind = enabled.port.bind.bind(enabled.port);
+	enabled.port.bind = async (input) => {
+		binds.push(input);
+		return await bind(input);
+	};
+	await started(enabled);
+	expect(binds).toHaveLength(1);
+	expect(binds[0]).toMatchObject({ switchAfterEdit: true, codingRegister: true });
+
+	const disabled = await fixture();
+	const disabledBinds: SessionBindInput[] = [];
+	const disabledBind = disabled.port.bind.bind(disabled.port);
+	disabled.port.bind = async (input) => {
+		disabledBinds.push(input);
+		return await disabledBind(input);
+	};
+	await started(disabled);
+	expect(disabledBinds).toHaveLength(1);
+	expect(disabledBinds[0]?.switchAfterEdit).toBe(false);
+});
+
 test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
 	const logs: string[] = [];
 	const sleeps: number[] = [];
