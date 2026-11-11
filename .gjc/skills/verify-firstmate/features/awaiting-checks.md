@@ -25,4 +25,5 @@ Preconditions:
 ## Gotchas
 
 - The plan-and-switch run can sit in `awaiting_checks` with no pull request. That state is not this feature.
-- A no-remote lane can still enter `awaiting_checks`. That is not this feature. A later dead-session sweep can end that wait. The log line `reason=operator_force` is the sweep label in `forceRetire`, not a checks result and not a scoped closeout. Observed on `smoke-live-20261111T085741Z` at 09:31:42 UTC, with `awaiting_checks_settled` reason `lane force-retired before checks settled`.
+- A missing `origin` is a confirmed bug, not this feature. `git remote get-url --push origin` fails, push is recorded as null, and null is not treated as not pushed, so the lane enters `awaiting_checks` with no pull request and can sit until the 60-minute timeout. A missing `origin` should count as `pushed=false`, and then this wait would not start. A steer of an ended attempt is intended. `work start`, including resume, is held while the wait is open, so the two together block another start for up to an hour.
+- A later dead-session sweep can end that wait. The log line `reason=operator_force` is the sweep label in `forceRetire`, not a checks result and not a scoped closeout. Observed on `smoke-live-20261111T085741Z` at 09:31:42 UTC, with `awaiting_checks_settled` reason `lane force-retired before checks settled`.

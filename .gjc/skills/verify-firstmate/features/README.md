@@ -29,9 +29,9 @@ Each feature file has an H1, one paragraph, then `Sub-features`, `How to get to 
 ## Features
 
 - [Plan and switch](./plan-and-switch.md) is the path this skill can prove. One mention, one lane, the strong model plans and edits, one switch, the cheap model finishes that turn, and the public attempt ends after the switch.
-- [Same-lane follow-up](./same-lane-follow-up.md) asks a settled lane for a second change. Driven on `smoke-live-20261111T083049Z` while `awaiting_checks`. The correction was refused. Not a cheap-model pass.
+- [Same-lane follow-up](./same-lane-follow-up.md) asks a settled lane for a second change. Driven on `smoke-live-20261111T083049Z` while `awaiting_checks`. The correction was refused, and a start is held for that wait. Not a cheap-model pass.
 - [New session starts strong](./new-session-starts-strong.md) starts a fresh lane after a switched one. Observed on `smoke-live-20261111T085741Z`. Operator-bot stand-in.
 - [Failed-attempt correction](./failed-attempt-correction.md) is the old name. The gateway corrects an accepted completed attempt that is not awaiting checks. A failed attempt is not the predecessor. The refusal on `smoke-live-20261111T083049Z` is recorded. The accept path is uncovered.
 - [Pane](./pane.md) is the second view of a running lane. Observed while `smoke-live-20261111T085741Z` was `in_flight`. Operator-bot stand-in.
 - [Scoped closeout](./scoped-closeout.md) retires a FirstMate lane with a closeout file. Uncovered. No real closeout file, and plain retire was not rerun.
-- [Awaiting checks](./awaiting-checks.md) is the pull-request checks cycle. Uncovered, and this scratch repository has no remote.
+- [Awaiting checks](./awaiting-checks.md) is the pull-request checks cycle. Uncovered. A missing `origin` still starts that wait, and that is a confirmed bug, not a passing checks cycle.

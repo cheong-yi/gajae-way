@@ -26,4 +26,4 @@ Preconditions:
 
 - A continuation while the job is `awaiting_checks` may be held instead of started. Record that hold. Do not call it a cheap-model pass.
 - Driven once. Message `1569999562418954303` asked the same lane to add `follow-up: live-20261111T083049Z`. At 08:59:11 UTC `work start --firstmate-correction` exited 1 with `correction_predecessor_not_settled`. No second attempt, and the head stayed `0a52564`. That is a hold, not a pass.
-- There is no cheap-reopen command while the job is `awaiting_checks`. A correction is the wrong command for this feature. The pass still requires the same session to commit the follow-up on the cheap model, with one switch line.
+- A steer only reaches an open attempt, and that is intended. `work start`, including resume, is held while the job is `awaiting_checks`, so a follow-up is blocked for up to an hour. That hold comes from the missing-origin checks wait. Do not invent a cheap-reopen command, and do not call the hold a cheap-model pass.
