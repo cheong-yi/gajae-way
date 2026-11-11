@@ -8,6 +8,9 @@ dist-packed/
 *.bun-build
 .DS_Store
 
-.gjc/
+.gjc/*
+!.gjc/skills/
+.gjc/skills/*
+!.gjc/skills/verify-firstmate/
 /.worktrees
 dist-*/
