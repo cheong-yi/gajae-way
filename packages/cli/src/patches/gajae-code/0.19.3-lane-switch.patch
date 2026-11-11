@@ -58,6 +58,47 @@ index d09600580..1e80cb7cf 100644
  
  	/**
  	 * Called after a tool call has been validated and is about to execute.
+diff --git a/coding-agent/src/commands/sdk.ts b/coding-agent/src/commands/sdk.ts
+index 6c5888e71..14f796a06 100644
+--- a/coding-agent/src/commands/sdk.ts
++++ b/coding-agent/src/commands/sdk.ts
+@@ -82,6 +82,7 @@ import {
+ } from "../sdk/startup-capability";
+ import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
+ import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
++import { withSdkHostTurnDeferral } from "../session/client-bridge";
+ import {
+ 	type CapturedSessionTranscriptSnapshot,
+ 	type ResumeSessionIdentity,
+@@ -1293,6 +1294,7 @@ export async function runSessionHost(
+ 	}
+ 	const { parsed } = opened;
+ 	const { session, startDeferredMemoryBackend } = created;
++	session.setClientBridge(withSdkHostTurnDeferral(session.clientBridge));
+ 	let lifecycleTranscriptPath: string | undefined;
+ 	session.registerToolSessionTransitionCleanup(async () => {
+ 		await session.sessionManager.ensureOnDisk();
+diff --git a/coding-agent/src/sdk/host/session-runtime.ts b/coding-agent/src/sdk/host/session-runtime.ts
+index 46d247f03..3fd83b1f3 100644
+--- a/coding-agent/src/sdk/host/session-runtime.ts
++++ b/coding-agent/src/sdk/host/session-runtime.ts
+@@ -45,6 +45,7 @@ import type { AgentEndEvent } from "../../extensibility/shared-events";
+ import { normalizeGoal } from "../../goals/state";
+ import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
+ import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
++import { withSdkHostTurnDeferral } from "../../session/client-bridge";
+ import type { SdkRunCapability } from "../../session/sdk-run-capability";
+ import {
+ 	boundTerminalRetentionState,
+@@ -7839,7 +7840,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
+ 		};
+ 		const removeProviderDefinitions = (capability: string): void => {
+ 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
+-			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
++			if (capability === "fs") ctx.setSdkClientBridge?.(withSdkHostTurnDeferral(undefined));
+ 		};
+ 		externalPermissions.installControls(
+ 			controlSurface,
 diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/session/agent-session.ts
 index b28f94b80..5d425f3c1 100644
 --- a/coding-agent/src/session/agent-session.ts
@@ -109,6 +150,22 @@ index b28f94b80..5d425f3c1 100644
  		// Re-evaluate append-only context mode when the setting changes at runtime.
  		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
  		// SDK ToolSession callbacks capture the just-constructed session. Defer the
+diff --git a/coding-agent/src/session/client-bridge.ts b/coding-agent/src/session/client-bridge.ts
+index a6b19526e..7aed5979f 100644
+--- a/coding-agent/src/session/client-bridge.ts
++++ b/coding-agent/src/session/client-bridge.ts
+@@ -83,3 +83,11 @@ export interface ClientBridge {
+ 		signal?: AbortSignal,
+ 	): Promise<ClientBridgePermissionOutcome>;
+ }
++export function withSdkHostTurnDeferral(bridge: ClientBridge | undefined): ClientBridge {
++	if (bridge?.deferAgentInitiatedTurns === true) return bridge;
++	return {
++		...bridge,
++		capabilities: bridge?.capabilities ?? {},
++		deferAgentInitiatedTurns: true,
++	};
++}
 diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/session/lane-model-switch.ts
 new file mode 100644
 index 000000000..2ad701246
