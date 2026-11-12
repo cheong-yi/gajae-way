@@ -596,9 +596,10 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 	}
 });
 
-test("FirstMate tables arrive in one migration after upstream schema 42", async () => {
+test("FirstMate is one migration at schema 43, after upstream 40, 41, and 42", async () => {
 	const source = await Bun.file(new URL("../src/store/migrations.ts", import.meta.url)).text();
 	const start = source.indexOf(`if (current < ${LATEST_SCHEMA_VERSION})`);
+	expect(LATEST_SCHEMA_VERSION).toBe(43);
 	expect(start).toBeGreaterThan(0);
 	const next = source.indexOf("if (current <", start + 10);
 	const body = next === -1 ? source.slice(start) : source.slice(start, next);
