@@ -1,5 +1,5 @@
 diff --git a/agent-core/src/agent-loop.ts b/agent-core/src/agent-loop.ts
-index 8ab5817b8..4fd3d45cf 100644
+index 8ab5817..4fd3d45 100644
 --- a/agent-core/src/agent-loop.ts
 +++ b/agent-core/src/agent-loop.ts
 @@ -4109,6 +4109,7 @@ async function runLoopBody(
@@ -24,7 +24,7 @@ index 8ab5817b8..4fd3d45cf 100644
  	let messages = context.messages;
  	// Revoke before invoking any caller-controlled transform so it cannot retain
 diff --git a/agent-core/src/agent.ts b/agent-core/src/agent.ts
-index 0d8678868..bbf6d2f95 100644
+index 0d86788..bbf6d2f 100644
 --- a/agent-core/src/agent.ts
 +++ b/agent-core/src/agent.ts
 @@ -644,6 +644,7 @@ export class Agent {
@@ -45,7 +45,7 @@ index 0d8678868..bbf6d2f95 100644
  				if (this.#activeRunId !== runId) {
  					return [];
 diff --git a/agent-core/src/types.ts b/agent-core/src/types.ts
-index d09600580..1e80cb7cf 100644
+index d096005..1e80cb7 100644
 --- a/agent-core/src/types.ts
 +++ b/agent-core/src/types.ts
 @@ -526,6 +526,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
@@ -59,10 +59,10 @@ index d09600580..1e80cb7cf 100644
  	/**
  	 * Called after a tool call has been validated and is about to execute.
 diff --git a/coding-agent/src/commands/sdk.ts b/coding-agent/src/commands/sdk.ts
-index 6c5888e71..14f796a06 100644
+index f8ffac1..05157a5 100644
 --- a/coding-agent/src/commands/sdk.ts
 +++ b/coding-agent/src/commands/sdk.ts
-@@ -82,6 +82,7 @@ import {
+@@ -87,6 +87,7 @@ import {
  } from "../sdk/startup-capability";
  import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
  import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
@@ -70,7 +70,7 @@ index 6c5888e71..14f796a06 100644
  import {
  	type CapturedSessionTranscriptSnapshot,
  	type ResumeSessionIdentity,
-@@ -1293,6 +1294,7 @@ export async function runSessionHost(
+@@ -1311,6 +1312,7 @@ export async function runSessionHost(
  	}
  	const { parsed } = opened;
  	const { session, startDeferredMemoryBackend } = created;
@@ -79,7 +79,7 @@ index 6c5888e71..14f796a06 100644
  	session.registerToolSessionTransitionCleanup(async () => {
  		await session.sessionManager.ensureOnDisk();
 diff --git a/coding-agent/src/sdk/host/session-runtime.ts b/coding-agent/src/sdk/host/session-runtime.ts
-index 46d247f03..3fd83b1f3 100644
+index 1abd87a..4fdfed4 100644
 --- a/coding-agent/src/sdk/host/session-runtime.ts
 +++ b/coding-agent/src/sdk/host/session-runtime.ts
 @@ -45,6 +45,7 @@ import type { AgentEndEvent } from "../../extensibility/shared-events";
@@ -90,7 +90,7 @@ index 46d247f03..3fd83b1f3 100644
  import type { SdkRunCapability } from "../../session/sdk-run-capability";
  import {
  	boundTerminalRetentionState,
-@@ -7839,7 +7840,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
+@@ -7938,7 +7939,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
  		};
  		const removeProviderDefinitions = (capability: string): void => {
  			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
@@ -100,10 +100,10 @@ index 46d247f03..3fd83b1f3 100644
  		externalPermissions.installControls(
  			controlSurface,
 diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/session/agent-session.ts
-index b28f94b80..5d425f3c1 100644
+index 2b7a35c..ec7d5ff 100644
 --- a/coding-agent/src/session/agent-session.ts
 +++ b/coding-agent/src/session/agent-session.ts
-@@ -543,6 +543,7 @@ import {
+@@ -561,6 +561,7 @@ import {
  	FoldCoordinator,
  	type ForegroundFoldOutcome,
  } from "./fold-coordinator";
@@ -111,7 +111,7 @@ index b28f94b80..5d425f3c1 100644
  import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
  import {
  	type BashExecutionMessage,
-@@ -6798,6 +6799,38 @@ export class AgentSession {
+@@ -6985,6 +6986,38 @@ export class AgentSession {
  		// (session persistence, hooks, auto-compaction, retry logic)
  		this.#unsubscribeAgent = this.agent.subscribe(this.#trackAgentEvent);
  
@@ -151,7 +151,7 @@ index b28f94b80..5d425f3c1 100644
  		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
  		// SDK ToolSession callbacks capture the just-constructed session. Defer the
 diff --git a/coding-agent/src/session/client-bridge.ts b/coding-agent/src/session/client-bridge.ts
-index a6b19526e..7aed5979f 100644
+index a6b1952..7aed597 100644
 --- a/coding-agent/src/session/client-bridge.ts
 +++ b/coding-agent/src/session/client-bridge.ts
 @@ -83,3 +83,11 @@ export interface ClientBridge {
@@ -168,7 +168,7 @@ index a6b19526e..7aed5979f 100644
 +}
 diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/session/lane-model-switch.ts
 new file mode 100644
-index 000000000..2ad701246
+index 0000000..2ad7012
 --- /dev/null
 +++ b/coding-agent/src/session/lane-model-switch.ts
 @@ -0,0 +1,73 @@

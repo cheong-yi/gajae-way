@@ -16,7 +16,7 @@ import {
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 // Bun inlines this packaged text asset into the dist bundle and compiled binary.
-import laneSwitchPatch from "./patches/gajae-code/0.19.3-lane-switch.patch" with { type: "text" };
+import laneSwitchPatch from "./patches/gajae-code/0.20.0-lane-switch.patch" with { type: "text" };
 
 export interface GjcInstallRunResult {
 	readonly exitCode: number;
@@ -27,7 +27,7 @@ export interface GjcInstallRunResult {
 export type GjcInstallRunner = (command: readonly string[], cwd: string) => Promise<GjcInstallRunResult>;
 
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
-const LANE_SWITCH_VERSION = "0.19.3";
+const LANE_SWITCH_VERSION = "0.20.0";
 const LANE_SWITCH_RECEIPT = ".lane-switch-patch.sha256";
 const laneSwitchDigest = createHash("sha256").update(laneSwitchPatch).digest("hex");
 

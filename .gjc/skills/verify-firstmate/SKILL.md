@@ -1,6 +1,6 @@
 ---
 name: verify-firstmate
-description: "Drive a FirstMate lane on the Gajaeway test home and prove the plan-then-switch path. Use after changing the 0.19.3 lane-switch patch, work.switchAfterEdit, or the test home deployment, before claiming that path works."
+description: "Drive a FirstMate lane on the Gajaeway test home and prove the plan-then-switch path. Use after changing the 0.20.0 lane-switch patch, work.switchAfterEdit, or the test home deployment, before claiming that path works."
 ---
 
 # Verify FirstMate

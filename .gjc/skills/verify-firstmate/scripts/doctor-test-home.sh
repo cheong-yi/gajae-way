@@ -10,10 +10,10 @@ set -uo pipefail
 TEST_HOME=$(realpath -m -- "${1:-${VERIFY_GAJAEWAY_TEST_HOME:-/home/cheongnet/gajaeway/test-state-firstmate-20261015}}")
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 checkout=$(git -C "$script_dir" rev-parse --show-toplevel) || exit 2
-PATCH=$checkout/packages/cli/src/patches/gajae-code/0.19.3-lane-switch.patch
+PATCH=$checkout/packages/cli/src/patches/gajae-code/0.20.0-lane-switch.patch
 BINARY=$TEST_HOME/bin/gajaeway-gateway.new
 CONFIG=$TEST_HOME/config.json
-STAMP=$TEST_HOME/gjc/0.19.3/.lane-switch-patch.sha256
+STAMP=$TEST_HOME/gjc/0.20.0/.lane-switch-patch.sha256
 
 failures=0
 pass() { echo "PASS $*"; }
@@ -29,7 +29,7 @@ else
 	fail "config.work.switchAfterEdit is not true ($CONFIG)"
 fi
 
-# 2. The installed GJC 0.19.3 was patched with this checkout's patch bytes.
+# 2. The installed GJC 0.20.0 was patched with this checkout's patch bytes.
 expected=$(sha256sum -- "$PATCH" 2>/dev/null | cut -d' ' -f1)
 recorded=$(tr -d '[:space:]' <"$STAMP" 2>/dev/null)
 if [[ -n $expected && $recorded == "$expected" ]]; then
