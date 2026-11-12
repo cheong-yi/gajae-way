@@ -552,7 +552,7 @@ If a service command times out with an indeterminate outcome, the restart receip
 
 An update-triggered restart stops the broker, runs journaled `broker-agent provision --mode update` under the broker lease, then starts the broker. If provisioning is unrecoverable, the restart receipt says to run `gajaeway setup --broker-agent`; inspect the provision status before restarting. On Linux, the service manager names the broker unit `gajaeway-broker.service`; on macOS the supervisor uses `dev.gajaeway.broker`.
 
-`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply, and `origin_silent` when a user message has gone unanswered for 15 minutes (see the runbook). The current schema is 42; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
+`ops cycle` includes the private broker agent's status and source/copy drift. It also reports `broker_respawn_churn`, `broker_index_lock_blocked`, and `gjc_unverified_version` when those gates apply, and `origin_silent` when a user message has gone unanswered for 15 minutes (see the runbook). The current schema is 43; `broker_quarantine` and `broker_cutovers` remain part of the broker-authority evidence.
 
 ## Speech gate
 

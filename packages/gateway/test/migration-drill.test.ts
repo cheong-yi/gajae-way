@@ -595,3 +595,63 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("FirstMate tables arrive in one migration after upstream schema 42", async () => {
+	const source = await Bun.file(new URL("../src/store/migrations.ts", import.meta.url)).text();
+	const start = source.indexOf(`if (current < ${LATEST_SCHEMA_VERSION})`);
+	expect(start).toBeGreaterThan(0);
+	const next = source.indexOf("if (current <", start + 10);
+	const body = next === -1 ? source.slice(start) : source.slice(start, next);
+	expect(source.slice(0, start)).not.toContain("firstmate_");
+	expect(source.slice(start + body.length)).not.toContain("firstmate_");
+	for (const table of [
+		"firstmate_assignments",
+		"firstmate_attempts",
+		"firstmate_abandonments",
+		"firstmate_approvals",
+		"firstmate_release_intents",
+		"firstmate_release_receipts",
+	])
+		expect(body).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
+
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-firstmate-one-migration-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const latest = await Store.open(path);
+		latest.close();
+		const rewound = new Database(path);
+		rewound.exec(`
+			DROP TABLE firstmate_release_receipts;
+			DROP TABLE firstmate_release_intents;
+			DROP TABLE firstmate_approvals;
+			DROP TABLE firstmate_attempts;
+			DROP TABLE firstmate_abandonments;
+			DROP TABLE firstmate_assignments;
+			DELETE FROM schema_migrations WHERE version > 42;
+		`);
+		expect(rewound.query<{ n: number }, []>("SELECT MAX(version) AS n FROM schema_migrations").get()?.n).toBe(42);
+		rewound.close();
+
+		const upgraded = await Store.open(path);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+		upgraded.close();
+		const after = new Database(path, { readonly: true });
+		const added = after.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version > 42").all();
+		expect(added).toEqual([{ version: LATEST_SCHEMA_VERSION }]);
+		const tables = after
+			.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'firstmate_%' ORDER BY name")
+			.all()
+			.map((row) => row.name);
+		after.close();
+		expect(tables).toEqual([
+			"firstmate_abandonments",
+			"firstmate_approvals",
+			"firstmate_assignments",
+			"firstmate_attempts",
+			"firstmate_release_intents",
+			"firstmate_release_receipts",
+		]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
