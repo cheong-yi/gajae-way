@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 43;
+export const LATEST_SCHEMA_VERSION = 44;
 
 export interface MigrationHost {
 	readonly database: {
@@ -1008,6 +1008,31 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
 				.run(43, new Date().toISOString());
+		});
+	}
+	const imagesColumnMissing = !host.database
+		.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
+		.all()
+		.some((row) => row.name === "images_json");
+	if (current < 44 || imagesColumnMissing) {
+		// Migration 42 was recorded on a binary that inserted the version row
+		// without adding images_json. A later recorded version does not re-run 42.
+		host.withTransaction(() => {
+			const columns = new Set(
+				host.database
+					.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
+					.all()
+					.map((row) => row.name),
+			);
+			if (!columns.has("images_json"))
+				host.database.execute("ALTER TABLE inbound_messages ADD COLUMN images_json TEXT");
+			const recorded = host.database
+				.statement<{ version: number }>("SELECT version FROM schema_migrations WHERE version = ?")
+				.get(44);
+			if (recorded === null)
+				host.database
+					.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(44, new Date().toISOString());
 		});
 	}
 }

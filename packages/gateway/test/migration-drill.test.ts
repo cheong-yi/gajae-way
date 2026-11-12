@@ -596,12 +596,14 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 	}
 });
 
-test("FirstMate is one migration at schema 43, after upstream 40, 41, and 42", async () => {
+test("FirstMate is one migration at schema 43 after upstream 40 41 and 42", async () => {
 	const source = await Bun.file(new URL("../src/store/migrations.ts", import.meta.url)).text();
-	const start = source.indexOf(`if (current < ${LATEST_SCHEMA_VERSION})`);
-	expect(LATEST_SCHEMA_VERSION).toBe(43);
+	const marker = "if (current " + String.fromCharCode(60) + " 43)";
+	const start = source.indexOf(marker);
+	expect(LATEST_SCHEMA_VERSION).toBe(44);
 	expect(start).toBeGreaterThan(0);
-	const next = source.indexOf("if (current <", start + 10);
+	const nextMarker = "if (current " + String.fromCharCode(60);
+	const next = source.indexOf(nextMarker, start + marker.length);
 	const body = next === -1 ? source.slice(start) : source.slice(start, next);
 	expect(source.slice(0, start)).not.toContain("firstmate_");
 	expect(source.slice(start + body.length)).not.toContain("firstmate_");
@@ -614,7 +616,6 @@ test("FirstMate is one migration at schema 43, after upstream 40, 41, and 42", a
 		"firstmate_release_receipts",
 	])
 		expect(body).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
-
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-firstmate-one-migration-"));
 	const path = join(directory, "gateway.db");
 	try {
@@ -637,8 +638,10 @@ test("FirstMate is one migration at schema 43, after upstream 40, 41, and 42", a
 		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
 		upgraded.close();
 		const after = new Database(path, { readonly: true });
-		const added = after.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version > 42").all();
-		expect(added).toEqual([{ version: LATEST_SCHEMA_VERSION }]);
+		const added = after
+			.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version > 42 AND version < 44")
+			.all();
+		expect(added).toEqual([{ version: 43 }]);
 		const tables = after
 			.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'firstmate_%' ORDER BY name")
 			.all()
@@ -652,6 +655,34 @@ test("FirstMate is one migration at schema 43, after upstream 40, 41, and 42", a
 			"firstmate_release_intents",
 			"firstmate_release_receipts",
 		]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("schema 44 adds images_json when migration 42 was recorded without it", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-drill-images-json-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const current = await Store.open(path);
+		current.close();
+		const raw = new Database(path);
+		raw.exec("ALTER TABLE inbound_messages DROP COLUMN images_json");
+		raw.close();
+
+		const upgraded = await Store.open(path);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+		upgraded.close();
+
+		const after = new Database(path, { readonly: true });
+		const columns = after
+			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
+			.all()
+			.map((column) => column.name);
+		const added = after.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version = 44").all();
+		after.close();
+		expect(columns).toContain("images_json");
+		expect(added).toEqual([{ version: 44 }]);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
