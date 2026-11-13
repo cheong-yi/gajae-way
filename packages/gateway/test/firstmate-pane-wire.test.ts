@@ -226,8 +226,16 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: child.conversationId });
 		});
 		client = await GajaewayClient.connectSocket(config.socketPath);
-		const start = await client.workStart({ firstmate: assignment });
-		if (!start.started) throw new Error(start.reason);
+		const opened = await client.workStart({ firstmate: assignment });
+		// The persona opens; the lane and its session do not exist yet.
+		expect(opened).toEqual({
+			started: false,
+			personaOpened: true,
+			taskId: "pane-task",
+			name: "pane",
+			worktree: path,
+		});
+		expect(db.bindings.getSessionRecord("work/task/pane")).toBeUndefined();
 		expect(opens).toBe(1);
 		expect(readLanePane(db, "pane")).toMatchObject({
 			taskId: "pane-task",
@@ -238,16 +246,19 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 			const sessionId = db.bindings.getSessionRecord(originKey(child))?.sessionId;
 			return sessionId ? port.sendAttempts.filter((input) => input.sessionId === sessionId) : [];
 		};
-		// The recorded pane is kicked off through chat.send's own inbound path: exactly one
-		// gateway-authored message, a fixed sentence naming the lane and never carrying task text.
+		// The recorded pane starts without a chat.send from the assignment author.
+		// The visible sentence is one bot notice. The internal kickoff carries no author.
 		await until(() => childBinds === 1);
 		expect(childBinds).toBe(1);
 		await until(() => childSends().length === 1);
-		const kickoffText = "The pane for FirstMate lane `pane` is open.";
-		const kickoffRows = db.inbox.recentInbound(originKey(child), 50, new Date(0).toISOString());
-		expect(kickoffRows).toHaveLength(1);
-		expect(kickoffRows[0]?.body).toBe(kickoffText);
-		expect(db.inbox.messageDisposition(originKey(child), "firstmate-pane-kickoff:pane")).toBeDefined();
+		const kickoffText =
+			"The pane for FirstMate lane `pane` is open. The lane does not exist yet; its notice gives the ordinary start command.";
+		const kickoff = db.inbox.messageDisposition(originKey(child), "firstmate-pane-kickoff:pane")?.message;
+		expect(kickoff?.source).toBe("lane_report");
+		expect(kickoff?.engagement_json).toBeNull();
+		expect(
+			db.outbox.rows().filter((row) => row.origin_key === originKey(child) && JSON.parse(row.payload_json).text === kickoffText),
+		).toHaveLength(1);
 		const personaDirective = (where: OriginRef, messageId: string) =>
 			client!.request("chat.send", {
 				origin: where,
@@ -298,26 +309,46 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		await until(() => childSends().length === 3);
 		expect(childBinds).toBe(1);
 		const preamble = childSends()[2]!.systemPreamble ?? "";
-		expect(preamble).toContain("FirstMate crewmate pane");
+		expect(preamble).toContain("FirstMate secondmate pane");
 		expect(preamble).toContain("task pane-task, lane `pane`");
 		expect(preamble).toContain(`[WAKE:${originKey(assignment.thread)}]`);
-		expect(preamble).toContain("never run `work start --firstmate-correction`, `work approve`");
+		expect(preamble).toContain("never run `work start --firstmate`");
+		expect(preamble).toContain("work start --firstmate-correction");
+		expect(preamble).toContain("work approve");
+		// The pane notice hands over one ordinary start, nothing about the lane exists yet.
+		expect(preamble).toContain("The lane does not exist yet");
+		expect(preamble).toContain(`gajaeway work start pane --cwd '${path}' '${assignment.mandate.text}'`);
 		// The gateway no longer turns the line into a work steer; the persona drives the lane.
 		expect(port.steers).toHaveLength(0);
 		expect(db.inbox.watchRows()[0]).toMatchObject({ state: "fired", triggered_message_id: "human" });
 		await until(() => db.inbox.pendingOldest(originKey(child)) === undefined);
 		const binding = db.bindings.getSessionRecord(originKey(child));
 		expect(binding?.sessionId).toBeTruthy();
+		// The pane's own ordinary start is the FirstMate worker attempt: the pane is its parent.
+		const start = await client.workStart({
+			name: "pane",
+			text: assignment.mandate.text,
+			cwd: path,
+			callerSessionId: binding!.sessionId,
+		});
+		if (!start.started) throw new Error("unexpected hold");
+		expect(start.sessionKey).toBe("work/task/pane");
+		expect(db.work.firstmate.initial(assignment.taskId)).toMatchObject({ opRef: start.opRef, ordinal: 0 });
+		expect(db.work.workAttemptGet(start.opRef)?.parent).toEqual({
+			kind: "persona",
+			originKey: originKey(child),
+			origin: child,
+		});
 		await client.close();
 		await adapter.close();
 		await server.stop();
 		server = await startUnixServer({ config, database: db, sessionPort: port });
 		client = await GajaewayClient.connectSocket(config.socketPath);
-		expect(await client.workStart({ firstmate: assignment })).toEqual(start);
+		expect(await client.workStart({ firstmate: assignment })).toEqual(opened);
 		expect(opens).toBe(1);
-		// Repeat open never duplicates the kickoff inbound.
+		// Repeat open never posts the notice again.
 		expect(
-			db.inbox.recentInbound(originKey(child), 50, new Date(0).toISOString()).filter((row) => row.body === kickoffText),
+			db.outbox.rows().filter((row) => row.origin_key === originKey(child) && JSON.parse(row.payload_json).text === kickoffText),
 		).toHaveLength(1);
 		expect((await send("after-restart", "Status?")).engaged).toBe(true);
 		await until(() => childSends().length === 4);
@@ -331,14 +362,14 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		await until(() => Boolean(db.work.workAttemptGet(start.opRef)?.settledAt));
 		await port.runExclusive(start.sessionKey, async () => {});
 		const attempt = db.work.workAttemptGet(start.opRef)!;
-		// The settled outcome is one native persona report to the task's parent thread, not a second post.
+		// The settled outcome is one native persona report to the pane that started the lane, not a second post.
 		expect(attempt.decision).toBe("reported");
 		expect(db.outbox.get(attempt.deliveryId)).toBeUndefined();
-		expect(db.inbox.messageDisposition(originKey(assignment.thread), attempt.reportId)?.message).toMatchObject({
+		expect(db.inbox.messageDisposition(originKey(child), attempt.reportId)?.message).toMatchObject({
 			source: "lane_report",
 			body: expect.stringContaining(`inspect: work inspect pane --task pane-task --op ${start.opRef}`),
 		});
-		await until(() => db.inbox.reportConsumed(originKey(assignment.thread), attempt.reportId));
+		await until(() => db.inbox.reportConsumed(originKey(child), attempt.reportId));
 		const observed = await client.workInspect({
 			name: assignment.name,
 			taskId: assignment.taskId,
@@ -404,7 +435,7 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		expect(paneClosed(db, child)).toBe(true);
 		expect((await send("after-retire")).engaged).toBe(false);
 		expect(db.bindings.getSessionRecord(originKey(child))?.sessionId).toBeFalsy();
-		expect(childTurns()).toBe(5);
+		expect(childTurns()).toBe(6);
 		expect(port.steers).toHaveLength(0);
 	} finally {
 		await client?.close();
@@ -513,10 +544,16 @@ test("FirstMate journey without Discord: assign, child message, close, follow-up
 		const childTurns = () => port.sendAttempts.filter((input) => input.sessionId === childSessionId()).length;
 		const expectNoPersona = noPersona(db, port, () => client!, child);
 
-		// 1. Assign: the lane starts and the gateway records the open child pane.
-		const start = await client.workStart({ firstmate: assignment });
-		if (!start.started) throw new Error(start.reason);
-		expect(start.sessionKey).toBe("work/task/journey");
+		// 1. Assign: the assignment is recorded and the gateway opens the pane persona; no lane yet.
+		const opened = await client.workStart({ firstmate: assignment });
+		expect(opened).toEqual({
+			started: false,
+			personaOpened: true,
+			taskId: "journey-task",
+			name: "journey",
+			worktree: path,
+		});
+		expect(db.bindings.getSessionRecord("work/task/journey")).toBeUndefined();
 		expect(readLanePane(db, "journey")).toMatchObject({ taskId: "journey-task", childOrigin: child });
 		expect(paneClosed(db, child)).toBe(false);
 		await until(() => childTurns() === 1);
@@ -529,13 +566,28 @@ test("FirstMate journey without Discord: assign, child message, close, follow-up
 		const openChildSession = childSessionId();
 		expect(openChildSession).toBeTruthy();
 
-		// Settle the lane attempt and confirm its parent delivery.
+		// 3. The pane's ordinary start creates the lane, and the pane is the worker's parent.
+		const start = await client.workStart({
+			name: "journey",
+			text: assignment.mandate.text,
+			cwd: path,
+			callerSessionId: openChildSession,
+		});
+		if (!start.started) throw new Error("unexpected hold");
+		expect(start.sessionKey).toBe("work/task/journey");
+		expect(db.work.workAttemptGet(start.opRef)?.parent).toEqual({
+			kind: "persona",
+			originKey: originKey(child),
+			origin: child,
+		});
+
+		// Settle the lane attempt and consume its report in the pane.
 		port.complete(start.opRef, "final local result");
 		await until(() => Boolean(db.work.workAttemptGet(start.opRef)?.settledAt));
 		await port.runExclusive(start.sessionKey, async () => {});
 		const attempt = db.work.workAttemptGet(start.opRef)!;
-		await until(() => db.outbox.get(attempt.deliveryId) !== undefined);
-		db.transaction((tx) => db.outbox.confirm(tx, attempt.deliveryId));
+		expect(attempt.decision).toBe("reported");
+		await until(() => db.inbox.reportConsumed(originKey(child), attempt.reportId));
 		// The settled attempt is the one open approval hold.
 		expect(db.work.firstmate.approvalHolds("journey")).toMatchObject([
 			{ state: "open", taskId: "journey-task", opRef: start.opRef, ordinal: 0, sessionId: start.sessionId },
@@ -752,20 +804,33 @@ test("FirstMate lane closed without abandonment: approval recorded, closeout clo
 		const owner = db.work.firstmate;
 		const expectNoPersona = noPersona(db, port, () => client!, child);
 
-		const start = await client.workStart({ firstmate: assignment });
-		if (!start.started) throw new Error(start.reason);
+		// The assignment is recorded and the pane opens; the pane's own start creates the lane.
+		const opened = await client.workStart({ firstmate: assignment });
+		expect(opened).toMatchObject({ started: false, personaOpened: true, name: "closed", taskId: "closed-task" });
 		expect(readLanePane(db, "closed")).toMatchObject({ taskId: "closed-task", childOrigin: child });
 		await until(() => childTurns() === 1);
 		await until(() => db.inbox.pendingOldest(originKey(child)) === undefined);
 		const openChildSession = childSessionId();
 		expect(openChildSession).toBeTruthy();
+		const start = await client.workStart({
+			name: "closed",
+			text: assignment.mandate.text,
+			cwd: path,
+			callerSessionId: openChildSession,
+		});
+		if (!start.started) throw new Error("unexpected hold");
+		expect(db.work.workAttemptGet(start.opRef)?.parent).toEqual({
+			kind: "persona",
+			originKey: originKey(child),
+			origin: child,
+		});
 
 		port.complete(start.opRef, "final local result");
 		await until(() => Boolean(db.work.workAttemptGet(start.opRef)?.settledAt));
 		await port.runExclusive(start.sessionKey, async () => {});
 		const attempt = db.work.workAttemptGet(start.opRef)!;
-		await until(() => db.outbox.get(attempt.deliveryId) !== undefined);
-		db.transaction((tx) => db.outbox.confirm(tx, attempt.deliveryId));
+		expect(attempt.decision).toBe("reported");
+		await until(() => db.inbox.reportConsumed(originKey(child), attempt.reportId));
 
 		// The settled lane stays bound and its pane stays open until the owner's closeout.
 		const laneSession = db.bindings.getSessionRecord(start.sessionKey)!;
@@ -961,7 +1026,7 @@ test("FirstMate lane closed without abandonment: approval recorded, closeout clo
 			messageId: "next-assignment",
 		};
 		const nextStart = await client.workStart({ firstmate: next });
-		if (!nextStart.started) throw new Error(nextStart.reason);
+		expect(nextStart).toMatchObject({ started: false, personaOpened: true, name: "next", taskId: "next-task" });
 		expect(owner.assignment("next")?.worktree.path).toBe(path);
 		// The released task's review and merge never read the checkout the live next task owns.
 		const caller = db.bindings.getSessionRecord(originKey(thread))?.sessionId;
@@ -999,3 +1064,115 @@ test("FirstMate lane closed without abandonment: approval recorded, closeout clo
 		await rm(directory, { recursive: true, force: true });
 	}
 }, 30_000);
+test("a closed room still opens the pane, and the notice is not stamped as the assignment author", async () => {
+	const directory = await realpath(await mkdtemp(join(tmpdir(), "gajaeway-pane-refused-")));
+	const repo = join(directory, "repo");
+	await mkdir(repo);
+	const git = (...args: string[]) => {
+		const result = Bun.spawnSync(["git", "-C", repo, ...args], {
+			env: {
+				...process.env,
+				GIT_AUTHOR_NAME: "fixture",
+				GIT_AUTHOR_EMAIL: "fixture@example.test",
+				GIT_COMMITTER_NAME: "fixture",
+				GIT_COMMITTER_EMAIL: "fixture@example.test",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		if (result.exitCode) throw new Error(result.stderr.toString());
+		return result.stdout.toString().trim();
+	};
+	git("init", "-q");
+	git("commit", "--allow-empty", "-qm", "fixture");
+	const path = join(directory, "assigned");
+	git("worktree", "add", "-qb", "firstmate/refused", path);
+	const assignment: WorkFirstmateAssignmentParams = {
+		taskId: "refused-task",
+		name: "refused",
+		ownerId: "stranger",
+		messageId: "assignment",
+		thread: { platform: "discord", kind: "thread", conversationId: "parent-thread", parentId: "cockpit" },
+		mandate: { id: "mandate", text: "Fix the scoped parser", checkRetries: false, commit: false, push: false },
+		worktree: {
+			path,
+			commonDir: await realpath(git("-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir")),
+			gitDir: await realpath(git("-C", path, "rev-parse", "--absolute-git-dir")),
+			branch: "firstmate/refused",
+		},
+	};
+	const config: GatewayConfig = {
+		schemaVersion: 1,
+		home: directory,
+		gjc: { agentDir: join(directory, "agent") },
+		configPath: join(directory, "config.json"),
+		socketPath: join(directory, "gateway.sock"),
+		dbPath: join(directory, "gateway.db"),
+		logVerbosity: "info",
+		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
+		channels: { "discord:cockpit": { engagement: "closed" } },
+	};
+	const db = await Store.open(config.dbPath);
+	const child: OriginRef = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "child-pane",
+		parentId: "cockpit",
+		threadVisibility: "public",
+	};
+	const port = new ScriptedSessionPort({
+		onBind: (input) => db.bindings.getSessionRecord(input.originKey)?.sessionId || crypto.randomUUID(),
+		onSend: (input, scripted) => {
+			scripted.complete(input.opRef, "[SILENT]");
+		},
+	});
+	attachTestBrokerOwnership(db, port, join(directory, "agent"));
+	let server: GatewayServer | undefined;
+	let adapter: GajaewayClient | undefined;
+	let client: GajaewayClient | undefined;
+	try {
+		server = await startUnixServer({ config, database: db, sessionPort: port });
+		adapter = await GajaewayClient.connectSocket(config.socketPath, { clientName: "adapter-discord" });
+		let opens = 0;
+		adapter.on("discord.thread.open", (value) => {
+			const request = value as { requestId: string };
+			opens++;
+			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: child.conversationId });
+		});
+		client = await GajaewayClient.connectSocket(config.socketPath);
+		const opened = await client.workStart({ firstmate: assignment });
+		expect(opened).toMatchObject({ started: false, personaOpened: true, name: "refused", taskId: "refused-task" });
+		expect(db.work.firstmate.assignment("refused")?.taskId).toBe("refused-task");
+		expect(readLanePane(db, "refused")?.childOrigin).toEqual(child);
+		const kickoff = db.inbox.messageDisposition(originKey(child), "firstmate-pane-kickoff:refused")?.message;
+		expect(kickoff?.source).toBe("lane_report");
+		expect(kickoff?.engagement_json).toBeNull();
+		expect(kickoff?.body).not.toContain("stranger");
+		const notices = db.outbox.rows().map((row) => JSON.parse(row.payload_json) as { role?: string; text?: string });
+		expect(notices).toEqual([
+			expect.objectContaining({
+				role: "assistant",
+				text: "The pane for FirstMate lane `refused` is open. The lane does not exist yet; its notice gives the ordinary start command.",
+			}),
+		]);
+		expect(JSON.stringify(notices)).not.toContain("stranger");
+		await until(() => port.binds.some((bind) => bind.originKey === originKey(child)));
+		const stranger = await client.request<{ engaged: boolean }>("chat.send", {
+			origin: child,
+			messageId: "stranger-follow-up",
+			text: "start it",
+			engagement: { mentioned: false, group: true, authorId: "stranger" },
+		});
+		expect(stranger.engaged).toBe(false);
+		const again = await client.workStart({ firstmate: assignment });
+		expect(again).toMatchObject({ started: false, personaOpened: true, name: "refused" });
+		expect(opens).toBe(1);
+		expect(db.outbox.rows()).toHaveLength(1);
+	} finally {
+		await client?.close();
+		await adapter?.close();
+		await server?.stop();
+		db.close();
+		await rm(directory, { recursive: true, force: true });
+	}
+});

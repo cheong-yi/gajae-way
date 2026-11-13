@@ -126,7 +126,7 @@ Discord·Slack·Telegram의 정적 PNG/JPEG 첨부파일을 모델의 이미지 
 
 로컬 FirstMate 명령은 권한을 가진 신뢰된 호출자가 제공한 명시적 불변 할당을 사용하며, Discord 메시지를 자동으로 해석하여 할당하지 않습니다:
 
-- `gajaeway work start --firstmate FILE`은 할당 JSON을 제출하고 수락/보류 결과의 전체 JSON을 출력합니다. 보류 시 종료 코드는 0이 아닙니다. 일반 start 인수와 혼용하지 않습니다.
+- `gajaeway work start --firstmate FILE`은 할당 JSON을 제출하고 전체 결과 JSON을 출력합니다. 보류 시 종료 코드는 0이 아닙니다. 할당을 기록하고 해당 작업의 secondmate pane 페르소나를 열며, 레인이나 세션은 만들지 않습니다. 그 secondmate가 실행하는 일반 `gajaeway work start NAME --cwd WORKTREE "<mandate text>"`가 pane을 부모로 레인을 만들고, 그때에야 `name`/`taskId`/`opRef`가 존재합니다. pane을 열 수 없으면 보이는 보류 결과를 반환하며, 요청된 Discord 스레드 생성은 무작정 재시도하지 않습니다. 일반 start 인수와 혼용하지 않습니다.
 - `gajaeway --socket PATH work start --firstmate-correction CORRECTION_JSON_FILE`은 신뢰된 로컬 호출자의 동일 작업 수정을 제출합니다. 필드는 `name`, `taskId`, `ownerId`, `messageId`, `thread`, `mandateId`, `priorOpRef`, `text`이며, 할당 또는 일반 명령 플래그와 혼용할 수 없습니다. 수락/보류 JSON 형식은 동일합니다. 선행 결과는 `done` 또는 `attempt_ended` 상태의 가장 최근 시도 중 귀속이 확인되고 수락·정산된 정확한 `end_turn`이어야 합니다. 새 독립 시도를 추가하면서 task/worktree/thread/mandate/session/epoch와 이전의 최선 노력 증거를 유지합니다.
 - `gajaeway work inspect NAME --task TASK_ID --op OP_REF [--native]`은 정확히 지정한 결과의 전체 JSON을 출력하며, identity/lifecycle과 complete/partial/unavailable 증거, provenance, reasons, `execution: "not_evaluated"`를 구분합니다. 기본값은 보존된 증거만 읽습니다. `--native`는 해당 작업의 제한된 조회만 허용하며 실행이나 재전송을 하지 않습니다.
 
@@ -136,7 +136,7 @@ Discord·Slack·Telegram의 정적 PNG/JPEG 첨부파일을 모델의 이미지 
 
 `WorkApproveResult`는 `{ recorded: true, approval }` (정확한 요청에 `approvalId`, `recordedAt` 추가) 또는 `{ recorded: false, held: true, reason }`입니다. CLI는 전체 JSON을 출력하며 보류 시 종료 코드 1을 반환합니다. 확인 기록은 결과 수용이 아닙니다. 네이티브 `done`/`attempt_ended`, 소유자의 결과 수용, 별도 보존형 마무리는 서로 다릅니다. 승인은 게시·커밋·푸시·배포·삭제·세션 해제 권한을 부여하지 않습니다. reconstructed/logs 입력은 보류되며 재구성 서비스나 자동 재실행은 없습니다. 보존형 마무리는 별도의 `gajaeway work retire --firstmate RELEASE_JSON_FILE` 명령이며 현재 유효한 `accept_outcome` 승인이 필요합니다. 소스와 안내는 통합 검증 및 새로운 Luna/Sol 게이트웨이 검토 전까지 UNVERIFIED입니다. 자연어 Discord/모델 또는 전체 소유자 여정의 준비 완료를 주장하지 않습니다.
 
-일반 start/run/status는 그대로이며, 일반 steer는 매핑된 작업을 수정하는 경로가 아닙니다. partial/unavailable 증거는 실행 실패를 뜻하지 않고, 포인터는 조회 가능 여부나 16 KiB를 넘는 전체 원문 또는 해제 후 원문 보존을 보장하지 않습니다. 네이티브 내부 보고는 작업자의 직접 채팅이 아니라 주 감독자의 기존 전달 경로를 사용합니다. 조회나 커밋 권한은 작업 승인 또는 게시 권한을 부여하지 않으며, push/PR/merge/release/deploy/retire/delete에는 각각 별도의 승인이 필요합니다. 이 최선 노력 방식의 새 데이터베이스 대상 소스 범위는 마이그레이션/과거 작업 재개, 전체 소유자 여정, 실제 환경 활성화를 확립하지 않습니다. 할당 예제와 신뢰 경계는 [런북](docs/runbooks/gajaeway-v1.md)을 참고하세요.
+일반 start/run/status는 그대로이며, 일반 steer는 매핑된 작업을 수정하는 경로가 아닙니다. partial/unavailable 증거는 실행 실패를 뜻하지 않고, 포인터는 조회 가능 여부나 16 KiB를 넘는 전체 원문 또는 해제 후 원문 보존을 보장하지 않습니다. 네이티브 내부 보고는 레인을 연 secondmate pane으로 가며, 할당 스레드는 소유자 결정을 유지합니다. 조회나 커밋 권한은 작업 승인 또는 게시 권한을 부여하지 않으며, push/PR/merge/release/deploy/retire/delete에는 각각 별도의 승인이 필요합니다. 이 최선 노력 방식의 새 데이터베이스 대상 소스 범위는 마이그레이션/과거 작업 재개, 전체 소유자 여정, 실제 환경 활성화를 확립하지 않습니다. 할당 예제와 신뢰 경계는 [런북](docs/runbooks/gajaeway-v1.md)을 참고하세요.
 
 ## 개발
 

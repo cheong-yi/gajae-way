@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from "node:fs/promises";
 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -765,6 +765,11 @@ describe("service installation", () => {
 							await writeFile(join(cwd, "node_modules", ".bin", "gjc"), version);
 							return { exitCode: 0, stdout: "", stderr: "" };
 						}
+						// 0.20.0 install applies the lane-switch patch before it links current.
+						if (command[0] === "patch") {
+							await access(command.at(-1) ?? "");
+							return { exitCode: 0, stdout: "", stderr: "" };
+						}
 						return { exitCode: 0, stdout: `gjc/${await readFile(command[0] as string, "utf8")}`, stderr: "" };
 					},
 				},
@@ -787,7 +792,8 @@ describe("service installation", () => {
 		} finally {
 			console.log = originalLog;
 			console.error = originalError;
-			process.exitCode = previousExitCode;
+			// Bun keeps a set exit code when this assignment is undefined.
+			process.exitCode = previousExitCode ?? 0;
 			for (const [key, value] of Object.entries(saved))
 				if (value === undefined) delete process.env[key];
 				else process.env[key] = value;
@@ -1625,6 +1631,13 @@ describe("work operator commands", () => {
 	for (const result of [
 		{ started: true, jobId: "job-exact", opRef: "op-exact", sessionKey: "work-mapped", sessionId: "session-exact" },
 		{ started: false, held: true, jobId: "job-exact", state: "awaiting_operator", reason: "acceptance_uncertain" },
+		{
+			started: false,
+			personaOpened: true,
+			taskId: "task-exact",
+			name: "mapped",
+			worktree: "/repo/task",
+		},
 	]) {
 		test(`mapped start forwards only the assignment and prints full JSON started=${result.started}`, async () => {
 			const root = await mkdtemp(join(tmpdir(), "mapped-start-"));
@@ -1636,7 +1649,8 @@ describe("work operator commands", () => {
 				expect(output.lines).toEqual([JSON.stringify(result)]);
 				expect(output.errors).toEqual([]);
 				expect(output.closed).toBe(true);
-				expect(output.exitCode).toBe(result.started ? 0 : 1);
+				// A persona-open is a success; only a hold is nonzero.
+				expect(output.exitCode).toBe("held" in result ? 1 : 0);
 			} finally {
 				await rm(root, { recursive: true, force: true });
 			}
@@ -1886,6 +1900,27 @@ describe("work operator commands", () => {
 			expect(output.requests).toEqual([{ verb: `work.${command}`, params: { name: "fix", text: "task" } }]);
 		});
 	}
+
+	test("work start preserves mandate text bytes and rejects only blank text", async () => {
+		const spaced = await run(["start", "fix", "  Keep these bytes  "], {
+			started: true,
+			jobId: "j",
+			opRef: "o",
+			sessionKey: "k",
+			sessionId: "s",
+		});
+		expect(spaced.requests).toEqual([{ verb: "work.start", params: { name: "fix", text: "  Keep these bytes  " } }]);
+		const blank = await run(["start", "fix", "   "], {
+			started: true,
+			jobId: "j",
+			opRef: "o",
+			sessionKey: "k",
+			sessionId: "s",
+		});
+		expect(blank.requests).toEqual([]);
+		expect(blank.errors.join("\n")).toContain("usage: gajaeway work");
+		expect(blank.exitCode).not.toBe(0);
+	});
 
 	test("work start leaves parent selection to the gateway", async () => {
 		const output = await run(["start", "fix", "task"], {

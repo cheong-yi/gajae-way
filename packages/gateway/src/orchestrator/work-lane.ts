@@ -92,7 +92,7 @@ import {
 import type { WriteTx } from "../store/tx";
 import { type BrokerWaitOptions, isBrokerUnavailable, waitForBroker } from "./broker";
 import { readFailedTransportCause } from "./failed-turn-evidence";
-import { paneDeliveryGuard, readLanePane } from "./firstmate-pane";
+import { paneClosed, paneDeliveryGuard, readChildPane, readLanePane } from "./firstmate-pane";
 import { GIT_COMMAND_TIMEOUT_MS, runGit } from "./git-command";
 import {
 	dirtyCheckout,
@@ -519,9 +519,9 @@ export class WorkLaneManager {
 				const name = current.sessionKey.slice("work/task/".length);
 				const assignment = this.#db.work.firstmate.assignment(name);
 				workAssert(
-					assignment?.taskId === attribution.taskId &&
-						current.parent?.kind === "persona" &&
-						current.parent.originKey === originKey(assignment.thread),
+					assignment !== undefined &&
+						assignment.taskId === attribution.taskId &&
+						this.#isWorkerParent(current, assignment),
 				);
 				const pane = readLanePane(this.#db, name);
 				const terminal = patch.terminal ?? current.terminal;
@@ -1043,8 +1043,7 @@ export class WorkLaneManager {
 				runtime.startedAt !== attempt.startedAt ||
 				runtime.settledAt !== (attempt.endedAt ?? null) ||
 				(runtime.terminal?.status?.clientRef !== undefined && runtime.terminal.status.clientRef !== opRef) ||
-				runtime.parent?.kind !== "persona" ||
-				runtime.parent.originKey !== originKey(assignment.thread)
+				!this.#isWorkerParent(runtime, assignment)
 			)
 				return unavailable("attempt_attribution_changed");
 			const binding = this.#db.bindings.getSessionRecord(sessionKey);
@@ -1476,10 +1475,13 @@ export class WorkLaneManager {
 				runtime.laneKey !== laneJobIdentity(assignment.name).laneKey ||
 				runtime.cwd !== assignment.worktree.path ||
 				runtime.mode === "historical" ||
-				runtime.parent?.kind !== "persona" ||
-				runtime.parent.originKey !== originKey(assignment.thread) ||
-				!isDeepStrictEqual(runtime.parent.origin, assignment.thread)
+				!this.#isWorkerParent(runtime, assignment)
 			) {
+				hold(attempt.opRef, "attempt_attribution_unavailable");
+				continue;
+			}
+			const parent = runtime.parent;
+			if (parent?.kind !== "persona") {
 				hold(attempt.opRef, "attempt_attribution_unavailable");
 				continue;
 			}
@@ -1494,8 +1496,8 @@ export class WorkLaneManager {
 			if (runtime.decision === "suppressed" && !runtime.output.knownSilence) hold(attempt.opRef, "silence_unproven");
 			// The one native route settled this outcome: a reported result is owed until its persona
 			// turn consumed it, a refused one until its fallback delivery confirmed.
-			if (runtime.decision === "reported") report(runtime.reportId, runtime.parent.originKey);
-			else if (runtime.decision === "fallback") delivery(runtime.deliveryId, runtime.opRef, runtime.parent.originKey);
+			if (runtime.decision === "reported") report(runtime.reportId, parent.originKey);
+			else if (runtime.decision === "fallback") delivery(runtime.deliveryId, runtime.opRef, parent.originKey);
 		}
 		for (const report of this.#db.work.laneReportsByParent(assignment.name)) {
 			const child = this.#db.work.workAttemptGet(report.child_op_ref);
@@ -1539,8 +1541,13 @@ export class WorkLaneManager {
 					typeof outcome.turnId !== "string"
 				)
 					hold(key, "outcome_attribution_unavailable");
-				else if (outcome.route === "persona") report(outcome.id, originKey(assignment.thread));
-				else delivery(outcome.id, outcome.turnId, originKey(assignment.thread));
+				else {
+					// The attempt reports to the persona that started it: the pane, or its assignment thread.
+					const parent = this.#db.work.workAttemptGet(outcome.opRef)?.parent;
+					if (parent?.kind !== "persona") hold(key, "outcome_attribution_unavailable");
+					else if (outcome.route === "persona") report(outcome.id, parent.originKey);
+					else delivery(outcome.id, outcome.turnId, parent.originKey);
+				}
 			} catch {
 				hold(key, "outcome_attribution_unavailable");
 			}
@@ -2001,66 +2008,67 @@ export class WorkLaneManager {
 		return { merged: true, prNumber: merge.prNumber, headSha: merge.headSha };
 	}
 
-	/** Trusted local protocol composition; not Discord author ingress. */
+	/**
+	 * Trusted local protocol composition; not Discord author ingress. Records the immutable
+	 * assignment and opens the pane persona; the pane's own ordinary `work.start` creates the
+	 * lane, with the pane as the worker's parent.
+	 */
 	async startFirstmate(assignment: FirstmateAssignment): Promise<WorkStartResult> {
 		this.#live();
 		assignment = structuredClone(assignment);
 		this.#assertFirstmateAdmission(assignment);
 		const admitted = assignment;
-		return this.#admit(admitted.name, () => this.#startFirstmateAdmitted(admitted));
-	}
-	async #startFirstmateAdmitted(assignment: FirstmateAssignment): Promise<WorkStartResult> {
-		return this.#port.runExclusive(`work/firstmate/${assignment.worktree.path}`, async () => {
-			this.#assertFirstmateAdmission(assignment);
-			const duplicate = this.#db.work.firstmate.initial(assignment.taskId);
-			if (duplicate) {
-				const runtime = this.#db.work.workAttemptGet(duplicate.opRef);
-				if (runtime) {
-					firstmateAssert(
-						runtime.sessionId === duplicate.sessionId &&
-							runtime.epoch === duplicate.epoch &&
-							runtime.jobId === duplicate.jobId &&
-							runtime.cwd === assignment.worktree.path &&
-							runtime.parent?.kind === "persona" &&
-							runtime.parent.originKey === originKey(assignment.thread),
-						"attempt_attribution_changed",
-					);
-				}
-				if (!runtime || !hasAcceptanceEvidence(runtime)) {
-					return {
-						started: false as const,
-						held: true as const,
-						jobId: duplicate.jobId,
-						state: this.#job(assignment.name)!.state,
-						reason: `original attempt ${duplicate.opRef} acceptance is unproven; no execution was replayed`,
-					};
-				}
-				return {
-					started: true as const,
-					jobId: duplicate.jobId,
-					opRef: duplicate.opRef,
-					sessionKey: workSessionKey(assignment.name),
-					sessionId: duplicate.sessionId,
-				};
-			}
-			// Duplicates do not run recovery: observation may otherwise trigger a checks retry.
-			await this.recover();
-			const sessionKey = workSessionKey(assignment.name);
-			const held = new Set(this.#heldSessionKeys.getStore());
-			held.add(sessionKey);
-			return this.#heldSessionKeys.run(held, () =>
-				this.#port.runExclusive(sessionKey, () =>
-					this.#startLocked(
-						{ name: assignment.name, text: assignment.mandate.text, cwd: assignment.worktree.path, resume: false },
-						"start",
-						{
-							parent: { kind: "persona", originKey: originKey(assignment.thread), origin: assignment.thread },
-							firstmate: { assignment, cause: { kind: "assignment" }, text: assignment.mandate.text },
-						},
-					),
-				),
-			);
+		return this.#port.runExclusive(`work/firstmate/${admitted.worktree.path}`, async () => {
+			this.#assertFirstmateAdmission(admitted);
+			// A repeated submission is a read-only replay, never a second write or Discord open.
+			if (this.#db.work.firstmate.assignment(admitted.name) === undefined)
+				this.#db.transaction((tx) => this.#db.work.firstmate.recordAssignment(tx, admitted));
+			return {
+				started: false as const,
+				personaOpened: true as const,
+				taskId: admitted.taskId,
+				name: admitted.name,
+				worktree: admitted.worktree.path,
+			};
 		});
+	}
+	/**
+	 * The recorded pane persona's ordinary start is the FirstMate worker attempt: same lane name
+	 * and assigned worktree, with the pane as parent. Any other name or cwd from that pane is refused.
+	 */
+	#paneFirstmate(input: WorkInput, mode: "start" | "run", parent: WorkParent | null): FirstmatePrepare | undefined {
+		if (mode !== "start" || parent?.kind !== "persona") return undefined;
+		const pane = readChildPane(this.#db, parent.origin);
+		if (!pane) return undefined;
+		const assignment = this.#db.work.firstmate.assignment(pane.laneName);
+		if (!assignment) return undefined;
+		if (paneClosed(this.#db, parent.origin))
+			throw new ProtocolError("invalid_params", "FirstMate pane is closed", {
+				reasonCode: "firstmate_admission_refused",
+				reason: "pane_closed",
+			});
+		if (input.name !== assignment.name || input.cwd !== assignment.worktree.path)
+			throw new ProtocolError("invalid_params", "this pane may start only its assigned lane and worktree", {
+				reasonCode: "pane_start_outside_assignment",
+				name: input.name,
+				lane: assignment.name,
+				worktree: assignment.worktree.path,
+			});
+		return { assignment, cause: { kind: "assignment" }, text: assignment.mandate.text };
+	}
+	/** The persona a FirstMate attempt reports to: its recorded pane, else the assignment thread. */
+	#workerParent(assignment: FirstmateAssignment): Extract<WorkParent, { kind: "persona" }> {
+		const pane = readLanePane(this.#db, assignment.name);
+		const origin = pane?.childOrigin ?? assignment.thread;
+		return { kind: "persona", originKey: originKey(origin), origin };
+	}
+	/** A recorded pane origin is the worker's parent; the assignment thread stays valid for its own attempts. */
+	#isWorkerParent(runtime: WorkAttemptRuntime, assignment: FirstmateAssignment): boolean {
+		const parent = runtime.parent;
+		if (parent?.kind !== "persona") return false;
+		if (parent.originKey === originKey(assignment.thread)) return true;
+		const pane = readLanePane(this.#db, assignment.name);
+		return pane !== undefined && parent.originKey === originKey(pane.childOrigin);
 	}
 	/** A released or abandoned task takes no follow-up; refused before any session binds. */
 	#assertFollowUpOpen(name: string): void {
@@ -2155,8 +2163,7 @@ export class WorkLaneManager {
 										runtime.sessionId === duplicate.sessionId &&
 										runtime.epoch === duplicate.epoch &&
 										runtime.cwd === assignment.worktree.path &&
-										runtime.parent?.kind === "persona" &&
-										runtime.parent.originKey === originKey(assignment.thread),
+									this.#isWorkerParent(runtime, assignment),
 									"attempt_attribution_changed",
 								);
 							}
@@ -2183,7 +2190,7 @@ export class WorkLaneManager {
 							{ name: assignment.name, text: input.text, cwd: assignment.worktree.path, resume: false },
 							"start",
 							{
-								parent: { kind: "persona", originKey: originKey(assignment.thread), origin: assignment.thread },
+								parent: this.#workerParent(assignment),
 								firstmate: evidence,
 							},
 						);
@@ -2280,24 +2287,25 @@ export class WorkLaneManager {
 			bound || !this.#db.bindings.getSessionRecord(workSessionKey(assignment.name))?.sessionId,
 			"native_session_not_adoptable",
 		);
-		if (bound) {
+		if (bound && job) {
 			firstmateAssert(
-				job &&
-					job.lane.worktreePath === assignment.worktree.path &&
+				job.lane.worktreePath === assignment.worktree.path &&
 					job.lane.branch === assignment.worktree.branch &&
 					job.lane.repository === undefined &&
 					job.lane.repositoryPath === undefined,
 				"lane_binding_changed",
 			);
+		}
+		// A recorded assignment whose pane has not started the lane yet has no job or attempt.
+		const last = bound ? job?.attempts.at(-1) : undefined;
+		if (last) {
 			firstmateAssert(owner.initial(assignment.taskId), "initial_attribution_missing");
-			const last = job.attempts.at(-1);
-			const attribution = last ? owner.attempt(last.opRef) : undefined;
+			const attribution = owner.attempt(last.opRef);
 			firstmateAssert(
-				last &&
-					attribution?.taskId === assignment.taskId &&
-					attribution.jobId === job.jobId &&
+				attribution?.taskId === assignment.taskId &&
+					attribution.jobId === job!.jobId &&
 					attribution.sessionId === last.sessionId &&
-					attribution.ordinal === job.attempts.length - 1,
+					attribution.ordinal === job!.attempts.length - 1,
 				"attempt_lineage_missing",
 			);
 			const runtime = this.#db.work.workAttemptGet(last.opRef);
@@ -2307,8 +2315,7 @@ export class WorkLaneManager {
 						runtime.sessionId === attribution.sessionId &&
 						runtime.epoch === attribution.epoch &&
 						runtime.cwd === assignment.worktree.path &&
-						runtime.parent?.kind === "persona" &&
-						runtime.parent.originKey === originKey(assignment.thread),
+						this.#isWorkerParent(runtime, assignment),
 					"attempt_attribution_changed",
 				);
 			}
@@ -2337,6 +2344,8 @@ export class WorkLaneManager {
 		try {
 			const started = await this.#start(parseInput(params), "run", call);
 			if (!started.started) {
+				// `work.run` never opens a persona: only a start without a session does.
+				workAssert("held" in started);
 				const { started: _, ...held } = started;
 				return held;
 			}
@@ -2359,9 +2368,12 @@ export class WorkLaneManager {
 	}
 	async #start(input: WorkInput, mode: "start" | "run", runCall?: RunCall): Promise<WorkStartResult> {
 		this.#live();
-		this.#db.work.firstmate.assertUnmapped(input.name, input.cwd);
 		const parent = this.#resolveCaller(input, mode);
-		return this.#admit(input.name, () => this.#startAdmitted(input, mode, { parent, runCall }));
+		const firstmate = this.#paneFirstmate(input, mode, parent);
+		if (!firstmate) this.#db.work.firstmate.assertUnmapped(input.name, input.cwd);
+		return this.#admit(input.name, () =>
+			this.#startAdmitted(input, mode, { parent, runCall, ...(firstmate ? { firstmate } : {}) }),
+		);
 	}
 	/**
 	 * The one start admission: a fresh lane is `admitting` until its durable record
@@ -3937,7 +3949,8 @@ export class WorkLaneManager {
 			firstmateAssert(
 				attribution?.taskId === assignment.taskId &&
 					parent?.kind === "persona" &&
-					parent.originKey === originKey(assignment.thread),
+					priorRuntime !== undefined &&
+					this.#isWorkerParent(priorRuntime, assignment),
 				"retry_owner_missing",
 			);
 			firstmateAssert(
@@ -4021,7 +4034,9 @@ export class WorkLaneManager {
 				// FirstMate records which native route carried this outcome; it never chooses another one.
 				const record = (route: "persona" | "fallback") => {
 					if (!assignment) return;
-					workAssert(last && parent.originKey === originKey(assignment.thread));
+					workAssert(
+						last !== undefined && runtime !== undefined && this.#isWorkerParent(runtime, assignment),
+					);
 					const id = route === "persona" ? reportId : deliveryId;
 					this.#db.core.metaSet(
 						checksOutcomePrefix(assignment.taskId) + reportRef,

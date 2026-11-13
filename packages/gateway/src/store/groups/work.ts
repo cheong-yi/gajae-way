@@ -362,9 +362,8 @@ export class FirstmateStore {
 				runtime.laneKey === `work-${binding.name}` &&
 				runtime.cwd === assignment.worktree.path &&
 				runtime.mode !== "historical" &&
+				// The worker reports to a persona: the assignment thread, or the pane persona that started it.
 				runtime.parent?.kind === "persona" &&
-				runtime.parent.originKey === originKey(assignment.thread) &&
-				receiptJson(runtime.parent.origin) === receiptJson(assignment.thread) &&
 				runtime.startedAt === attempt.startedAt &&
 				this.attempt(identity.opRef)?.preparedAt === attempt.startedAt &&
 				runtime.settledAt === attempt.endedAt &&
@@ -645,6 +644,30 @@ export class FirstmateStore {
 		firstmateAssert(assignment.name === name && assignment.taskId === row.task_id, "assignment_corrupt");
 		return assignment;
 	}
+	/**
+	 * Records the immutable assignment before its lane exists, so the pane persona can start the
+	 * worker later with one ordinary `work.start`. Repeated identical records are idempotent.
+	 */
+	recordAssignment(tx: WriteTx, assignment: FirstmateAssignment): void {
+		this.#core.assertActive(tx);
+		this.assertAssignment(assignment);
+		if (this.assignment(assignment.name)) return;
+		this.#db
+			.prepare(
+				"INSERT INTO firstmate_assignments (task_id, lane_name, owner_id, message_id, thread_key, worktree_path, git_dir, assignment_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+			)
+			.run(
+				tx,
+				assignment.taskId,
+				assignment.name,
+				assignment.ownerId,
+				assignment.messageId,
+				originKey(assignment.thread),
+				assignment.worktree.path,
+				assignment.worktree.gitDir,
+				assignmentJson(assignment),
+			);
+	}
 	abandoned(name: string): boolean {
 		return this.#db.prepare("SELECT lane_name FROM firstmate_abandonments WHERE lane_name = ?").get(name) !== null;
 	}
@@ -811,18 +834,17 @@ export class FirstmateStore {
 				record.lane.repositoryPath === undefined,
 			"lane_binding_mismatch",
 		);
-		firstmateAssert(
-			runtime.parent?.kind === "persona" && runtime.parent.originKey === originKey(assignment.thread),
-			"thread_binding_mismatch",
-		);
+		// The worker reports to a persona: the assignment thread, or the pane persona that started it.
+		// The orchestrator binds the exact persona before prepare and re-checks it on settle.
+		firstmateAssert(runtime.parent?.kind === "persona", "thread_binding_mismatch");
 		const assigned = this.assignment(assignment.name);
 		let ordinal = 0;
 		if (cause.kind === "assignment") {
 			firstmateAssert(
 				record.attempts.length === 1 &&
-					!assigned &&
-					!this.initial(assignment.taskId) &&
-					text === assignment.mandate.text,
+				(!assigned || assignmentJson(assigned) === assignmentJson(assignment)) &&
+				!this.initial(assignment.taskId) &&
+				text === assignment.mandate.text,
 				"assignment_already_attempted",
 			);
 		} else {

@@ -1149,7 +1149,8 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					try {
 						const result = await client.workStart(params);
 						console.log(JSON.stringify(result));
-						if (!result.started) process.exitCode = 1;
+						// A persona-opened result is success: the pane's own start creates the lane.
+						if (!result.started && !("personaOpened" in result)) process.exitCode = 1;
 					} catch (error) {
 						refusal(error);
 					} finally {
@@ -1324,8 +1325,9 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 					else if (arg?.startsWith("--")) throw new Error(usage);
 					else textParts.push(arg as string);
 				}
-				const text = textParts.join(" ").trim();
-				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text) throw new Error(usage);
+				// Preserve the text bytes: a mapped FirstMate lane admits its mandate text exactly.
+				const text = textParts.join(" ");
+				if (!name || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name) || !text.trim()) throw new Error(usage);
 				if (base !== undefined && repo === undefined) throw new Error(usage);
 				// This is a caller response-wait budget, never an attempt deadline.
 				// Timeout/disconnect leaves the attempt observable via work.status.
@@ -1350,9 +1352,11 @@ export async function main(args = process.argv.slice(2), options: MainOptions = 
 							console.log(
 								`started: ${result.sessionKey} session=${result.sessionId} job=${result.jobId} op=${result.opRef}`,
 							);
-						} else {
+						} else if ("held" in result) {
 							console.log(`HELD: ${result.reason}\njob: ${result.jobId} state: ${result.state}`);
 							process.exitCode = 1;
+						} else {
+							console.log(`persona opened: ${result.name} task=${result.taskId} worktree=${result.worktree}`);
 						}
 					} else {
 						const result = await client.request<WorkRunResult>("work.run", params);

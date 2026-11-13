@@ -7,6 +7,7 @@ import { eventTypeOrigin, monitorSessionOrigin, type OriginRef, originKey, type 
 import { maybeCreateThreadOnMention, settleDiscordDelivery, UnnamedThreads } from "../../adapter-discord/src/main";
 import { discordMessageOrigin } from "../../adapter-discord/src/origin";
 import type { GatewayConfig } from "../src/config";
+import { saveChildPane } from "../src/orchestrator/firstmate-pane";
 import { type GatewayServer, startUnixServer } from "../src/server/server";
 import { Store } from "../src/store";
 import { resolveLaneReportOrigin, workAttemptDeliveryId } from "../src/store/groups/work";
@@ -362,10 +363,35 @@ test("settled FirstMate lane reports once through the native lane_report wake; t
 			branch: "firstmate/fmreport",
 		},
 	};
-	// The parent persona settles its first turn before the FirstMate lane reports.
-	const persona = await startPersonaTurn(f, origin, "firstmate-parent-trigger");
+	// The FirstMate submission records the assignment and opens the pane persona; no lane exists yet.
+	const opened = await f.client.request("work.start", { firstmate: assignment });
+	expect(opened.error).toBeUndefined();
+	// No adapter is connected here: the assignment is recorded and the pane failure is a visible hold.
+	expect(opened.result).toMatchObject({ started: false, held: true, state: "pane_unavailable" });
+	const paneOrigin: OriginRef = {
+		platform: "discord",
+		kind: "thread",
+		conversationId: "firstmate-pane",
+		parentId: "parent-channel",
+		threadVisibility: "public",
+	};
+	saveChildPane(f.database, {
+		parentOrigin: origin,
+		childOrigin: paneOrigin,
+		taskId: assignment.taskId,
+		laneName: assignment.name,
+		personaOriginKey: originKey(origin),
+		createdByGateway: f.database.instanceId,
+	});
+	// The pane persona settles its first turn before the lane it starts reports.
+	const persona = await startPersonaTurn(f, paneOrigin, "firstmate-pane-trigger");
 	await silencePersona(f, persona.opRef);
-	const start = await f.client.request("work.start", { firstmate: assignment });
+	const start = await f.client.request("work.start", {
+		name: assignment.name,
+		text: assignment.mandate.text,
+		cwd: worktreePath,
+		callerSessionId: persona.sessionId,
+	});
 	expect(start.error).toBeUndefined();
 	expect(start.result.started).toBe(true);
 	const finding = "FM-FINDING chunked surrogate pairs dropped at the flush boundary";
@@ -397,7 +423,13 @@ test("settled FirstMate lane reports once through the native lane_report wake; t
 	});
 	expect(inspected.error).toBeUndefined();
 	expect(inspected.result.evidence).toMatchObject({ completeness: "complete", text: finding });
-	expect(chatMessages(f)).toHaveLength(0);
+	// The finding reaches the pane as a non-final transcript frame, never as a posted answer.
+	expect(
+		chatMessages(f).filter((frame) => frame.payload.text.includes(finding) && frame.payload.final !== false),
+	).toHaveLength(0);
+	expect(
+		chatMessages(f).filter((frame) => frame.payload.text.includes(finding)).every((frame) => frame.payload.noChildFallback === true),
+	).toBe(true);
 	const relay = `Verified finding: ${finding}`;
 	f.port.complete(sends[1]!.opRef, relay);
 	await eventually(
@@ -405,8 +437,8 @@ test("settled FirstMate lane reports once through the native lane_report wake; t
 		(messages) => messages.some((frame) => frame.payload.text === relay),
 		"persona-authored relay of the finding",
 	);
-	expect(chatMessages(f).filter((frame) => frame.payload.text.includes(finding))).toMatchObject([
-		{ payload: { text: relay, origin } },
+	expect(chatMessages(f).filter((frame) => frame.payload.text === relay)).toMatchObject([
+		{ payload: { text: relay, origin: paneOrigin } },
 	]);
 }, 20_000);
 

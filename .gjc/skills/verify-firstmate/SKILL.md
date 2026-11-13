@@ -5,7 +5,7 @@ description: "Drive a FirstMate lane on the Gajaeway test home and prove the pla
 
 # Verify FirstMate
 
-This skill drives the running FirstMate test home the way a mention does. It does not launch a gateway. It does not cover a second product called prewalk. The plan and the switch are one path, and that path is the feature `plan-and-switch`.
+This skill drives the running FirstMate test home the way a mention does. It does not launch a gateway. It does not cover a second product called prewalk. It verifies the order where the secondmate pane opens first and its ordinary work start creates the lane. The plan and the switch are one path, and that path is the feature `plan-and-switch`.
 
 Two speeds. Never mix them.
 
@@ -47,7 +47,9 @@ This proves the doctor and the disposable repository. It does not prove a lane.
 
 The map is `features/README.md`. Drive one feature file at a time. A pass on one file does not cover the others.
 
-The only feature with a passing run behind it is `features/plan-and-switch.md`. Drive that file to prove this skill. The other files are real journeys. They are uncovered until a run follows them and their own evidence command passes. Do not report them as verified from the plan-and-switch run.
+No feature has a passing run behind the current order. Every file is uncovered until a run follows it and its own evidence command passes. Do not report one file as verified from another file's run.
+
+The current order: `gajaeway work start --firstmate FILE` records the assignment and opens the task's secondmate pane. It creates no lane and no session. That secondmate's ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. A pane that does not open is a held result. Do not treat the submission as a started lane.
 
 The mention in that file can be posted by an operator bot into channel `1511208447939706972`. That post is a stand-in for a human mention. Do not print the bot credential. A human mention remains unverified until a person posts one.
 

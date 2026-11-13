@@ -28,6 +28,7 @@ import { ACK_TIMEOUT_MS, DeliveryService } from "../src/delivery/delivery";
 import { initializeMemory, memoryGit, memoryRoot } from "../src/memory/doctrine";
 import { MonitorRegistry } from "../src/monitors/registry";
 import * as ghChecks from "../src/orchestrator/gh-checks";
+import { readLanePane } from "../src/orchestrator/firstmate-pane";
 import { ModelNotSelectedError } from "../src/orchestrator/session-port";
 import { deterministicTerminalDeliveryId } from "../src/orchestrator/tail-runner";
 import { WorkLaneManager } from "../src/orchestrator/work-lane";
@@ -278,8 +279,14 @@ test("FirstMate work.retire dispatch holds a steered native report until its par
 	attachTestBrokerOwnership(database, port, join(directory, "agent"));
 	const checks = spyOn(ghChecks, "ghCheckStatusClient").mockReturnValue({ getCheckStatus: async () => null });
 	let client: Awaited<ReturnType<typeof connect>> | undefined;
+	let adapter: GajaewayClient | undefined;
 	try {
 		server = await startUnixServer({ config, database, sessionPort: port, onStop: () => database.close() });
+		adapter = await GajaewayClient.connectSocket(config.socketPath, { clientName: "adapter-discord" });
+		adapter.on("discord.thread.open", (value) => {
+			const request = value as { requestId: string };
+			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: "closeout-pane" });
+		});
 		client = await connect(config.socketPath);
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
 		await waitFor(client.frames, 1);
@@ -291,7 +298,7 @@ test("FirstMate work.retire dispatch holds a steered native report until its par
 			return frame.result;
 		};
 		const until = async (predicate: () => boolean) => {
-			for (let index = 0; index < 400 && !predicate(); index++) await Bun.sleep(5);
+			for (let index = 0; index < 800 && !predicate(); index++) await Bun.sleep(5);
 			expect(predicate()).toBe(true);
 		};
 		const parent = originKey(assignment.thread);
@@ -302,24 +309,44 @@ test("FirstMate work.retire dispatch holds a steered native report until its par
 			engagement: { mentioned: true, group: true, authorId: assignment.ownerId },
 		});
 		await until(() => port.sends.some((send) => send.text.includes("Unrelated parent turn")));
-		const parentSend = port.sends.find((send) => send.text.includes("Unrelated parent turn"))!;
-		const start = await request("start", "work.start", { firstmate: assignment });
+		port.complete(
+			port.sends.find((send) => send.text.includes("Unrelated parent turn"))!.opRef,
+			"[SILENT]",
+		);
+		// The submission opens the secondmate pane; no lane exists yet.
+		const opened = await request("start", "work.start", { firstmate: assignment });
+		expect(opened).toMatchObject({ started: false, personaOpened: true, name: "closeout" });
+		const pane = readLanePane(database, assignment.name)!;
+		expect(pane).toBeDefined();
+		const paneKey = originKey(pane.childOrigin);
+		await until(() => Boolean(database.bindings.getSessionRecord(paneKey)?.sessionId));
+		const paneSend = port.sends.find(
+			(send) => send.sessionId === database.bindings.getSessionRecord(paneKey)?.sessionId,
+		)!;
+		// The secondmate's own ordinary start creates the lane, with the pane as its parent.
+		const start = await request("pane-start", "work.start", {
+			name: assignment.name,
+			text: assignment.mandate.text,
+			cwd: path,
+			callerSessionId: paneSend.sessionId,
+		});
 		expect(start.started).toBe(true);
+		expect(database.work.workAttemptGet(start.opRef)?.parent).toMatchObject({ kind: "persona", originKey: paneKey });
 		port.complete(start.opRef, "Scoped local result");
 		await until(() => Boolean(database.work.workAttemptGet(start.opRef)?.settledAt));
 		await port.runExclusive(start.sessionKey, async () => {});
 		const runtime = database.work.workAttemptGet(start.opRef)!;
 		expect(runtime.decision).toBe("reported");
-		expect(database.inbox.messageDisposition(parent, runtime.reportId)?.message).toMatchObject({
+		expect(database.inbox.messageDisposition(paneKey, runtime.reportId)?.message).toMatchObject({
 			message_id: runtime.reportId,
-			origin_key: parent,
+			origin_key: paneKey,
 			source: "lane_report",
 		});
 		expect(database.outbox.get(runtime.deliveryId)).toBeUndefined();
-		// The reported lane outcome is steered into the busy parent turn, not posted as a separate answer.
+		// The reported lane outcome is steered into the busy secondmate turn, not posted as an answer.
 		await until(() => port.steers.length === 1);
-		expect(port.steers[0]).toMatchObject({ sessionId: parentSend.sessionId });
-		expect(port.steers[0]!.text).toContain(database.inbox.messageDisposition(parent, runtime.reportId)!.message.body);
+		expect(port.steers[0]).toMatchObject({ sessionId: paneSend.sessionId });
+		expect(port.steers[0]!.text).toContain(database.inbox.messageDisposition(paneKey, runtime.reportId)!.message.body);
 		const observed = await request("inspect", "work.inspect", {
 			name: assignment.name,
 			taskId: assignment.taskId,
@@ -351,22 +378,21 @@ test("FirstMate work.retire dispatch holds a steered native report until its par
 			},
 		};
 		// Steer acceptance marks the report row done, but the parent turn that received it is still running.
-		expect(database.inbox.messageDisposition(parent, runtime.reportId)?.message).toMatchObject({
+		expect(database.inbox.messageDisposition(paneKey, runtime.reportId)?.message).toMatchObject({
 			state: "done",
 			turn_role: "steer",
-			turn_op_ref: parentSend.opRef,
+			turn_op_ref: paneSend.opRef,
 		});
-		expect(database.inbox.reportConsumed(parent, runtime.reportId)).toBe(false);
+		expect(database.inbox.reportConsumed(paneKey, runtime.reportId)).toBe(false);
 		expect(await request("retire-held", "work.retire", retire)).toMatchObject({
 			retired: false,
 			obligations: [{ id: runtime.reportId, reason: "report_unconsumed" }],
 		});
 		expect(port.closes).toHaveLength(0);
 		expect(database.work.firstmate.releaseForAttempt(start.opRef)).toBeUndefined();
-		// The parent turn finishing is the native consumption; no separate outcome post is owed.
-		port.complete(parentSend.opRef, "Unrelated parent reply");
-		await until(() => database.inbox.messageDisposition(parent, "parent-message")?.message.turn_state === "done");
-		expect(database.inbox.reportConsumed(parent, runtime.reportId)).toBe(true);
+		// The secondmate turn finishing is the native consumption; no separate outcome post is owed.
+		port.complete(paneSend.opRef, "Secondmate absorbed the outcome.");
+		await until(() => database.inbox.reportConsumed(paneKey, runtime.reportId));
 		const recover = spyOn(WorkLaneManager.prototype, "recover");
 		const dispatch = spyOn(WorkLaneManager.prototype, "retireFirstmate");
 		try {
@@ -379,11 +405,16 @@ test("FirstMate work.retire dispatch holds a steered native report until its par
 			dispatch.mockRestore();
 			recover.mockRestore();
 		}
-		expect(port.closes).toHaveLength(1);
+		// The release closes the lane and the secondmate pane it belonged to.
+		expect(port.closes).toHaveLength(2);
+		expect(port.closes.map((close) => close.sessionId)).toEqual(
+			expect.arrayContaining([start.sessionId, paneSend.sessionId]),
+		);
 		expect(database.work.firstmate.releaseForAttempt(start.opRef)).toBeDefined();
 		expect(git("-C", path, "rev-parse", "--abbrev-ref", "HEAD")).toBe(assignment.worktree.branch);
 	} finally {
 		client?.close();
+		await adapter?.close();
 		checks.mockRestore();
 	}
 });
@@ -462,7 +493,11 @@ for (const { output, state, unavailable } of [
 			onBind: (input) => bindWorkFixture(input.originKey, input.epoch),
 			onSend: (input, scripted) => {
 				// Persona opening/reports are auto-answered; worker settlement is explicitly scripted below.
-				if (input.text.includes(parentOpening) || input.text.includes("[Internal report from another Gajae session"))
+				if (
+					input.text.includes(parentOpening) ||
+					input.text.includes("[Internal report from another Gajae session") ||
+					input.text.includes("The pane for FirstMate lane")
+				)
 					scripted.complete(input.opRef, "[SILENT]");
 				if (input.text === "ordinary run") scripted.complete(input.opRef, "ordinary result");
 			},
@@ -479,6 +514,17 @@ for (const { output, state, unavailable } of [
 		};
 		const checksFactory = spyOn(ghChecks, "ghCheckStatusClient").mockReturnValue(checks);
 		server = await startUnixServer({ config, database, sessionPort: port });
+		// The in-process adapter answers the gateway's pane-open request; nothing reaches Discord.
+		let adapter: GajaewayClient | undefined;
+		let paneThreads = 0;
+		const connectAdapter = async () => {
+			adapter = await GajaewayClient.connectSocket(config.socketPath, { clientName: "adapter-discord" });
+			adapter.on("discord.thread.open", (value) => {
+				const request = value as { requestId: string };
+				void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: `wire-pane-${++paneThreads}` });
+			});
+		};
+		await connectAdapter();
 		let sdk = await GajaewayClient.connectSocket(config.socketPath);
 		const cli = async (...args: string[]) => {
 			const process = Bun.spawn(
@@ -542,10 +588,48 @@ for (const { output, state, unavailable } of [
 			}
 			expect(submitted.stderr).toBe("");
 			expect(submitted.code).toBe(0);
-			const start: WorkStartResult = JSON.parse(submitted.stdout);
-			if (!start.started) throw new Error("unexpected initial hold");
+			const openedResult: WorkStartResult = JSON.parse(submitted.stdout);
+			expect(openedResult).toMatchObject({
+				started: false,
+				personaOpened: true,
+				name: assignment.name,
+				taskId: assignment.taskId,
+				worktree: path,
+			});
 			const owner = database.work.firstmate;
 			expect(owner.assignment(assignment.name)).toEqual(assignment);
+			expect(owner.initial(assignment.taskId)).toBeUndefined();
+			// The secondmate's ordinary start creates the lane, with the pane as its parent.
+			const pane = readLanePane(database, assignment.name)!;
+			expect(pane).toBeDefined();
+			const paneKey = originKey(pane.childOrigin);
+			await until(() => Boolean(database.bindings.getSessionRecord(paneKey)?.sessionId));
+			await port.runExclusive(paneKey, async () => {});
+			const start = await sdk.workStart({
+				name: assignment.name,
+				text: assignment.mandate.text,
+				cwd: path,
+				callerSessionId: database.bindings.getSessionRecord(paneKey)!.sessionId,
+			});
+			if (!start.started) throw new Error("unexpected initial hold");
+			/** Opens a second assignment's pane and lets that pane create its lane. */
+			const startPinnedPane = async (candidate: WorkFirstmateAssignmentParams) => {
+				const paneOpen = await sdk.workStart({ firstmate: candidate });
+				expect(paneOpen).toMatchObject({ started: false, personaOpened: true, name: candidate.name });
+				const recorded = readLanePane(database, candidate.name)!;
+				expect(recorded).toBeDefined();
+				const key = originKey(recorded.childOrigin);
+				await until(() => Boolean(database.bindings.getSessionRecord(key)?.sessionId));
+				await port.runExclusive(key, async () => {});
+				const started = await sdk.workStart({
+					name: candidate.name,
+					text: candidate.mandate.text,
+					cwd: candidate.worktree.path,
+					callerSessionId: database.bindings.getSessionRecord(key)!.sessionId,
+				});
+				if (!started.started) throw new Error(`unexpected ${candidate.name} hold`);
+				return { started, paneKey: key, paneSessionId: database.bindings.getSessionRecord(key)!.sessionId };
+			};
 			expect(owner.initial(assignment.taskId)).toMatchObject({
 				taskId: assignment.taskId,
 				jobId: start.jobId,
@@ -559,12 +643,16 @@ for (const { output, state, unavailable } of [
 				text: assignment.mandate.text,
 				repo: path,
 			});
-			expect(database.work.workAttemptGet(start.opRef)?.parent).toEqual({
+			expect(database.work.workAttemptGet(start.opRef)?.parent).toMatchObject({
 				kind: "persona",
-				originKey: originKey(assignment.thread),
-				origin: assignment.thread,
+				originKey: paneKey,
 			});
-			expect(await sdk.workStart({ firstmate: assignment })).toEqual(start);
+			// A repeated submission opens no new pane and creates no second lane.
+			expect(await sdk.workStart({ firstmate: assignment })).toMatchObject({
+				started: false,
+				personaOpened: true,
+				name: assignment.name,
+			});
 			expect(port.sendAttempts.filter((send) => send.opRef === start.opRef)).toHaveLength(1);
 			const selectors = { name: assignment.name, taskId: assignment.taskId, opRef: start.opRef };
 			const inspectArgs = ["inspect", assignment.name, "--task", assignment.taskId, "--op", start.opRef];
@@ -668,31 +756,27 @@ for (const { output, state, unavailable } of [
 			const initialRuntime = database.work.workAttemptGet(start.opRef)!;
 			// One native persona report; nothing is posted beside it.
 			expect(database.outbox.get(initialRuntime.deliveryId)).toBeUndefined();
-			const initialReport = database.inbox.messageDisposition(originKey(assignment.thread), initialRuntime.reportId);
+			const initialReport = database.inbox.messageDisposition(paneKey, initialRuntime.reportId);
 			expect(initialReport?.message).toMatchObject({
 				message_id: initialRuntime.reportId,
-				origin_key: originKey(assignment.thread),
+				origin_key: paneKey,
 				source: "lane_report",
 			});
-			// The idle parent persona is woken once with the reported outcome; settle that turn before read-only checks.
+			// The idle secondmate is woken once with the reported outcome; settle that turn before read-only checks.
 			await until(() => port.sends.some((send) => send.text.includes(initialReport!.message.body)));
 			const reportWake = port.sends.filter((send) => send.text.includes(initialReport!.message.body));
 			expect(reportWake).toHaveLength(1);
 			expect(reportWake[0]!.text).toContain("[Internal report from another Gajae session");
-			expect(reportWake[0]!.sessionId).toBe(
-				database.bindings.getSessionRecord(originKey(assignment.thread))!.sessionId,
-			);
-			port.complete(reportWake[0]!.opRef, "Parent absorbed the report.");
+			expect(reportWake[0]!.sessionId).toBe(database.bindings.getSessionRecord(paneKey)!.sessionId);
+			port.complete(reportWake[0]!.opRef, "Secondmate absorbed the report.");
 			await until(
-				() =>
-					database.inbox.messageDisposition(originKey(assignment.thread), initialRuntime.reportId)?.message.state ===
-					"done",
+				() => database.inbox.messageDisposition(paneKey, initialRuntime.reportId)?.message.state === "done",
 			);
-			await port.runExclusive(originKey(assignment.thread), async () => {});
-			// A checks outcome is also one native persona report; the parent absorbs it like any lane_report.
+			await port.runExclusive(paneKey, async () => {});
+			// A checks outcome is also one native persona report; the secondmate absorbs it like any lane_report.
 			let checksWakes = 0;
 			const absorbChecksReports = async () => {
-				const parentKey = originKey(assignment.thread);
+				const parentKey = paneKey;
 				const open = () =>
 					sql()
 						.prepare(
@@ -720,7 +804,7 @@ for (const { output, state, unavailable } of [
 			const confirmOutcomes = () =>
 				database.transaction((tx) => {
 					for (const row of database.outbox.rows())
-						if (row.origin_key === originKey(assignment.thread) && row.state !== "confirmed")
+						if (row.origin_key === paneKey && row.state !== "confirmed")
 							database.outbox.confirm(tx, row.delivery_id);
 				});
 			confirmOutcomes();
@@ -1062,10 +1146,7 @@ for (const { output, state, unavailable } of [
 			const originalJob = job();
 			// The original outcome went only to the persona inbox; nothing was posted beside it.
 			expect(database.outbox.get(originalRuntime.deliveryId)).toBeUndefined();
-			const originalReport = database.inbox.messageDisposition(
-				originKey(assignment.thread),
-				originalRuntime.reportId,
-			)?.message;
+			const originalReport = database.inbox.messageDisposition(paneKey, originalRuntime.reportId)?.message;
 			expect(originalReport?.body).toContain(`--op ${start.opRef}`);
 			const correctionFile = join(directory, "correction.json");
 			await writeFile(correctionFile, JSON.stringify(correction));
@@ -1141,35 +1222,29 @@ for (const { output, state, unavailable } of [
 			expect(correctedRuntime.reportId).not.toBe(originalRuntime.reportId);
 			expect(database.outbox.get(correctedRuntime.deliveryId)).toBeUndefined();
 			expect(correctedRuntime.decision).toBe("reported");
-			const correctedReport = database.inbox.messageDisposition(
-				originKey(assignment.thread),
-				correctedRuntime.reportId,
-			);
+			const correctedReport = database.inbox.messageDisposition(paneKey, correctedRuntime.reportId);
 			expect(correctedReport?.message).toMatchObject({
 				message_id: correctedRuntime.reportId,
-				origin_key: originKey(assignment.thread),
+				origin_key: paneKey,
 				source: "lane_report",
 			});
 			await until(() => port.sends.some((send) => send.text.includes(correctedReport!.message.body)));
 			const correctedWake = port.sends.filter((send) => send.text.includes(correctedReport!.message.body));
 			expect(correctedWake).toHaveLength(1);
 			expect(correctedWake[0]!.opRef).not.toBe(reportWake[0]!.opRef);
-			port.complete(correctedWake[0]!.opRef, "Parent absorbed the corrected report.");
+			port.complete(correctedWake[0]!.opRef, "Secondmate absorbed the corrected report.");
 			await until(
-				() =>
-					database.inbox.messageDisposition(originKey(assignment.thread), correctedRuntime.reportId)?.message.state ===
-					"done",
+				() => database.inbox.messageDisposition(paneKey, correctedRuntime.reportId)?.message.state === "done",
 			);
-			await port.runExclusive(originKey(assignment.thread), async () => {});
+			await port.runExclusive(paneKey, async () => {});
 			await absorbChecksReports();
+			// The opening kickoff is one internal report. It is not a chat message from the assignment author.
 			expect(
 				port.sends.filter((send) => send.text.includes("[Internal report from another Gajae session")),
-			).toHaveLength(2 + checksWakes);
+			).toHaveLength(3 + checksWakes);
 			confirmOutcomes();
 			expect(database.outbox.get(originalRuntime.deliveryId)).toBeUndefined();
-			expect(
-				database.inbox.messageDisposition(originKey(assignment.thread), originalRuntime.reportId)?.message,
-			).toEqual(originalReport);
+			expect(database.inbox.messageDisposition(paneKey, originalRuntime.reportId)?.message).toEqual(originalReport);
 			expect(database.work.workAttemptGet(start.opRef)).toEqual(originalRuntime);
 			expect(owner.initial(assignment.taskId)).toEqual(originalAttribution);
 			expect(await observe(() => sdk.workInspect(selectors))).toEqual(retained);
@@ -1425,7 +1500,11 @@ for (const { output, state, unavailable } of [
 			expect(JSON.parse(conflictCli.stdout)).toMatchObject({ recorded: false, held: true });
 			expect(sql().prepare("SELECT * FROM firstmate_approvals").all()).toHaveLength(1);
 			expect(await noEffects(() => sdk.workStart({ firstmateCorrection: correction }))).toEqual(corrected);
-			expect(await noEffects(() => sdk.workStart({ firstmate: assignment }))).toEqual(start);
+			expect(await noEffects(() => sdk.workStart({ firstmate: assignment }))).toMatchObject({
+				started: false,
+				personaOpened: true,
+				name: assignment.name,
+			});
 			await refuse({ ...correction, messageId: "stale-after-result" }, "correction_predecessor_not_settled");
 			expect(port.sendAttempts.filter((send) => send.opRef === corrected.opRef)).toHaveLength(1);
 			// Cross-task refusal needs a genuine, settled identity, not an uncertain
@@ -1444,31 +1523,11 @@ for (const { output, state, unavailable } of [
 					branch: "firstmate/independent",
 				},
 			};
-			const independentParentKey = originKey(independentAssignment.thread);
-			expect(independentParentKey).not.toBe(originKey(assignment.thread));
-			expect(
-				await sdk.request("chat.send", {
-					origin: independentAssignment.thread,
-					messageId: independentAssignment.messageId,
-					text: parentOpening,
-					engagement: { mentioned: true, group: true, authorId: independentAssignment.ownerId },
-				}),
-			).toMatchObject({ engaged: true });
-			await until(() =>
-				Boolean(
-					sql()
-						.prepare("SELECT 1 FROM inbound_messages WHERE message_id = ? AND origin_key = ? AND state = 'done'")
-						.get(independentAssignment.messageId, independentParentKey),
-				),
-			);
-			await port.runExclusive(independentParentKey, async () => {});
-			const independentParentSession = database.bindings.getSessionRecord(independentParentKey)?.sessionId;
-			expect(independentParentSession).toBeDefined();
-			expect(independentParentSession).not.toBe(
-				database.bindings.getSessionRecord(originKey(assignment.thread))?.sessionId,
-			);
-			const independent = await sdk.workStart({ firstmate: independentAssignment });
-			if (!independent.started) throw new Error("independent task unexpectedly held");
+			const independentPinned = await startPinnedPane(independentAssignment);
+			const independent = independentPinned.started;
+			const independentParentKey = independentPinned.paneKey;
+			const independentParentSession = independentPinned.paneSessionId;
+			expect(independentParentKey).not.toBe(paneKey);
 			port.complete(independent.opRef, "independent task result");
 			await until(() => Boolean(database.work.workAttemptGet(independent.opRef)?.settledAt));
 			await port.runExclusive(independent.sessionKey, async () => {});
@@ -1567,6 +1626,7 @@ for (const { output, state, unavailable } of [
 			});
 			try {
 				server = await startUnixServer({ config, database, sessionPort: restartedPort });
+				await connectAdapter();
 				await Promise.all(startupRecoveries);
 			} finally {
 				startupRecovery.mockRestore();
@@ -1586,7 +1646,11 @@ for (const { output, state, unavailable } of [
 			expect(await sdk.workInspect(selectors)).toEqual(retained);
 			expect(restartedPort.sends).toHaveLength(0);
 			expect(restartedPort.workerOutputReads).toHaveLength(0);
-			expect(await sdk.workStart({ firstmate: assignment })).toEqual(start);
+			expect(await sdk.workStart({ firstmate: assignment })).toMatchObject({
+				started: false,
+				personaOpened: true,
+				name: assignment.name,
+			});
 			expect(await sdk.workStart({ firstmateCorrection: correction })).toEqual(corrected);
 			expect(await sdk.workInspect(correctedSelectors)).toEqual(second);
 			expect(restartedPort.sends).toHaveLength(0);
@@ -1607,24 +1671,43 @@ for (const { output, state, unavailable } of [
 					branch: "firstmate/held",
 				},
 			};
+			const heldOpen = await sdk.workStart({ firstmate: heldAssignment });
+			expect(heldOpen).toMatchObject({ started: false, personaOpened: true, name: "held" });
+			const heldPane = readLanePane(database, "held")!;
+			const heldPaneKey = originKey(heldPane.childOrigin);
+			await until(() => Boolean(database.bindings.getSessionRecord(heldPaneKey)?.sessionId));
+			const heldSessionId = database.bindings.getSessionRecord(heldPaneKey)!.sessionId;
+			const sendsBeforeHeld = restartedPort.sendAttempts.length;
 			restartedPort.send = async (input) => {
 				restartedPort.sendAttempts.push(input);
 				throw new Error("scripted lost acceptance receipt");
 			};
-			await expect(sdk.workStart({ firstmate: heldAssignment })).rejects.toMatchObject({
-				detail: { reasonCode: "send_acceptance_uncertain" },
-			});
+			// The secondmate's own start loses its receipt; the attempt stays uncertain.
+			await expect(
+				sdk.workStart({
+					name: "held",
+					text: heldAssignment.mandate.text,
+					cwd: heldPath,
+					callerSessionId: heldSessionId,
+				}),
+			).rejects.toMatchObject({ detail: { reasonCode: "send_acceptance_uncertain" } });
 			const heldInitial = database.work.firstmate.initial(heldAssignment.taskId)!;
 			const heldFile = join(directory, "held.json");
 			await writeFile(heldFile, JSON.stringify(heldAssignment));
+			// Repeating the submission opens no second pane and creates no lane.
 			const heldCli = await cli("start", "--firstmate", heldFile);
-			expect(heldCli.code).not.toBe(0);
-			const held: WorkStartResult = JSON.parse(heldCli.stdout);
-			expect(held).toMatchObject({ started: false, held: true, jobId: heldInitial.jobId });
-			if (held.started) throw new Error("uncertain attempt was replayed");
-			expect(held.reason).toContain(heldInitial.opRef);
-			expect(await sdk.workStart({ firstmate: heldAssignment })).toEqual(held);
-			expect(restartedPort.sendAttempts).toHaveLength(1);
+			expect(heldCli.code).toBe(0);
+			const heldOpenedAgain: WorkStartResult = JSON.parse(heldCli.stdout);
+			expect(heldOpenedAgain).toMatchObject({ started: false, personaOpened: true, name: "held" });
+			await expect(
+				sdk.workStart({
+					name: "held",
+					text: heldAssignment.mandate.text,
+					cwd: heldPath,
+					callerSessionId: heldSessionId,
+				}),
+			).rejects.toMatchObject({ detail: { reasonCode: "attempt_open", opRef: heldInitial.opRef } });
+			expect(restartedPort.sendAttempts.length - sendsBeforeHeld).toBe(1);
 			expect(database.work.firstmate.initial(heldAssignment.taskId)).toEqual(heldInitial);
 			const lostCorrection = { ...correction, messageId: "lost-correction", priorOpRef: corrected.opRef };
 			const lostFile = join(directory, "lost-correction.json");
@@ -1665,7 +1748,7 @@ for (const { output, state, unavailable } of [
 			expect(lostCli.code).not.toBe(0);
 			const lost: WorkStartResult = JSON.parse(lostCli.stdout);
 			expect(lost).toMatchObject({ started: false, held: true, jobId: start.jobId });
-			if (lost.started) throw new Error("lost correction acceptance was replayed");
+			if (lost.started || !("held" in lost)) throw new Error("lost correction acceptance was replayed");
 			expect(lost.reason).toContain(uncertain.opRef);
 			expect(await noEffects(() => sdk.workStart({ firstmateCorrection: lostCorrection }), restartedPort)).toEqual(
 				lost,
@@ -1725,7 +1808,11 @@ for (const { output, state, unavailable } of [
 			expect(restartCli.code).not.toBe(0);
 			expect(JSON.parse(restartCli.stdout)).toEqual(heldAfterRestart);
 			expect(await sdk.workStart({ firstmateCorrection: correction })).toEqual(corrected);
-			expect(await sdk.workStart({ firstmate: assignment })).toEqual(start);
+			expect(await sdk.workStart({ firstmate: assignment })).toMatchObject({
+				started: false,
+				personaOpened: true,
+				name: assignment.name,
+			});
 			expect(finalPort.sendAttempts).toHaveLength(0);
 			expect(finalPort.binds).toHaveLength(0);
 			expect(database.work.firstmate.attempt(uncertain.opRef)).toEqual(uncertainAttribution);

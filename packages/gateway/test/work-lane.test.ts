@@ -602,6 +602,83 @@ async function firstmateFixture(options: Partial<WorkLaneManagerOptions> = {}) {
 }
 
 /**
+ * The settled order: `--firstmate` records the assignment and opens the pane persona; that pane's
+ * own ordinary start creates the lane. Unit tests drive both halves directly.
+ */
+function workerPane(assignment: FirstmateAssignment): {
+	parentOrigin: OriginRef;
+	childOrigin: OriginRef;
+	taskId: string;
+	laneName: string;
+	personaOriginKey: string;
+} {
+	return {
+		parentOrigin: assignment.thread,
+		childOrigin: {
+			platform: "discord",
+			kind: "thread",
+			conversationId: `pane-${assignment.name}`,
+			...(assignment.thread.kind === "thread" && assignment.thread.parentId
+				? { parentId: assignment.thread.parentId }
+				: {}),
+			threadVisibility: "public",
+		},
+		taskId: assignment.taskId,
+		laneName: assignment.name,
+		personaOriginKey: originKey(assignment.thread),
+	};
+}
+
+function workerParent(assignment: FirstmateAssignment): OriginRef {
+	return workerPane(assignment).childOrigin;
+}
+
+function workerParentKey(assignment: FirstmateAssignment): string {
+	return originKey(workerParent(assignment));
+}
+
+/** The pane persona is gone: the outcome must take its fallback delivery. */
+function unbindWorkerParent(f: Awaited<ReturnType<typeof firstmateFixture>>, assignment: FirstmateAssignment) {
+	const raw = new Database(join(f.directory, "gateway.db"));
+	try {
+		raw.query("DELETE FROM sessions WHERE origin_key = ?").run(workerParentKey(assignment));
+	} finally {
+		raw.close();
+	}
+}
+
+async function beginWorker(
+	f: Awaited<ReturnType<typeof firstmateFixture>>,
+	assignment: FirstmateAssignment = f.assignment,
+): Promise<WorkStartResult> {
+	const opened = await f.manager.startFirstmate(assignment);
+	expect(opened).toMatchObject({ started: false, personaOpened: true, name: assignment.name });
+	const pane = { ...workerPane(assignment), createdByGateway: f.db.instanceId };
+	if (readLanePane(f.db, assignment.name) === undefined) saveChildPane(f.db, pane);
+	const sessionId = f.db.bindings.getSessionRecord(originKey(pane.childOrigin))?.sessionId || crypto.randomUUID();
+	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(pane.childOrigin), sessionId));
+	return await f.manager.start({
+		name: assignment.name,
+		text: assignment.mandate.text,
+		cwd: assignment.worktree.path,
+		resume: false,
+		callerSessionId: sessionId,
+	});
+}
+
+async function startWorker(
+	f: Awaited<ReturnType<typeof firstmateFixture>>,
+	assignment: FirstmateAssignment = f.assignment,
+): Promise<Extract<WorkStartResult, { started: true }>> {
+	const started = await beginWorker(f, assignment);
+	if (!started.started) {
+		if ("held" in started) throw new Error(started.reason);
+		throw new Error("the persona opened but no lane was created");
+	}
+	return started;
+}
+
+/**
  * Measure only the request: setup/recovery and observer settlement belong outside this window.
  * Open-attempt duplicates run immediately in the same microtask turn, without a timer/I/O yield.
  */
@@ -715,14 +792,14 @@ async function approvalInput(
 	};
 }
 
-/** `personaBound` decides the native report route: the persona inbox, or its fallback delivery. */
+/** `personaBound` decides the native report route: the pane persona inbox, or its fallback delivery. */
 async function approvalFixture(text = "done", unavailable = false, personaBound = true) {
 	const f = await firstmateFixture();
 	if (personaBound)
 		f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(f.assignment.thread), crypto.randomUUID()));
 	Object.assign(f.assignment.mandate, { checkRetries: false });
-	const start = await f.manager.startFirstmate(f.assignment);
-	if (!start.started) throw new Error("unexpected hold");
+	const start = await startWorker(f);
+	if (!personaBound) unbindWorkerParent(f, f.assignment);
 	if (unavailable) f.port.fetchWorkerOutput = async () => ({ status: "unavailable", code: "output_unavailable" });
 	f.port.complete(start.opRef, text);
 	await until(() => Boolean(f.db.work.workAttemptGet(start.opRef)?.settledAt));
@@ -733,26 +810,10 @@ async function approvalFixture(text = "done", unavailable = false, personaBound 
 async function paneFixture(options: Partial<WorkLaneManagerOptions> = {}) {
 	const f = await firstmateFixture(options);
 	Object.assign(f.assignment.mandate, { checkRetries: false });
-	const start = await f.manager.startFirstmate(f.assignment);
-	if (!start.started) throw new Error("unexpected hold");
-	const childOrigin: OriginRef = {
-		platform: "discord",
-		kind: "thread",
-		conversationId: "pane-child",
-		parentId: "cockpit",
-		threadVisibility: "public",
-	};
-	const pane = {
-		parentOrigin: f.assignment.thread,
-		childOrigin,
-		taskId: f.assignment.taskId,
-		laneName: f.assignment.name,
-		personaOriginKey: originKey(f.assignment.thread),
-		createdByGateway: f.db.instanceId,
-	};
-	saveChildPane(f.db, pane);
+	const start = await startWorker(f);
+	const pane = { ...workerPane(f.assignment), createdByGateway: f.db.instanceId };
 	const input = {
-		origin: childOrigin,
+		origin: pane.childOrigin,
 		messageId: "child-human",
 		text: "Adjust the empty-input branch.",
 		authorIsBot: false,
@@ -781,26 +842,32 @@ for (const checkRetries of [false, true]) {
 				branch: "firstmate/b",
 			},
 		};
-		const start = await f.manager.startFirstmate(assignment);
-		if (!start.started) throw new Error("unexpected hold");
+		const start = await startWorker(f, assignment);
 		expect(f.owner.assignment("a")).toEqual(f.assignment);
 		expect(f.owner.assignment("b")).toEqual(assignment);
+		// Lane a reports to its own pane persona, not to the assignment thread.
 		await settleFirstmateSetup(f, f.start.opRef);
 		const ordinary = f.db.work.workAttemptGet(f.start.opRef)!;
-		expect(JSON.parse(f.db.outbox.get(ordinary.deliveryId)!.payloadJson)).not.toHaveProperty("noChildFallback");
+		expect(ordinary.decision).toBe("reported");
+		expect(f.db.outbox.get(ordinary.deliveryId)).toBeUndefined();
+		expect(f.db.inbox.messageDisposition(originKey(f.pane.childOrigin), ordinary.reportId)).toBeDefined();
+		// Lane b reports to its pane, which is a child of lane a's pane: its fallback keeps the flag.
+		unbindWorkerParent(f, assignment);
 		await settleFirstmateSetup(f, start.opRef);
 		const nested = f.db.work.workAttemptGet(start.opRef)!;
-		expect(JSON.parse(f.db.outbox.get(nested.deliveryId)!.payloadJson)).toMatchObject({
-			origin: f.pane.childOrigin,
-			noChildFallback: true,
-		});
+		expect(nested.decision).toBe("fallback");
+		const nestedPayload = JSON.parse(f.db.outbox.get(nested.deliveryId)!.payloadJson);
+		expect(nestedPayload).toMatchObject({ noChildFallback: true });
+		expect(originKey(nestedPayload.origin)).toBe(originKey(workerPane(assignment).childOrigin));
 		if (checkRetries) {
 			expect(f.job("b").state).toBe("awaiting_checks");
 			checks.set({ prNumber: 620, status: "green", failingChecks: [] });
 			await pollUntil(f, () => f.job("b").state === "done");
 			const outcome = f.db.outbox.rows().find((row) => JSON.parse(row.payload_json).text.includes("checks=passed"));
 			expect(outcome).toBeDefined();
-			expect(JSON.parse(outcome!.payload_json)).toMatchObject({ origin: f.pane.childOrigin, noChildFallback: true });
+			const outcomePayload = JSON.parse(outcome!.payload_json);
+			expect(outcomePayload).toMatchObject({ noChildFallback: true });
+			expect(originKey(outcomePayload.origin)).toBe(originKey(workerPane(assignment).childOrigin));
 		}
 	});
 }
@@ -877,10 +944,10 @@ test("pane silent terminal retains native silence evidence and posts nothing bes
 	expect(runtime.output.knownSilence).not.toBeNull();
 	expect(runtime.decision).toBe("suppressed");
 	expect(f.db.outbox.get(runtime.deliveryId)).toBeUndefined();
-	expect(f.db.outbox.rows().filter((row) => row.origin_key === originKey(f.assignment.thread))).toEqual([]);
+	expect(f.db.outbox.rows().filter((row) => row.origin_key === workerParentKey(f.assignment))).toEqual([]);
 	// The settled result is still the one answer an owner approval may resolve.
 	expect(f.owner.approvalHolds(f.assignment.name).map((hold) => hold.state)).toEqual(["open"]);
-	expect(f.db.inbox.messageDisposition(originKey(f.assignment.thread), runtime.reportId)).toBeUndefined();
+	expect(f.db.inbox.messageDisposition(workerParentKey(f.assignment), runtime.reportId)).toBeUndefined();
 	const before = f.notices.filter((payload) => payload.deliveryId === runtime.deliveryId).length;
 	await f.manager.recover();
 	expect(f.notices.filter((payload) => payload.deliveryId === runtime.deliveryId)).toHaveLength(before);
@@ -889,19 +956,20 @@ test("pane silent terminal retains native silence evidence and posts nothing bes
 test("pane checks terminal event has its own replay identity and confirmed outcome release debt", async () => {
 	const checks = scriptedChecks({ prNumber: 619, status: "pending", failingChecks: [] });
 	const f = await firstmateFixture({ checkStatusClient: checks.client });
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, start.opRef);
 	expect(f.job().state).toBe("awaiting_checks");
-	const runtime = f.db.work.workAttemptGet(start.opRef)!;
-	f.db.transaction((tx) => f.db.outbox.confirm(tx, runtime.deliveryId));
+	settleReportDelivery(f, start.opRef);
 	checks.set({ prNumber: 619, status: "green", failingChecks: [] });
 	await pollUntil(f, () => f.job().state === "done");
-	const checksOutcome = f.db.outbox.rows().find((row) => row.delivery_id !== runtime.deliveryId)!;
-	expect(checksOutcome).toBeDefined();
-	expect(JSON.parse(checksOutcome.payload_json).text).toContain("checks=passed");
-	expect(JSON.parse(checksOutcome.payload_json)).not.toHaveProperty("noChildFallback");
-	expect(f.db.inbox.pendingOldest(originKey(f.assignment.thread))).toBeUndefined();
+	const checksReport = f.db.core
+		.groupDb("work")
+		.prepare(
+			"SELECT message_id, body FROM inbound_messages WHERE origin_key = ? AND source = 'lane_report' AND body LIKE '%checks=passed%'",
+		)
+		.all(workerParentKey(f.assignment)) as { message_id: string; body: string }[];
+	expect(checksReport).toHaveLength(1);
 	const count = f.notices.length;
 	await f.manager.recover();
 	expect(f.notices).toHaveLength(count);
@@ -922,9 +990,9 @@ test("pane checks terminal event has its own replay identity and confirmed outco
 	};
 	expect(await f.manager.retireFirstmate(request)).toMatchObject({
 		retired: false,
-		obligations: [{ id: checksOutcome.delivery_id, reason: "delivery_pending" }],
+		obligations: [{ id: checksReport[0]!.message_id, reason: "report_unconsumed" }],
 	});
-	f.db.transaction((tx) => f.db.outbox.confirm(tx, checksOutcome.delivery_id));
+	consumeReport(f, checksReport[0]!.message_id);
 	expect((await f.manager.retireFirstmate(request)).retired).toBe(true);
 });
 
@@ -959,7 +1027,7 @@ test("FirstMate merge refuses unfinished checks and the writer, then the gateway
 			body: "Merge this task once its checks are green and another session has reviewed it.",
 		});
 	});
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, start.opRef);
 	const name = f.assignment.name;
@@ -1041,30 +1109,35 @@ test("FirstMate merge refuses unfinished checks and the writer, then the gateway
 	]);
 });
 
-test("pane transcript stays in child while deterministic terminal outcomes stay in the single parent", async () => {
+test("pane transcript and deterministic terminal outcome both stay in the pane that started the lane", async () => {
 	const f = await paneFixture();
+	const paneKey = workerParentKey(f.assignment);
+	const paneConversation = workerParent(f.assignment).conversationId;
 	await until(() => f.port.sendAttempts.some((send) => send.opRef === f.start.opRef));
 	f.port.emitAssistant(f.start.sessionId, "running child transcript", "pane-event", f.start.opRef);
-	await until(() => f.notices.some((payload) => payload.origin.conversationId === "pane-child"));
-	const child = f.notices.find((payload) => payload.origin.conversationId === "pane-child")!;
+	await until(() => f.notices.some((payload) => payload.origin.conversationId === paneConversation));
+	const child = f.notices.find((payload) => payload.origin.conversationId === paneConversation)!;
 	expect(child).toMatchObject({ text: "running child transcript", noChildFallback: true, final: false });
 	f.port.complete(f.start.opRef, "MODEL EXCERPT MUST NOT REACH PARENT");
 	await until(() => Boolean(f.db.work.workAttemptGet(f.start.opRef)?.settledAt));
 	const runtime = f.db.work.workAttemptGet(f.start.opRef)!;
-	const outcome = f.db.outbox.get(runtime.deliveryId)!;
-	expect(outcome.originKey).toBe(originKey(f.assignment.thread));
-	expect(JSON.parse(outcome.payloadJson).text).toContain(f.start.opRef);
-	expect(outcome.payloadJson).not.toContain("MODEL EXCERPT MUST NOT REACH PARENT");
+	expect(runtime.decision).toBe("reported");
+	expect(f.db.outbox.get(runtime.deliveryId)).toBeUndefined();
+	const report = f.db.inbox.messageDisposition(paneKey, runtime.reportId)?.message;
+	expect(report).toMatchObject({ origin_key: paneKey, source: "lane_report" });
+	expect(report?.body).toContain(f.start.opRef);
+	expect(report?.body).not.toContain("MODEL EXCERPT MUST NOT REACH PARENT");
+	// The assignment thread keeps authority, not the worker transcript or its report.
 	expect(f.db.inbox.messageDisposition(originKey(f.assignment.thread), runtime.reportId)).toBeUndefined();
-	const count = f.notices.filter((payload) => payload.deliveryId === runtime.deliveryId).length;
-	await f.manager.recover();
-	expect(f.notices.filter((payload) => payload.deliveryId === runtime.deliveryId)).toHaveLength(count);
+	expect(f.notices.filter((payload) => payload.deliveryId === runtime.deliveryId)).toHaveLength(0);
 	const correction = await f.manager.startFirstmateCorrection(correctionInput(f, f.start.opRef));
 	if (!correction.started) throw new Error("unexpected correction hold");
 	f.port.complete(correction.opRef, "corrected model excerpt");
 	await until(() => Boolean(f.db.work.workAttemptGet(correction.opRef)?.settledAt));
-	expect(f.db.outbox.get(f.db.work.workAttemptGet(correction.opRef)!.deliveryId)?.originKey).toBe(outcome.originKey);
-	expect(f.db.work.workAttemptGet(correction.opRef)!.deliveryId).not.toBe(runtime.deliveryId);
+	const corrected = f.db.work.workAttemptGet(correction.opRef)!;
+	expect(corrected.parent?.kind === "persona" ? corrected.parent.originKey : undefined).toBe(paneKey);
+	expect(f.db.inbox.messageDisposition(paneKey, corrected.reportId)?.message).toMatchObject({ origin_key: paneKey });
+	expect(corrected.reportId).not.toBe(runtime.reportId);
 });
 
 /** The report started its own persona turn and that turn finished. */
@@ -1225,10 +1298,8 @@ test("FirstMate abandonment refuses a dirty checkout without touching it and aba
 test("FirstMate abandonment settles an open checks cycle through the native report and native retire", async () => {
 	const checks = scriptedChecks({ prNumber: 613, status: "pending", failingChecks: [] });
 	const f = await firstmateFixture({ checkStatusClient: checks.client });
-	const parentKey = originKey(f.assignment.thread);
-	f.db.transaction((tx) => f.db.bindings.bind(tx, parentKey, crypto.randomUUID()));
-	const start = await f.manager.startFirstmate(f.assignment);
-	if (!start.started) throw new Error("unexpected hold");
+	const parentKey = workerParentKey(f.assignment);
+	const start = await startWorker(f);
 	await settleFirstmateSetup(f, start.opRef);
 	expect(f.job().state).toBe("awaiting_checks");
 	const recover = spyOn(f.manager, "recover");
@@ -1280,13 +1351,13 @@ test("FirstMate release holds an unconsumed native report but ignores unrelated 
 test("FirstMate release holds a report steered into a busy parent turn until that turn finishes", async () => {
 	const f = await releaseFixture(false);
 	const report = settleReportDelivery(f, f.start.opRef, false);
-	const parentKey = originKey(f.assignment.thread);
+	const parentKey = workerParentKey(f.assignment);
 	const busy = "gw-p-busy-parent";
 	f.db.transaction((tx) =>
 		f.db.inbox.enqueue(tx, {
 			messageId: "busy-parent",
 			originKey: parentKey,
-			originRefJson: JSON.stringify(f.assignment.thread),
+			originRefJson: JSON.stringify(workerParent(f.assignment)),
 			body: "unrelated parent turn",
 			receivedAt: new Date(Date.now() - 1_000).toISOString(),
 		}),
@@ -1446,7 +1517,7 @@ for (const proof of [
 test("FirstMate correction debts cover older attempts and retained inspection covers both after release", async () => {
 	const f = await releaseFixture(false);
 	const correction = await f.manager.startFirstmateCorrection(correctionInput(f, f.start.opRef));
-	if (!correction.started) throw new Error(correction.reason);
+	if (!correction.started) throw new Error("held" in correction ? correction.reason : "unexpected persona open");
 	await settleFirstmateSetup(f, correction.opRef);
 	const approval = await f.manager.approveFirstmate({
 		...(await approvalInput(f, correction.opRef)),
@@ -1577,8 +1648,7 @@ test("FirstMate confirmed release frees its clean checkout and thread for a new 
 	if (!released.retired) throw new Error(released.reason);
 	expect(f.owner.released(f.assignment.name)).toBe(true);
 	expect(f.git("-C", f.assignment.worktree.path, "status", "--porcelain", "--untracked-files=all")).toBe("");
-	const admitted = await f.manager.startFirstmate(replacement);
-	if (!admitted.started) throw new Error(admitted.reason);
+	const admitted = await startWorker(f, replacement);
 	await settleFirstmateSetup(f, admitted.opRef);
 	// The released task keeps its assignment, attempts, approval and release receipt.
 	expect(f.owner.assignment(f.assignment.name)).toEqual(f.assignment);
@@ -1875,7 +1945,7 @@ for (const state of ["attempt_ended", "done"] as const) {
 		const f = await firstmateFixture(state === "done" ? { checkStatusClient: checks.client } : {});
 		f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(f.assignment.thread), crypto.randomUUID()));
 		if (state === "attempt_ended") Object.assign(f.assignment.mandate, { checkRetries: false });
-		const start = await f.manager.startFirstmate(f.assignment);
+		const start = await startWorker(f);
 		if (!start.started) throw new Error("unexpected hold");
 		await settleFirstmateSetup(f, start.opRef);
 		if (state === "done") {
@@ -1886,10 +1956,10 @@ for (const state of ["attempt_ended", "done"] as const) {
 		const settledRuntime = f.db.work.workAttemptGet(start.opRef)!;
 		expect(settledRuntime.decision).toBe("reported");
 		expect(
-			f.db.inbox.messageDisposition(originKey(f.assignment.thread), settledRuntime.reportId)?.message,
+			f.db.inbox.messageDisposition(workerParentKey(f.assignment), settledRuntime.reportId)?.message,
 		).toMatchObject({
 			message_id: settledRuntime.reportId,
-			origin_key: originKey(f.assignment.thread),
+			origin_key: workerParentKey(f.assignment),
 			source: "lane_report",
 		});
 		const input = await approvalInput(f, start.opRef);
@@ -2164,7 +2234,7 @@ test("FirstMate open and awaiting-checks attempts cannot acquire an approval rec
 	const checks = scriptedChecks({ prNumber: 612, status: "pending", failingChecks: [] });
 	const f = await firstmateFixture({ checkStatusClient: checks.client });
 	f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(f.assignment.thread), crypto.randomUUID()));
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	const open = await approvalInput(f, start.opRef);
 	expect(await withoutFirstmateEffects(f, () => f.manager.approveFirstmate(open))).toMatchObject({
@@ -2185,14 +2255,10 @@ for (const state of ["attempt_ended", "done"] as const) {
 	test(`FirstMate correction preserves original evidence and returns a second exact answer from ${state}`, async () => {
 		const checks = scriptedChecks({ prNumber: 610, status: "pending", failingChecks: [] });
 		const f = await firstmateFixture(state === "done" ? { checkStatusClient: checks.client } : {});
-		// Native persona reports require the task thread's existing parent session.
-		const parentKey = originKey(f.assignment.thread);
-		const parentSessionId = crypto.randomUUID();
-		f.db.transaction((tx) => f.db.bindings.bind(tx, parentKey, parentSessionId));
+		// Native persona reports require the pane persona's existing parent session.
+		const parentKey = workerParentKey(f.assignment);
 		if (state === "attempt_ended") Object.assign(f.assignment.mandate, { checkRetries: false });
-		const original = await f.manager.startFirstmate(f.assignment);
-		if (!original.started) throw new Error("unexpected hold");
-		expect(original.sessionId).not.toBe(parentSessionId);
+		const original = await startWorker(f);
 		await settleFirstmateSetup(f, original.opRef);
 		if (state === "done") {
 			checks.set({ prNumber: 610, status: "green", failingChecks: [] });
@@ -2263,7 +2329,7 @@ for (const state of ["attempt_ended", "done"] as const) {
 		const answer = await inspectWithoutExecution(f, correction.opRef);
 		expect(answer.evidence).toMatchObject({ completeness: "complete", text: "Corrected exact answer." });
 		expect(answer.identity?.opRef).toBe(correction.opRef);
-		expect(f.db.bindings.getSessionRecord(parentKey)?.sessionId).toBe(parentSessionId);
+		expect(f.db.bindings.getSessionRecord(parentKey)?.sessionId).toBeTruthy();
 		expect(f.db.work.workAttemptGet(correction.opRef)?.decision).toBe("reported");
 		const correctedReportId = f.db.work.workAttemptGet(correction.opRef)!.reportId;
 		expect(correctedReportId).not.toBe(priorRuntime!.reportId);
@@ -2285,7 +2351,11 @@ for (const state of ["attempt_ended", "done"] as const) {
 		).toEqual(journal);
 		expect(await inspectWithoutExecution(f, original.opRef)).toEqual(priorAnswer);
 		expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmateCorrection(input))).toEqual(correction);
-		expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(f.assignment))).toEqual(original);
+		expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(f.assignment))).toMatchObject({
+			started: false,
+			personaOpened: true,
+			name: "a",
+		});
 		await f.restart();
 		expect(await withoutFirstmateEffects(f, () => f.currentManager().startFirstmateCorrection(input))).toEqual(
 			correction,
@@ -2297,7 +2367,7 @@ for (const state of ["attempt_ended", "done"] as const) {
 
 test("FirstMate correction deduplicates concurrent requests before latest selection and rejects conflicting messages", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
@@ -2343,7 +2413,7 @@ test("FirstMate correction deduplicates concurrent requests before latest select
 
 test("FirstMate correction rejects invalid authority and selectors without native effects", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
@@ -2371,7 +2441,7 @@ test("FirstMate correction rejects invalid authority and selectors without nativ
 
 test("FirstMate correction refuses changed binding, worktree and native ownership without prepare or send", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
@@ -2428,7 +2498,7 @@ test("FirstMate correction refuses changed binding, worktree and native ownershi
 
 test("FirstMate correction resumes an inactive bound session and refuses a gone one before bind replaces it", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
@@ -2502,7 +2572,7 @@ test("FirstMate correction resumes an inactive bound session and refuses a gone 
 
 test("FirstMate correction maps a non-broker bind failure to bind_failed", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const job = f.job();
@@ -2521,7 +2591,7 @@ test("FirstMate correction maps a non-broker bind failure to bind_failed", async
 });
 test("FirstMate correction after close binds a new session and keeps the old attempt", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const before = f.db.work.firstmate.attempt(original.opRef);
@@ -2550,7 +2620,7 @@ test("FirstMate correction after close binds a new session and keeps the old att
 
 test("FirstMate lost correction acceptance holds exact duplicate and cannot be bypassed by a new message", async () => {
 	const f = await firstmateFixture({ pollMs: 60_000 });
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
@@ -2566,7 +2636,7 @@ test("FirstMate lost correction acceptance holds exact duplicate and cannot be b
 	expect(f.db.work.workAttemptGet(uncertain.opRef)?.sendPhase).toBe("uncertain");
 	const held = await withoutFirstmateEffects(f, () => f.manager.startFirstmateCorrection(input));
 	expect(held).toMatchObject({ started: false, held: true, jobId: original.jobId });
-	if (held.started) throw new Error("unexpected resend");
+	if (held.started || !("held" in held)) throw new Error("unexpected resend");
 	expect(held.reason).toContain(uncertain.opRef);
 	await withoutFirstmateEffects(f, async () => {
 		await expect(
@@ -2588,7 +2658,7 @@ test("FirstMate lost correction acceptance holds exact duplicate and cannot be b
 
 test("FirstMate correction refuses unsettled and held predecessors before effects", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	const input = correctionInput(f, original.opRef);
 	await withoutFirstmateEffects(f, async () => {
@@ -2642,7 +2712,7 @@ test("FirstMate correction refuses unsettled and held predecessors before effect
 test("FirstMate correction prepare failure rolls back done reopening and all attribution", async () => {
 	const checks = scriptedChecks({ prNumber: 612, status: "pending", failingChecks: [] });
 	const f = await firstmateFixture({ checkStatusClient: checks.client });
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	checks.set({ prNumber: 612, status: "green", failingChecks: [] });
@@ -2677,7 +2747,7 @@ test("FirstMate correction prepare failure rolls back done reopening and all att
 
 test("FirstMate correction prepared interruption remains held without transport replay", async () => {
 	const f = await firstmateFixture({ pollMs: 60_000 });
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
@@ -2695,7 +2765,7 @@ test("FirstMate correction prepared interruption remains held without transport 
 	expect(f.db.work.workAttemptGet(prepared.opRef)?.sendPhase).toBe("prepared");
 	const held = await withoutFirstmateEffects(f, () => f.manager.startFirstmateCorrection(input));
 	expect(held).toMatchObject({ started: false, held: true });
-	if (held.started) throw new Error("unexpected replay");
+	if (held.started || !("held" in held)) throw new Error("unexpected replay");
 	expect(held.reason).toContain(prepared.opRef);
 	expect(f.port.sendAttempts).toHaveLength(1);
 	expect(f.port.binds).toHaveLength(2);
@@ -2703,7 +2773,7 @@ test("FirstMate correction prepared interruption remains held without transport 
 
 test("FirstMate correction cannot bypass ordinary start run or steer guards", async () => {
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const input = correctionInput(f, original.opRef);
@@ -2725,7 +2795,7 @@ for (const authorized of [true, false]) {
 		const checks = scriptedChecks({ prNumber: 611, status: "pending", failingChecks: [] });
 		const f = await firstmateFixture({ checkStatusClient: checks.client });
 		Object.assign(f.assignment.mandate, { checkRetries: authorized });
-		const original = await f.manager.startFirstmate(f.assignment);
+		const original = await startWorker(f);
 		if (!original.started) throw new Error("unexpected hold");
 		await settleFirstmateSetup(f, original.opRef);
 		await withoutFirstmateEffects(f, async () => {
@@ -2809,7 +2879,7 @@ async function inspectWithoutExecution(
 
 test("FirstMate inspection retains exact complete results across repetition and restart without execution", async () => {
 	const f = await firstmateFixture();
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, start.opRef);
 	const result = await inspectWithoutExecution(f, start.opRef);
@@ -2837,7 +2907,7 @@ test("FirstMate inspection retains exact complete results across repetition and 
 
 test("FirstMate inspection retains complete and partial evidence ahead of the reader clock without execution", async () => {
 	const f = await firstmateFixture();
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, start.opRef);
 	const original = f.db.work.workAttemptGet(start.opRef)!;
@@ -2899,7 +2969,7 @@ test("FirstMate inspection retains complete and partial evidence ahead of the re
 
 test("FirstMate inspection keeps retained partial output when runtime retrieval is absent or released", async () => {
 	const f = await firstmateFixture();
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	const text = "한".repeat(8_000);
 	f.port.complete(start.opRef, text);
@@ -2949,7 +3019,7 @@ test("FirstMate inspection keeps retained partial output when runtime retrieval 
 
 test("FirstMate native inspection cannot settle or write an open attempt", async () => {
 	const f = await firstmateFixture();
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	// Stop observation, not the scripted operation, so no background settlement races the measured request.
 	await f.manager.stop();
@@ -3032,7 +3102,7 @@ test("FirstMate native inspection cannot settle or write an open attempt", async
 
 test("FirstMate inspection refuses wrong task, operation, binding, epoch and retained provenance", async () => {
 	const f = await firstmateFixture();
-	const start = await f.manager.startFirstmate(f.assignment);
+	const start = await startWorker(f);
 	if (!start.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, start.opRef);
 	const selector = { name: "a", taskId: f.assignment.taskId, opRef: start.opRef, native: true };
@@ -3124,14 +3194,21 @@ test("FirstMate inspection refuses wrong task, operation, binding, epoch and ret
 	}
 });
 
-test("FirstMate snapshots trusted input and duplicates retain exact identities without bind or send", async () => {
+test("FirstMate snapshots trusted input and duplicate persona opens retain exact identities without a lane", async () => {
 	const f = await firstmateFixture();
 	const expected = structuredClone(f.assignment);
-	const start = f.manager.startFirstmate(f.assignment);
+	const open = f.manager.startFirstmate(f.assignment);
 	Object.assign(f.assignment.mandate, { text: "widen task", push: true });
-	const original = await start;
-	if (!original.started) throw new Error("unexpected hold");
+	const opened = await open;
+	// The assignment is recorded; no lane, bind or send exists from the persona open alone.
+	expect(opened).toMatchObject({ started: false, personaOpened: true, name: "a", taskId: expected.taskId });
 	expect(f.owner.assignment("a")).toEqual(expected);
+	expect(f.owner.initial(expected.taskId)).toBeUndefined();
+	expect(f.port.binds).toHaveLength(0);
+	expect(f.port.sends).toHaveLength(0);
+	expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(expected))).toEqual(opened);
+	// The pane's ordinary start creates the lane from the recorded mandate.
+	const original = await startWorker(f, expected);
 	expect(f.port.sends[0]?.text).toBe(expected.mandate.text);
 	expect(f.owner.initial(expected.taskId)).toMatchObject({
 		opRef: original.opRef,
@@ -3142,13 +3219,12 @@ test("FirstMate snapshots trusted input and duplicates retain exact identities w
 		cause: { kind: "assignment" },
 		text: expected.mandate.text,
 	});
-	expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(expected))).toEqual(original);
 	await settleFirstmateSetup(f, original.opRef);
-	expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(expected))).toEqual(original);
+	expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(expected))).toEqual(opened);
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.sendAttempts).toHaveLength(1);
 	await f.restart();
-	expect(await withoutFirstmateEffects(f, () => f.currentManager().startFirstmate(expected))).toEqual(original);
+	expect(await withoutFirstmateEffects(f, () => f.currentManager().startFirstmate(expected))).toEqual(opened);
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.sendAttempts).toHaveLength(1);
 });
@@ -3159,16 +3235,16 @@ test("FirstMate uncertain duplicates remain held on the original operation", asy
 		f.port.sendAttempts.push(input);
 		throw new Error("receipt lost");
 	};
-	await expect(f.manager.startFirstmate(f.assignment)).rejects.toMatchObject({
+	await expect(beginWorker(f)).rejects.toMatchObject({
 		detail: { reasonCode: "send_acceptance_uncertain" },
 	});
 	const initial = f.owner.initial(f.assignment.taskId)!;
 	const before = f.db.work.workAttemptGet(initial.opRef)!;
 	expect(before.sendPhase).toBe("uncertain");
-	const held = await withoutFirstmateEffects(f, () => f.manager.startFirstmate(f.assignment));
-	expect(held).toMatchObject({ started: false, held: true, jobId: initial.jobId });
-	if (held.started) throw new Error("uncertain attempt replayed");
-	expect(held.reason).toContain(initial.opRef);
+	// A second pane start refuses while that attempt is open; it never replays the send.
+	await expect(beginWorker(f)).rejects.toMatchObject({
+		detail: { reasonCode: "attempt_open", opRef: initial.opRef },
+	});
 	expect(f.owner.initial(f.assignment.taskId)).toEqual(initial);
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.sendAttempts).toHaveLength(1);
@@ -3182,14 +3258,14 @@ test("FirstMate prepared admission holds after a post-commit interruption withou
 		f.git("-C", f.assignment.worktree.path, "branch", "-m", "temporarily-changed");
 		return tail;
 	};
-	await expect(f.manager.startFirstmate(f.assignment)).rejects.toMatchObject({ detail: { reason: "branch_changed" } });
+	await expect(beginWorker(f)).rejects.toMatchObject({ detail: { reason: "branch_changed" } });
 	f.git("-C", f.assignment.worktree.path, "branch", "-m", f.assignment.worktree.branch);
 	const original = f.owner.initial(f.assignment.taskId)!;
 	expect(f.db.work.workAttemptGet(original.opRef)?.sendPhase).toBe("prepared");
-	const held = await withoutFirstmateEffects(f, () => f.manager.startFirstmate(f.assignment));
-	expect(held).toMatchObject({ started: false, held: true, jobId: original.jobId });
-	if (held.started) throw new Error("prepared attempt replayed");
-	expect(held.reason).toContain(original.opRef);
+	// A second pane start refuses while that attempt is open; it never replays transport.
+	await expect(beginWorker(f)).rejects.toMatchObject({
+		detail: { reasonCode: "attempt_open", opRef: original.opRef },
+	});
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.sendAttempts).toHaveLength(0);
 });
@@ -3203,7 +3279,7 @@ test("FirstMate rejects stale worktrees, conflicting policy, native adoption and
 	});
 	expect(f.port.binds).toHaveLength(0);
 	expect(f.port.sendAttempts).toHaveLength(0);
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const conflict = structuredClone(f.assignment);
@@ -3294,7 +3370,7 @@ test("FirstMate admits an abandoned lane worktree but refuses a live lane worktr
 	});
 
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	const replacement: FirstmateAssignment = {
@@ -3308,7 +3384,7 @@ test("FirstMate admits an abandoned lane worktree but refuses a live lane worktr
 		detail: { reason: "immutable_assignment_conflict" },
 	});
 	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: "a" });
-	const admitted = await f.manager.startFirstmate(replacement);
+	const admitted = await startWorker(f, replacement);
 	expect(admitted.started).toBe(true);
 	if (!admitted.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, admitted.opRef);
@@ -3331,7 +3407,7 @@ test("FirstMate refuses a competing native worktree and permits disjoint work af
 	});
 	expect(competing.port.binds).toHaveLength(1);
 	const f = await firstmateFixture();
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	await settleFirstmateSetup(f, original.opRef);
 	f.git("-C", f.assignment.worktree.path, "switch", "-q", "-c", "changed");
@@ -3356,11 +3432,11 @@ test("FirstMate activity failure rolls back attribution native projections and j
 		throw new Error("activity rollback");
 	});
 	try {
-		await expect(f.manager.startFirstmate(f.assignment)).rejects.toThrow("activity rollback");
+		await expect(beginWorker(f)).rejects.toThrow("activity rollback");
 	} finally {
 		fault.mockRestore();
 	}
-	expect(f.owner.assignment("a")).toBeUndefined();
+	expect(f.owner.assignment("a")).toEqual(f.assignment);
 	expect(f.owner.initial(f.assignment.taskId)).toBeUndefined();
 	expect(f.db.work.projectionRows()).toEqual(before);
 	expect(f.db.journal.latest("attempt")).toEqual(journal.attempts);
@@ -3368,13 +3444,11 @@ test("FirstMate activity failure rolls back attribution native projections and j
 	expect(f.db.bindings.workLaneRows()[0]?.last_activity_at).toBeNull();
 	expect(f.port.binds).toHaveLength(1);
 	expect(f.port.sendAttempts).toHaveLength(0);
-	// Session binding is external to prepare; do not silently adopt its orphan on another call.
-	await withoutFirstmateEffects(f, async () => {
-		await expect(f.manager.startFirstmate(f.assignment)).rejects.toMatchObject({
-			detail: { reason: "native_session_not_adoptable" },
-		});
-	});
-	expect(f.port.binds).toHaveLength(1);
+	// A retry after the rollback reuses the lane's own binding and records the first attempt.
+	const retried = await startWorker(f);
+	expect(f.port.binds).toHaveLength(2);
+	expect(f.port.sendAttempts).toHaveLength(1);
+	expect(f.owner.initial(f.assignment.taskId)?.opRef).toBe(retried.opRef);
 });
 
 test("FirstMate shared admission reserves worktree before a competing native bind", async () => {
@@ -3389,7 +3463,7 @@ test("FirstMate shared admission reserves worktree before a competing native bin
 		}
 		return bind(input);
 	};
-	const mapped = f.manager.startFirstmate(f.assignment);
+	const mapped = beginWorker(f);
 	await entered.promise;
 	const competing = f.manager.start({ name: "other", text: "competing", cwd: f.assignment.worktree.path }).then(
 		() => undefined,
@@ -3406,7 +3480,7 @@ test("FirstMate shared admission reserves worktree before a competing native bin
 test("FirstMate native two-retry budget retains mandate lineage session epoch and explicit no-push", async () => {
 	const checks = scriptedChecks({ prNumber: 590, status: "pending", failingChecks: [] });
 	const f = await firstmateFixture({ checkStatusClient: checks.client });
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	const initial = f.owner.initial(f.assignment.taskId)!;
 	await settleFirstmateSetup(f, original.opRef);
@@ -3430,8 +3504,12 @@ test("FirstMate native two-retry budget retains mandate lineage session epoch an
 	expect(f.db.work.workAttemptGet(original.opRef)?.settledAt).not.toBeNull();
 	expect(f.job().awaitingChecks?.retries).toBe(0);
 	expect(f.job().attempts).toHaveLength(1);
-	// Accepted duplicate is observation-free even with red checks.
-	expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(f.assignment))).toEqual(original);
+	// A duplicate persona open is observation-free even with red checks; it creates no lane.
+	expect(await withoutFirstmateEffects(f, () => f.manager.startFirstmate(f.assignment))).toMatchObject({
+		started: false,
+		personaOpened: true,
+		name: "a",
+	});
 	expect(f.port.sends).toHaveLength(1);
 	const polls = checks.calls.length;
 	const journal = f.db.journal.latest("attempt");
@@ -3474,7 +3552,11 @@ test("FirstMate native two-retry budget retains mandate lineage session epoch an
 	await pollUntil(f, () => f.job().state === "awaiting_operator");
 	expect(f.port.binds).toHaveLength(3);
 	expect(f.port.sendAttempts).toHaveLength(3);
-	expect(await f.manager.startFirstmate(f.assignment)).toEqual(original);
+	expect(await f.manager.startFirstmate(f.assignment)).toMatchObject({
+		started: false,
+		personaOpened: true,
+		name: "a",
+	});
 });
 
 test("FirstMate denied retry mandate sends nothing and failed binding spends budget without phantom attribution", async () => {
@@ -3482,7 +3564,7 @@ test("FirstMate denied retry mandate sends nothing and failed binding spends bud
 		const checks = scriptedChecks({ prNumber: 591, status: "pending", failingChecks: [] });
 		const f = await firstmateFixture({ checkStatusClient: checks.client });
 		Object.assign(f.assignment.mandate, { checkRetries: authorized });
-		const original = await f.manager.startFirstmate(f.assignment);
+		const original = await startWorker(f);
 		if (!original.started) throw new Error("unexpected hold");
 		f.port.complete(original.opRef, "done");
 		await until(() => f.job().state === "awaiting_checks");
@@ -3504,7 +3586,7 @@ test("FirstMate denied retry mandate sends nothing and failed binding spends bud
 test("FirstMate retry refuses a changed native session epoch without new prepare or send", async () => {
 	const checks = scriptedChecks({ prNumber: 592, status: "pending", failingChecks: [] });
 	const f = await firstmateFixture({ checkStatusClient: checks.client });
-	const original = await f.manager.startFirstmate(f.assignment);
+	const original = await startWorker(f);
 	if (!original.started) throw new Error("unexpected hold");
 	const initial = f.owner.initial(f.assignment.taskId);
 	f.port.complete(original.opRef, "done");

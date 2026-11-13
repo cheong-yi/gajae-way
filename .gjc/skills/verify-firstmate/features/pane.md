@@ -1,15 +1,16 @@
 # Pane
 
-The pane is a second view of a running lane. It can inspect and report. It does not edit the worktree, and it does not decide the lane outcome.
+The pane is the secondmate persona that starts and then watches one running lane. `gajaeway work start --firstmate FILE` opens it and creates no lane. Its own ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. It can then inspect and report. It does not edit the worktree, and it does not decide the lane outcome.
 
 ## Sub-features
 
-- `pane-opens` opens while the lane is running.
+- `pane-opens` opens from the assignment, before the lane exists.
+- `pane-starts-lane` starts the lane with one ordinary work start, not with `--firstmate`.
 - `pane-does-not-edit` leaves the worktree commit unchanged by the pane session.
 
 ## How to get to it (user POV)
 
-- Start a lane from a mention. The pane opens beside that lane.
+- Have the first mate submit the assignment. The secondmate pane opens first, then its ordinary work start creates the lane.
 
 ## Driving it with verify-firstmate
 

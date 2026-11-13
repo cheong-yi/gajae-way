@@ -763,6 +763,14 @@ export type WorkStartResult =
 			readonly sessionId: string;
 	  }
 	| {
+			/** The FirstMate pane persona is open; no work session exists until that pane starts the lane. */
+			readonly started: false;
+			readonly personaOpened: true;
+			readonly taskId: string;
+			readonly name: string;
+			readonly worktree: string;
+	  }
+	| {
 			readonly started: false;
 			readonly held: true;
 			readonly jobId: string;

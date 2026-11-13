@@ -1,6 +1,6 @@
 # Plan and switch
 
-A mention starts one FirstMate lane. The lane plans on the strong model, edits in that same session, switches once, and the cheap model finishes the turn. The public attempt ends after the switch.
+A mention starts one FirstMate lane. The first mate records the assignment with `gajaeway work start --firstmate FILE`, which opens that task's secondmate pane and creates no lane. The secondmate's ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. The lane plans on the strong model, edits in that same session, switches once, and the cheap model finishes the turn. The public attempt ends after the switch.
 
 ## Sub-features
 
@@ -11,7 +11,7 @@ A mention starts one FirstMate lane. The lane plans on the strong model, edits i
 
 ## How to get to it (user POV)
 
-- Mention the test bot in a new thread of channel `1511208447939706972` and ask it to start one work lane on a local repository with no remotes.
+- Mention the test bot in a new thread of channel `1511208447939706972` and ask the first mate to assign one work lane on a local repository with no remotes. The submission opens the secondmate pane; the lane does not exist until that pane runs its ordinary `gajaeway work start`.
 
 ## Driving it with verify-firstmate
 
@@ -23,7 +23,9 @@ Preconditions:
 - **Doctor.** Run `.gjc/skills/verify-firstmate/scripts/doctor-test-home.sh`. The last line is `doctor: ok`.
 - **Repository.** Run `.gjc/skills/verify-firstmate/scripts/disposable-repo.sh create /home/cheongnet/gajaeway/verify-scratch/$RUN/repo`. The output reads `created <path> head=<sha> branch=main remotes=none`.
 - **Window.** Run `SINCE=$(date -u +%FT%TZ)`. Keep it.
-- **Mention.** Post this text in a new thread, mentioning test bot `1557246454714736723`. An operator-bot post is a stand-in, not a human mention.
+- **Mention.** Post the text below in a new thread of channel `1511208447939706972`, mentioning test bot `1557246454714736723`. An operator-bot post is a stand-in, not a human mention.
+- **Assignment.** The first mate runs `gajaeway work start --firstmate ASSIGNMENT_JSON_FILE`. That records the task and asks Discord for the secondmate thread. It creates no lane. If the result is a hold, stop. Do not report a started lane.
+- **Lane start.** The secondmate runs one ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"`. Only that creates the lane, with the pane as parent. A hold means the thread was not opened. Do not report a started lane.
 
 ```text
 Start one work lane on the local repository <repo>.
