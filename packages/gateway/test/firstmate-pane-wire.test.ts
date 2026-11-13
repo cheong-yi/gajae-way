@@ -153,6 +153,7 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		return result.stdout.toString().trim();
 	};
 	git("init", "-q");
+	git("remote", "add", "origin", "https://example.test/org/gajae-way.git");
 	git("commit", "--allow-empty", "-qm", "fixture");
 	const path = join(directory, "assigned");
 	git("worktree", "add", "-qb", "firstmate/pane", path);
@@ -178,14 +179,17 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "discord:cockpit": { engagement: "open", audience: "all" } },
+		channels: {
+			"discord:cockpit": { engagement: "open", audience: "all" },
+			"discord:repo-channel": { engagement: "open", audience: "all" },
+		},
 	};
 	const db = await Store.open(config.dbPath);
 	const child: OriginRef = {
 		platform: "discord",
 		kind: "thread",
 		conversationId: "child-pane",
-		parentId: "cockpit",
+		parentId: "repo-channel",
 		threadVisibility: "public",
 	};
 	let childBinds = 0;
@@ -220,10 +224,15 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		adapter = await GajaewayClient.connectSocket(config.socketPath, { clientName: "adapter-discord" });
 		let opens = 0;
 		adapter.on("discord.thread.open", (value) => {
-			const request = value as { requestId: string; parent: OriginRef };
+			const request = value as { requestId: string; parent: OriginRef; repoSlug?: string };
 			opens++;
 			expect(request.parent).toEqual(assignment.thread);
-			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: child.conversationId });
+			expect(request.repoSlug).toBe("gajae-way");
+			void adapter!.request("discord.thread.opened", {
+				requestId: request.requestId,
+				threadId: child.conversationId,
+				parentChannelId: "repo-channel",
+			});
 		});
 		client = await GajaewayClient.connectSocket(config.socketPath);
 		const opened = await client.workStart({ firstmate: assignment });
@@ -242,6 +251,8 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 			childOrigin: child,
 			createdByGateway: db.instanceId,
 		});
+		expect(readLanePane(db, "pane")?.childOrigin.parentId).toBe("repo-channel");
+		expect(assignment.thread.parentId).toBe("cockpit");
 		const childSends = () => {
 			const sessionId = db.bindings.getSessionRecord(originKey(child))?.sessionId;
 			return sessionId ? port.sendAttempts.filter((input) => input.sessionId === sessionId) : [];
@@ -498,14 +509,17 @@ test("FirstMate journey without Discord: assign, child message, close, follow-up
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "discord:cockpit": { engagement: "open", audience: "all" } },
+		channels: {
+			"discord:cockpit": { engagement: "open", audience: "all" },
+			"discord:repo-channel": { engagement: "open", audience: "all" },
+		},
 	};
 	const db = await Store.open(config.dbPath);
 	const child: OriginRef = {
 		platform: "discord",
 		kind: "thread",
 		conversationId: "child-journey",
-		parentId: "cockpit",
+		parentId: "repo-channel",
 		threadVisibility: "public",
 	};
 	const port = new ScriptedSessionPort({
@@ -530,7 +544,11 @@ test("FirstMate journey without Discord: assign, child message, close, follow-up
 		const adapterEvents = recordAdapterEvents(adapter);
 		adapter.on("discord.thread.open", (value) => {
 			const request = value as { requestId: string };
-			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: child.conversationId });
+			void adapter!.request("discord.thread.opened", {
+				requestId: request.requestId,
+				threadId: child.conversationId,
+				parentChannelId: "repo-channel",
+			});
 		});
 		client = await GajaewayClient.connectSocket(config.socketPath);
 		const send = (where: OriginRef, messageId: string, text: string, authorId: string) =>
@@ -754,14 +772,17 @@ test("FirstMate lane closed without abandonment: approval recorded, closeout clo
 		socketPath: join(directory, "gateway.sock"),
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
-		channels: { "discord:cockpit": { engagement: "open", audience: "all" } },
+		channels: {
+			"discord:cockpit": { engagement: "open", audience: "all" },
+			"discord:repo-channel": { engagement: "open", audience: "all" },
+		},
 	};
 	const db = await Store.open(config.dbPath);
 	const child: OriginRef = {
 		platform: "discord",
 		kind: "thread",
 		conversationId: "child-closed",
-		parentId: "cockpit",
+		parentId: "repo-channel",
 		threadVisibility: "public",
 	};
 	const port = new ScriptedSessionPort({
@@ -787,7 +808,11 @@ test("FirstMate lane closed without abandonment: approval recorded, closeout clo
 			const request = value as { requestId: string };
 			// The first pane is the closed lane's; a later assignment gets its own pane.
 			const threadId = paneOpens++ === 0 ? child.conversationId : `child-next-${paneOpens}`;
-			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId });
+			void adapter!.request("discord.thread.opened", {
+				requestId: request.requestId,
+				threadId,
+				parentChannelId: "repo-channel",
+			});
 		});
 		client = await GajaewayClient.connectSocket(config.socketPath);
 		const send = (where: OriginRef, messageId: string, text: string, authorId: string) =>
@@ -1110,14 +1135,17 @@ test("a closed room still opens the pane, and the notice is not stamped as the a
 		dbPath: join(directory, "gateway.db"),
 		logVerbosity: "info",
 		ownerTarget: { origin: { platform: "discord", kind: "dm", conversationId: "owner", peerId: "owner" } },
-		channels: { "discord:cockpit": { engagement: "closed" } },
+		channels: {
+			"discord:cockpit": { engagement: "closed" },
+			"discord:repo-channel": { engagement: "closed" },
+		},
 	};
 	const db = await Store.open(config.dbPath);
 	const child: OriginRef = {
 		platform: "discord",
 		kind: "thread",
 		conversationId: "child-pane",
-		parentId: "cockpit",
+		parentId: "repo-channel",
 		threadVisibility: "public",
 	};
 	const port = new ScriptedSessionPort({
@@ -1137,7 +1165,11 @@ test("a closed room still opens the pane, and the notice is not stamped as the a
 		adapter.on("discord.thread.open", (value) => {
 			const request = value as { requestId: string };
 			opens++;
-			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: child.conversationId });
+			void adapter!.request("discord.thread.opened", {
+				requestId: request.requestId,
+				threadId: child.conversationId,
+				parentChannelId: "repo-channel",
+			});
 		});
 		client = await GajaewayClient.connectSocket(config.socketPath);
 		const opened = await client.workStart({ firstmate: assignment });

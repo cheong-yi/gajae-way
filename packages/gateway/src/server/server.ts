@@ -110,6 +110,7 @@ import {
 	saveChildPane,
 } from "../orchestrator/firstmate-pane";
 import { ghCheckStatusClient } from "../orchestrator/gh-checks";
+import { runGit } from "../orchestrator/git-command";
 import { LaneGovernor, laneJobIdentity } from "../orchestrator/lane-governor";
 import {
 	PERSONA_RESTART_DRAIN_MAX_WAIT_MS,
@@ -533,7 +534,11 @@ interface Runtime {
 	readonly work: WorkLaneManager;
 	readonly threadOpens: Map<
 		string,
-		{ connection: Connection; resolve: (threadId: string) => void; reject: (error: Error) => void }
+		{
+			connection: Connection;
+			resolve: (pane: { threadId: string; parentChannelId: string }) => void;
+			reject: (error: Error) => void;
+		}
 	>;
 	readonly permissionPanels: PermissionPanels;
 	/** Redacts secrets from every chat-bound frame at the connection writer; not configurable from chat or config.json. */
@@ -1937,7 +1942,8 @@ async function handleRequest(
 			);
 			if (!pending || pending.connection !== connection)
 				throw new ProtocolError("invalid_params", "unknown thread request");
-			if (workString(params.threadId)) pending.resolve(params.threadId);
+			if (workString(params.threadId) && workString(params.parentChannelId))
+				pending.resolve({ threadId: params.threadId, parentChannelId: params.parentChannelId });
 			else pending.reject(new Error(workString(params.error) ? params.error : "Discord thread creation failed"));
 			connection.write({ v: PROFILE_VERSION, type: "response", id: request.id, result: { received: true } });
 			return;
@@ -2928,6 +2934,30 @@ async function closeFirstmatePane(runtime: Runtime, store: Store, name: string):
 	await runtime.personaSessions.close(originKey(pane.childOrigin));
 }
 
+/**
+ * The origin remote's repository name, read from git rather than the checkout
+ * folder: a worktree directory is an operator's choice, not the repository's
+ * identity. Undefined when there is no readable origin; the pane still opens.
+ */
+async function originRepoSlug(worktreePath: string): Promise<string | undefined> {
+	try {
+		const result = await runGit(["-C", worktreePath, "remote", "get-url", "origin"], { timeoutMs: 5_000 });
+		if (result.exitCode !== 0) return undefined;
+		const name = result.stdout
+			.trim()
+			.replace(/\/+$/, "")
+			.replace(/\.git$/i, "")
+			.split(/[/:]/)
+			.at(-1)!
+			.toLowerCase()
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/^-+|-+$/g, "");
+		return name || undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /** A timed-out creation is held, never silently repeated against Discord. */
 type PaneOpen = { readonly opened: true } | { readonly opened: false; readonly reason: string };
 
@@ -2964,11 +2994,12 @@ async function openFirstmatePane(
 		(connection) => connection.negotiated && connection.client?.name === "adapter-discord",
 	);
 	if (!adapter) return { opened: false, reason: "pane_adapter_unavailable" };
+	const repoSlug = await originRepoSlug(assignment.worktree.path);
 	const requestId = crypto.randomUUID();
 	store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "requested" }));
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const threadId = await new Promise<string>((resolve, reject) => {
+		const pane = await new Promise<{ threadId: string; parentChannelId: string }>((resolve, reject) => {
 			runtime.threadOpens.set(requestId, { connection: adapter, resolve, reject });
 			timer = setTimeout(() => reject(new Error("Discord thread creation acceptance uncertain")), 10_000);
 			console.info(`firstmate_pane_open_sent name=${assignment.name} requestId=${requestId}`);
@@ -2981,14 +3012,15 @@ async function openFirstmatePane(
 					parent: assignment.thread,
 					messageId: assignment.messageId,
 					name: `FirstMate ${assignment.name}`,
+					...(repoSlug === undefined ? {} : { repoSlug }),
 				},
 			});
 		});
 		const childOrigin: OriginRef = {
 			platform: "discord",
 			kind: "thread",
-			conversationId: threadId,
-			parentId: assignment.thread.kind === "thread" ? assignment.thread.parentId : assignment.thread.conversationId,
+			conversationId: pane.threadId,
+			parentId: pane.parentChannelId,
 			threadVisibility: "public",
 		};
 		saveChildPane(store, {

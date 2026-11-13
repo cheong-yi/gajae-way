@@ -285,7 +285,11 @@ test("FirstMate work.retire dispatch holds a steered native report until its par
 		adapter = await GajaewayClient.connectSocket(config.socketPath, { clientName: "adapter-discord" });
 		adapter.on("discord.thread.open", (value) => {
 			const request = value as { requestId: string };
-			void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: "closeout-pane" });
+			void adapter!.request("discord.thread.opened", {
+				requestId: request.requestId,
+				threadId: "closeout-pane",
+				parentChannelId: "fixture-parent",
+			});
 		});
 		client = await connect(config.socketPath);
 		client.send({ v: "0.1", type: "hello", payload: { supportedVersions: ["0.1"] } });
@@ -521,7 +525,11 @@ for (const { output, state, unavailable } of [
 			adapter = await GajaewayClient.connectSocket(config.socketPath, { clientName: "adapter-discord" });
 			adapter.on("discord.thread.open", (value) => {
 				const request = value as { requestId: string };
-				void adapter!.request("discord.thread.opened", { requestId: request.requestId, threadId: `wire-pane-${++paneThreads}` });
+				void adapter!.request("discord.thread.opened", {
+					requestId: request.requestId,
+					threadId: `wire-pane-${++paneThreads}`,
+					parentChannelId: "fixture-parent",
+				});
 			});
 		};
 		await connectAdapter();

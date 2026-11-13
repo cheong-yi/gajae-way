@@ -202,6 +202,8 @@ export interface TypingPort {
 export interface DiscordClientLike {
 	user?: { id: string | number } | null;
 	channels: { fetch(id: string): Promise<unknown> };
+	/** Listed guilds, as discord.js caches them; iteration yields channels used to place lane panes. */
+	guilds?: { readonly cache?: Iterable<unknown> } | null;
 }
 
 export interface DiscordInboundMessage extends DiscordMessageOriginShape, ReplyMessageLike, AttachmentCarrier {
@@ -1147,15 +1149,81 @@ function isSyntheticDiscordThreadId(conversationId: string): boolean {
 	return /^handoff:[0-9a-f]{32}$/.test(conversationId) || /^lane-report-[0-9a-f]{64}$/.test(conversationId);
 }
 
+/** Fallback lane pane channel when no repo channel matches or the slug is missing. */
+const PANE_FALLBACK_CHANNEL_ID = "1511673764574793798";
+const PANE_ACTIVE_CATEGORY = "ACTIVE REPOS";
+const PANE_INACTIVE_CATEGORY = "INACTIVE-REPOS";
+
+interface PaneChannel {
+	readonly id: string;
+	readonly name: string;
+	readonly categoryName?: string;
+}
+
+/**
+ * Every channel the client has cached, with its category name. A category is the
+ * parent channel object when discord.js resolved one, otherwise the parent id
+ * matched against the same list.
+ */
+function listedPaneChannels(discord: DiscordClientLike): readonly PaneChannel[] {
+	const raw: Array<{ id: string; name: string; parentId?: string; parentName?: string }> = [];
+	for (const guild of collectionValues(discord.guilds?.cache)) {
+		const cache = (guild as { readonly channels?: { readonly cache?: unknown } } | null)?.channels?.cache;
+		for (const entry of collectionValues(cache)) {
+			if (typeof entry !== "object" || entry === null) continue;
+			const candidate = entry as {
+				readonly id?: unknown;
+				readonly name?: unknown;
+				readonly parentId?: unknown;
+				readonly parent?: unknown;
+			};
+			if (typeof candidate.id !== "string" || typeof candidate.name !== "string") continue;
+			const parentName =
+				typeof candidate.parent === "object" &&
+				candidate.parent !== null &&
+				typeof (candidate.parent as { readonly name?: unknown }).name === "string"
+					? (candidate.parent as { readonly name: string }).name
+					: undefined;
+			raw.push({
+				id: candidate.id,
+				name: candidate.name,
+				...(typeof candidate.parentId === "string" ? { parentId: candidate.parentId } : {}),
+				...(parentName === undefined ? {} : { parentName }),
+			});
+		}
+	}
+	const names = new Map(raw.map((channel) => [channel.id, channel.name] as const));
+	return raw.map((channel) => ({
+		id: channel.id,
+		name: channel.name,
+		categoryName: channel.parentName ?? (channel.parentId === undefined ? undefined : names.get(channel.parentId)),
+	}));
+}
+
+/** ACTIVE REPOS `repo-<slug>` first, then INACTIVE-REPOS, then the fallback channel. */
+function paneParentChannelId(discord: DiscordClientLike, repoSlug: string | undefined): string {
+	if (!repoSlug) return PANE_FALLBACK_CHANNEL_ID;
+	const wanted = `repo-${repoSlug}`.toLowerCase();
+	const channels = listedPaneChannels(discord);
+	for (const category of [PANE_ACTIVE_CATEGORY, PANE_INACTIVE_CATEGORY]) {
+		const matches = channels.filter(
+			(channel) => channel.categoryName === category && channel.name.toLowerCase() === wanted,
+		);
+		if (matches.length > 0) return matches.map((channel) => channel.id).sort()[0]!;
+	}
+	return PANE_FALLBACK_CHANNEL_ID;
+}
+
 /** Explicit gateway request; never the inbound mention path and never gateway meta. */
 export async function openDiscordPane(
 	discord: DiscordClientLike,
-	request: { parent: OriginRef; name: string },
-): Promise<string> {
+	request: { parent: OriginRef; name: string; repoSlug?: string },
+): Promise<{ threadId: string; parentChannelId: string }> {
 	const parent = request.parent;
 	if (parent.platform !== "discord" || (parent.kind !== "channel" && parent.kind !== "thread"))
 		throw new Error("invalid pane parent");
-	const channel = await fetchTextChannel(discord, parent.kind === "thread" ? parent.parentId! : parent.conversationId);
+	const parentChannelId = paneParentChannelId(discord, request.repoSlug);
+	const channel = await fetchTextChannel(discord, parentChannelId);
 	// Discord cannot nest threads. A fresh channel anchor also avoids reusing a
 	// source message that already owns a mention-created thread.
 	const anchor = await channel.send(request.name);
@@ -1163,18 +1231,24 @@ export async function openDiscordPane(
 		throw new Error("Discord pane anchor cannot start a thread");
 	const thread = (await anchor.startThread({ name: request.name, autoArchiveDuration: 1440 })) as { id: string };
 	if (typeof thread.id !== "string" || !thread.id) throw new Error("Discord pane thread id missing");
-	return thread.id;
+	return { threadId: thread.id, parentChannelId };
 }
 
 export function subscribeDiscordPaneRequests(gateway: GatewayClientLike, discord: DiscordClientLike): () => void {
 	return (
 		gateway.on?.("discord.thread.open", (value) => {
-			const request = value as { requestId: string; parent: OriginRef; name: string };
+			const request = value as { requestId: string; parent: OriginRef; name: string; repoSlug?: unknown };
+			const paneRequest = {
+				requestId: request.requestId,
+				parent: request.parent,
+				name: request.name,
+				...(typeof request.repoSlug === "string" && request.repoSlug ? { repoSlug: request.repoSlug } : {}),
+			};
 			console.info(`discord_pane_open_received requestId=${(value as { requestId?: string }).requestId}`);
 			void (async () => {
-				let result: { requestId: string; threadId?: string; error?: string };
+				let result: { requestId: string; threadId?: string; parentChannelId?: string; error?: string };
 				try {
-					result = { requestId: request.requestId, threadId: await openDiscordPane(discord, request) };
+					result = { requestId: request.requestId, ...(await openDiscordPane(discord, paneRequest)) };
 					console.info(`discord_pane_open_done requestId=${request.requestId} threadId=${result.threadId}`);
 				} catch (error) {
 					result = { requestId: request.requestId, error: errorMessage(error) };

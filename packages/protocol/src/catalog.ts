@@ -1596,7 +1596,7 @@ export interface OpsDeliveriesResult {
 /** Verb catalog: verb name -> { params, result } (documentation-level typing). */
 export interface VerbCatalogV01 {
 	"discord.thread.opened": {
-		params: { readonly requestId: string; readonly threadId?: string; readonly error?: string };
+		params: { readonly requestId: string; readonly threadId?: string; readonly parentChannelId?: string; readonly error?: string };
 		result: { readonly received: true };
 	};
 	"gateway.status": { params: undefined; result: GatewayStatusResult };
@@ -1690,6 +1690,7 @@ export interface EventCatalogV01 {
 		readonly parent: OriginRef;
 		readonly messageId: string;
 		readonly name: string;
+		readonly repoSlug?: string;
 	};
 	"chat.message": ChatMessagePayload;
 	"chat.progress": ChatProgressPayload;

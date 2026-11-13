@@ -50,6 +50,7 @@ The map is `features/README.md`. Drive one feature file at a time. A pass on one
 No feature has a passing run behind the current order. Every file is uncovered until a run follows it and its own evidence command passes. Do not report one file as verified from another file's run.
 
 The current order: `gajaeway work start --firstmate FILE` records the assignment and opens the task's secondmate pane. It creates no lane and no session. That secondmate's ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. A pane that does not open is a held result. Do not treat the submission as a started lane.
+The explicit local check for that order is `.gjc/skills/verify-firstmate/scripts/pane-order-check.sh`. Exit 0 means the named unit tests passed. Exit 1 means one failed. That command does not post to Discord, and it does not prove the live thread `parent_id`.
 
 The mention in that file can be posted by an operator bot into channel `1511208447939706972`. That post is a stand-in for a human mention. Do not print the bot credential. A human mention remains unverified until a person posts one.
 
@@ -80,6 +81,7 @@ All are executable and live in `.gjc/skills/verify-firstmate/scripts/`.
 - `doctor-test-home.sh [test-home]` reads the deployment and writes nothing.
 - `disposable-repo.sh create <absolute-path>` creates a repository with no remotes and one setup commit. `destroy` removes only a repository this helper created.
 - `live-evidence.sh --since <UTC ISO> [test-home]` reads session logs and work status.
+- `pane-order-check.sh` runs the local pane-order and pane-parent unit tests. Exit 0 is those tests. It does not prove a live Discord `parent_id`.
 
 `VERIFY_GAJAEWAY_TEST_HOME` and `VERIFY_GAJAEWAY_GJC_LOG_DIR` override the test home and the log directory. The marker inside a created repository is `verify-gajaeway-disposable`, so destroy still recognizes repositories the older helper created.
 

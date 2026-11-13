@@ -16,11 +16,11 @@ The pane is the secondmate persona that starts and then watches one running lane
 
 Preconditions:
 
-- A lane is still running. A finished attempt is too late for this feature.
-- This file has no passing evidence.
+- This file has no passing live evidence.
+- The local check does not post to Discord and does not restart a service.
 
-- **Identify the pane.** While `work status` shows the attempt running, find the pane session whose origin is the lane pane, not the worker cwd.
-- **Evidence.** The pane session has no edit tool call. The worker commit is unchanged by the pane. The pane's report is not the public attempt result.
+- **Local check.** Run `.gjc/skills/verify-firstmate/scripts/pane-order-check.sh`. Exit 0 is the explicit check that `--firstmate` creates no lane, the opening line is a bot notice with no author, the pane's ordinary start creates the lane, and the recorded child parent is the channel the adapter reports. Exit 1 means one of those tests failed. This command does not prove a live Discord `parent_id`.
+- **Live order.** A later drive still has to follow this file. Proof remains the worker JSONL plus public work status. A pass on `plan-and-switch` does not cover this file.
 
 ## Gotchas
 

@@ -27,8 +27,8 @@ function parsePane(raw: string | undefined): FirstmatePane | undefined {
 			pane.childOrigin.platform !== "discord" ||
 			pane.childOrigin.kind !== "thread" ||
 			pane.childOrigin.threadVisibility !== "public" ||
-			pane.childOrigin.parentId !==
-				(pane.parentOrigin.kind === "thread" ? pane.parentOrigin.parentId : pane.parentOrigin.conversationId) ||
+			typeof pane.childOrigin.parentId !== "string" ||
+			pane.childOrigin.parentId.length === 0 ||
 			pane.personaOriginKey !== originKey(pane.parentOrigin) ||
 			![pane.taskId, pane.laneName, pane.createdByGateway].every(
 				(value) => typeof value === "string" && value.length > 0,
