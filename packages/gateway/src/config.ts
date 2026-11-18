@@ -72,6 +72,15 @@ export const DEFAULT_SESSIONS_BUSY_STALL_MS = 5 * 60_000;
 export const DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS = 10 * 60_000;
 const SESSIONS_RECOVERY_BOUND_MIN_MS = 60_000;
 const SESSIONS_RECOVERY_BOUND_MAX_MS = 24 * 60 * 60_000;
+/**
+ * An escalated retired hold (#686) whose host stays provably not live this long
+ * is parked: kept, its late answer still wanted, but probed hourly instead of
+ * every sweep. The user was told at escalation; only the per-minute recovery
+ * sweep still read it, and that cost grew without bound (#715).
+ */
+export const DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS = 24 * 60 * 60_000;
+const SESSIONS_RETIRED_HOLD_ABANDON_MIN_MS = 60 * 60_000;
+const SESSIONS_RETIRED_HOLD_ABANDON_MAX_MS = 30 * 24 * 60 * 60_000;
 
 export interface SessionHostConfig {
 	readonly maxLiveHosts?: number;
@@ -82,6 +91,8 @@ export interface SessionHostConfig {
 	readonly busyStallMs?: number;
 	/** Bound on an unresolved turn's hold of its origin when its host is gone; default DEFAULT_SESSIONS_UNRESOLVED_HOLD_MS. */
 	readonly unresolvedHoldMs?: number;
+	/** An escalated retired hold whose host stays not live this long is parked (probed hourly, never closed); default DEFAULT_SESSIONS_RETIRED_HOLD_ABANDON_MS. */
+	readonly retiredHoldAbandonMs?: number;
 }
 export type GjcServiceTier =
 	| "none"
@@ -203,6 +214,8 @@ export interface InterimSpeechConfig {
 }
 
 export interface MemoryConfig {
+	/** Seed built-in memory monitors at boot; unset defaults to true. Does not change existing monitors. */
+	readonly seedDefaultMonitors?: boolean;
 	/**
 	 * Byte size threshold for memory.debloat detector: files in memory/ larger than
 	 * this value (in bytes) are flagged as oversized and routed for restructuring.
@@ -476,9 +489,15 @@ function parseMemory(value: unknown): MemoryConfig {
 	const section = "memory";
 	const input = requireObject(value, section);
 	for (const key of Object.keys(input))
-		if (key !== "debloatByteThreshold") throw new ConfigError("config_invalid", `${section} contains an unknown field`);
+		if (key !== "debloatByteThreshold" && key !== "seedDefaultMonitors")
+			throw new ConfigError("config_invalid", `${section} contains an unknown field`);
+	if (input.seedDefaultMonitors !== undefined && typeof input.seedDefaultMonitors !== "boolean")
+		throw new ConfigError("config_invalid", `${section}.seedDefaultMonitors must be a boolean`);
 	const debloatByteThreshold = parsePositiveInteger(input.debloatByteThreshold, `${section}.debloatByteThreshold`);
-	return debloatByteThreshold === undefined ? {} : { debloatByteThreshold };
+	return {
+		...(debloatByteThreshold === undefined ? {} : { debloatByteThreshold }),
+		...(input.seedDefaultMonitors === undefined ? {} : { seedDefaultMonitors: input.seedDefaultMonitors }),
+	};
 }
 
 function parseStallTimeout(value: unknown): number {
@@ -634,7 +653,14 @@ function parseWork(value: unknown): WorkLaneConfig {
 
 function parseSessions(value: unknown): SessionHostConfig {
 	const input = requireObject(value, "sessions");
-	const keys = ["maxLiveHosts", "idleRetireMs", "idleResetMs", "busyStallMs", "unresolvedHoldMs"];
+	const keys = [
+		"maxLiveHosts",
+		"idleRetireMs",
+		"idleResetMs",
+		"busyStallMs",
+		"unresolvedHoldMs",
+		"retiredHoldAbandonMs",
+	];
 	if (Object.keys(input).some((key) => !keys.includes(key)))
 		throw new ConfigError("config_invalid", `sessions may only contain ${keys.join(", ")}`);
 	if (
@@ -678,12 +704,23 @@ function parseSessions(value: unknown): SessionHostConfig {
 				"config_invalid",
 				`sessions.${key} must be an integer between ${SESSIONS_RECOVERY_BOUND_MIN_MS} and ${SESSIONS_RECOVERY_BOUND_MAX_MS}`,
 			);
+	if (
+		input.retiredHoldAbandonMs !== undefined &&
+		(!Number.isInteger(input.retiredHoldAbandonMs) ||
+			(input.retiredHoldAbandonMs as number) < SESSIONS_RETIRED_HOLD_ABANDON_MIN_MS ||
+			(input.retiredHoldAbandonMs as number) > SESSIONS_RETIRED_HOLD_ABANDON_MAX_MS)
+	)
+		throw new ConfigError(
+			"config_invalid",
+			`sessions.retiredHoldAbandonMs must be an integer between ${SESSIONS_RETIRED_HOLD_ABANDON_MIN_MS} and ${SESSIONS_RETIRED_HOLD_ABANDON_MAX_MS}`,
+		);
 	return {
 		...(input.maxLiveHosts === undefined ? {} : { maxLiveHosts: input.maxLiveHosts as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.idleResetMs === undefined ? {} : { idleResetMs: input.idleResetMs as number }),
 		...(input.busyStallMs === undefined ? {} : { busyStallMs: input.busyStallMs as number }),
 		...(input.unresolvedHoldMs === undefined ? {} : { unresolvedHoldMs: input.unresolvedHoldMs as number }),
+		...(input.retiredHoldAbandonMs === undefined ? {} : { retiredHoldAbandonMs: input.retiredHoldAbandonMs as number }),
 	};
 }
 

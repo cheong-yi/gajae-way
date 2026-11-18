@@ -92,6 +92,36 @@ test("model accepts an explicit selector or a preset", () => {
 	expect(() => parseConfigFile({ schemaVersion: 1, model: ["one", "two"] })).toThrow("model must be an object");
 });
 
+test("memory seed policy accepts only booleans and rejects unknown memory settings", () => {
+	for (const seedDefaultMonitors of [false, true]) {
+		const memory = { seedDefaultMonitors, debloatByteThreshold: 2048 };
+		expect(parseConfigFile({ schemaVersion: 1, memory }).memory).toEqual(memory);
+	}
+	for (const invalid of ["false", 0, 1, null, {}, []])
+		expect(() => parseConfigFile({ schemaVersion: 1, memory: { seedDefaultMonitors: invalid } })).toThrow(
+			"memory.seedDefaultMonitors must be a boolean",
+		);
+	expect(() => parseConfigFile({ schemaVersion: 1, memory: { seedDefaultMonitor: false } })).toThrow(
+		"memory contains an unknown field",
+	);
+});
+
+test("memory seed policy changes require restart without applying or seeding live", async () => {
+	const path = await home();
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, memory: { seedDefaultMonitors: false } }),
+	);
+	const current = await loadConfig({ home: path });
+	await Bun.write(
+		join(path, "config.json"),
+		JSON.stringify({ schemaVersion: 1, memory: { seedDefaultMonitors: true } }),
+	);
+	const result = await reloadConfig(current);
+	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["memory"] });
+	if (result.ok) expect(result.config.memory?.seedDefaultMonitors).toBe(false);
+});
+
 test("stallTimeoutMs has an operational default and the removed batching fields give a migration error", async () => {
 	const path = await home();
 	const defaults = await loadConfig({ home: path });
@@ -260,6 +290,17 @@ test("sessions host limits parse, omit absent fields, and reload live", async ()
 	expect(
 		parseConfigFile({ schemaVersion: 1, sessions: { busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 } }).sessions,
 	).toEqual({ busyStallMs: 86_400_000, unresolvedHoldMs: 60_000 });
+	// Dead retired hold abandonment window, at both ends of its range.
+	expect(parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMs: 3_600_000 } }).sessions).toEqual({
+		retiredHoldAbandonMs: 3_600_000,
+	});
+	expect(parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMs: 2_592_000_000 } }).sessions).toEqual({
+		retiredHoldAbandonMs: 2_592_000_000,
+	});
+	for (const retiredHoldAbandonMs of [3_599_999, 2_592_000_001, 1.5])
+		expect(() => parseConfigFile({ schemaVersion: 1, sessions: { retiredHoldAbandonMs } })).toThrow(
+			"sessions.retiredHoldAbandonMs must be an integer",
+		);
 	const path = await home();
 	await Bun.write(
 		join(path, "config.json"),
