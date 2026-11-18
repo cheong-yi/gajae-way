@@ -12,6 +12,7 @@ import {
 	ModelNotSelectedError,
 	parseWorkerOutputResponse,
 	SessionBusyStalledError,
+	SessionContractError,
 	SessionRequestTimeoutError,
 	type WorkerOutputEvidence,
 } from "../src/orchestrator/session-port";
@@ -791,6 +792,7 @@ test("only a lane bind asks for switchAfterEdit, as exactly one create env entry
 	expect(createInput(1)).not.toHaveProperty("env");
 });
 
+
 test("a journaled create replays its own env instead of the current switchAfterEdit flag", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-switch-replay-"));
 	const store = await Store.open(join(home, "gateway.db"));
@@ -886,6 +888,49 @@ test("a journaled create replays its own env instead of the current switchAfterE
 	expect(calls.some((args) => args.some((arg) => arg.includes("session.close")))).toBe(false);
 	expect(store.bindings.brokerOperation(authority, "session.create", plainScope)).toBeUndefined();
 	expect(store.bindings.getSessionRecord(plainOrigin)?.epoch).toBe(0);
+});
+
+test("control setters without a boolean changed receipt throw SessionContractError with fixed text", async () => {
+	home = await mkdtemp(join(tmpdir(), "gajaeway-session-contract-"));
+	database = await Store.open(join(home, "gateway.db"));
+	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
+	const repo = join(home, "workspace");
+	const malformed = new Set<string>();
+	const run: CliRunner = async (args) => {
+		if (args.includes("session.create"))
+			return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { sessionId: "contract-1" } }), stderr: "" };
+		for (const op of ["model.profile.set", "model.set", "thinking.set", "service_tier.set"])
+			if (args.includes(op)) {
+				const changed = malformed.has(op) ? "yes" : false;
+				return { exitCode: 0, stdout: JSON.stringify({ ok: true, result: { changed } }), stderr: "" };
+			}
+		throw new Error(`unexpected command ${args.join(" ")}`);
+	};
+	const port = new BrokerSessionPort({
+		authority,
+		database,
+		cli: run,
+		tailRunner: new TailRunner({ stream: noRelay, repo }),
+	});
+	const binding = await port.bind({ originKey: "discord/dm/contract", epoch: 0, repo });
+	const target = { sessionId: binding.sessionId, repo };
+	const cases: Array<[string, () => Promise<unknown>]> = [
+		["model.profile.set", () => port.setModel({ ...target, selection: { preset: "gpt-heavy" } })],
+		["model.set", () => port.setModel({ ...target, selection: "openai-codex/gpt-5.5" })],
+		["thinking.set", () => port.setModel({ ...target, selection: "openai-codex/gpt-5.5:high" })],
+		["service_tier.set", () => port.setServiceTier({ ...target, tier: "default" })],
+	];
+	for (const [op, call] of cases) {
+		malformed.clear();
+		malformed.add(op);
+		const error = await call().then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBeInstanceOf(SessionContractError);
+		expect((error as Error).message).toBe(`${op} succeeded without a changed receipt`);
+	}
+});
 });
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
