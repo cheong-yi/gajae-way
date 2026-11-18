@@ -931,7 +931,6 @@ test("control setters without a boolean changed receipt throw SessionContractErr
 		expect((error as Error).message).toBe(`${op} succeeded without a changed receipt`);
 	}
 });
-});
 
 test("broker SessionPort reuses the durable epoch binding and does not recreate a session", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-port-"));
