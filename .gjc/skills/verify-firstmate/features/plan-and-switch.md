@@ -50,3 +50,4 @@ Do this in order:
 - `awaiting_checks` after `end_turn` is the public end of this attempt. It is not a passing pull-request check. This repository has no remote.
 - A missing switch line is a failure. Do not accept the Discord reply as a substitute.
 - Exit `4` means the attempt ended and the public end is missing or before the switch. Exit `5` means the attempt is still open. Wait. Do not record exit `5` as a failure.
+- Passed once on 2026-11-18 at 13:02:33 UTC, run `plan-switch-20261118T130118Z`, evidence `/home/cheongnet/gajaeway/verify-scratch/plan-switch-20261118T130118Z/evidence.txt`. Operator-bot stand-in. An earlier run the same day, `plan-switch-20261118T124356Z`, failed with no switch because GJC 0.21.1 had not yet been patched.

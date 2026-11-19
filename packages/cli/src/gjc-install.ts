@@ -16,7 +16,8 @@ import {
 import { join } from "node:path";
 import { homeLayout } from "@gajae-gateway/home";
 // Bun inlines this packaged text asset into the dist bundle and compiled binary.
-import laneSwitchPatch from "./patches/gajae-code/0.20.0-lane-switch.patch" with { type: "text" };
+import laneSwitchPatch020 from "./patches/gajae-code/0.20.0-lane-switch.patch" with { type: "text" };
+import laneSwitchPatch021 from "./patches/gajae-code/0.21.1-lane-switch.patch" with { type: "text" };
 
 export interface GjcInstallRunResult {
 	readonly exitCode: number;
@@ -27,9 +28,20 @@ export interface GjcInstallRunResult {
 export type GjcInstallRunner = (command: readonly string[], cwd: string) => Promise<GjcInstallRunResult>;
 
 const VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
-const LANE_SWITCH_VERSION = "0.20.0";
+const LANE_SWITCH_PATCHES: Readonly<Record<string, string>> = {
+	"0.20.0": laneSwitchPatch020,
+	"0.21.1": laneSwitchPatch021,
+};
 const LANE_SWITCH_RECEIPT = ".lane-switch-patch.sha256";
-const laneSwitchDigest = createHash("sha256").update(laneSwitchPatch).digest("hex");
+
+function laneSwitchPatch(version: string): string | undefined {
+	return LANE_SWITCH_PATCHES[version];
+}
+
+function laneSwitchDigest(version: string): string | undefined {
+	const patch = laneSwitchPatch(version);
+	return patch === undefined ? undefined : createHash("sha256").update(patch).digest("hex");
+}
 
 async function defaultRunner(command: readonly string[], cwd: string): Promise<GjcInstallRunResult> {
 	const child = Bun.spawn([...command], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -71,9 +83,11 @@ async function verifyGjc(path: string, cwd: string, version: string, runner: Gjc
  * cleanly fails the install; staging is discarded and `current` never moves.
  */
 async function applyInstallPatch(staging: string, version: string, runner: GjcInstallRunner): Promise<void> {
-	if (version !== LANE_SWITCH_VERSION) return;
+	const patch = laneSwitchPatch(version);
+	const digest = laneSwitchDigest(version);
+	if (patch === undefined || digest === undefined) return;
 	const patchPath = join(staging, ".gjc-lane-switch.patch");
-	await writeFile(patchPath, laneSwitchPatch, { mode: 0o600 });
+	await writeFile(patchPath, patch, { mode: 0o600 });
 	try {
 		const command = [
 			"patch",
@@ -86,7 +100,7 @@ async function applyInstallPatch(staging: string, version: string, runner: GjcIn
 			patchPath,
 		];
 		assertSuccessful(command, await runner(command, staging));
-		await writeFile(join(staging, LANE_SWITCH_RECEIPT), laneSwitchDigest, { mode: 0o600 });
+		await writeFile(join(staging, LANE_SWITCH_RECEIPT), digest, { mode: 0o600 });
 	} finally {
 		await rm(patchPath, { force: true });
 	}
@@ -165,9 +179,10 @@ export async function installPinnedGjc(options: {
 			await rename(staging, versionDir);
 			staging = undefined;
 		} else {
+			const digest = laneSwitchDigest(version);
 			if (
-				version === LANE_SWITCH_VERSION &&
-				(await readFile(join(versionDir, LANE_SWITCH_RECEIPT), "utf8").catch(() => undefined)) !== laneSwitchDigest
+				digest !== undefined &&
+				(await readFile(join(versionDir, LANE_SWITCH_RECEIPT), "utf8").catch(() => undefined)) !== digest
 			) {
 				throw new Error(`existing gjc ${version} lacks the required lane-switch patch; use a fresh private prefix`);
 			}

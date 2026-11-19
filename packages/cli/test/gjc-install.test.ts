@@ -163,6 +163,63 @@ test("the embedded 0.20.0 lane-switch patch applies to pristine sources with GNU
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+test("the embedded 0.21.1 lane-switch patch applies to pristine sources with GNU patch --fuzz=0", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-lane-switch-"));
+	const source =
+		process.env.GAJAEWAY_GJC_0_21_1_PRISTINE ??
+		"/home/cheongnet/gajaeway/state/workspace/gjc-lane-switch-0.21.1-pristine";
+	try {
+		const version = Bun.spawnSync(["patch", "--version"], { stdout: "pipe", stderr: "pipe" });
+		expect(version.stdout.toString()).toContain("GNU patch");
+		const patchText = await readFile(
+			join(import.meta.dir, "../src/patches/gajae-code/0.21.1-lane-switch.patch"),
+			"utf8",
+		);
+		const patchPath = join(directory, "0.21.1-lane-switch.patch");
+		await writeFile(patchPath, patchText);
+		const installed = [
+			"agent-core/src/agent-loop.ts",
+			"agent-core/src/agent.ts",
+			"agent-core/src/types.ts",
+			"coding-agent/src/commands/sdk.ts",
+			"coding-agent/src/sdk/host/session-runtime.ts",
+			"coding-agent/src/session/agent-session.ts",
+			"coding-agent/src/session/client-bridge.ts",
+		];
+		for (const relative of installed) {
+			const destination = join(directory, "node_modules", "@gajae-code", relative);
+			await mkdir(dirname(destination), { recursive: true });
+			await writeFile(destination, await readFile(join(source, relative)));
+		}
+		const child = Bun.spawn(
+			[
+				"patch",
+				"--batch",
+				"--forward",
+				"--fuzz=0",
+				"--strip=1",
+				"--directory=node_modules/@gajae-code",
+				"--input",
+				patchPath,
+			],
+			{ cwd: directory, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+		);
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
+		const session = await readFile(
+			join(directory, "node_modules", "@gajae-code", "coding-agent", "src", "session", "agent-session.ts"),
+			"utf8",
+		);
+		expect(session).toContain("installLaneModelSwitch({");
+		expect(session).toContain('process.env.GAJAEWAY_LANE_SWITCH === "1"');
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
 
 test("a lane-switch patch that does not apply cleanly fails", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-lane-switch-"));

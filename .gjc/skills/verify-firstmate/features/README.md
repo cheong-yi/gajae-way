@@ -28,7 +28,7 @@ Each feature file has an H1, one paragraph, then `Sub-features`, `How to get to 
 
 ## Features
 
-- [Plan and switch](./plan-and-switch.md) is the path this skill is built around. Uncovered after the order change. The secondmate pane opens first, its ordinary work start creates the lane, then the strong model plans and edits, one switch happens, the cheap model finishes that turn, and the public attempt ends after the switch.
+- [Plan and switch](./plan-and-switch.md) passed on 2026-11-18 at 13:02:33 UTC. Evidence is `/home/cheongnet/gajaeway/verify-scratch/plan-switch-20261118T130118Z/evidence.txt`. One switch to `opencode-go/deepseek-v4.1-flash:high`, then the public attempt ended at 13:02:52 UTC in `awaiting_checks`. The mention was an operator-bot stand-in. This pass does not cover the other files.
 - [Same-lane follow-up](./same-lane-follow-up.md) asks a settled lane for a second change. Driven on `smoke-live-20261111T083049Z` while `awaiting_checks`. The correction was refused, and a start is held for that wait. Not a cheap-model pass.
 - [New session starts strong](./new-session-starts-strong.md) starts a fresh lane after a switched one. Observed on `smoke-live-20261111T085741Z`. Operator-bot stand-in.
 - [Failed-attempt correction](./failed-attempt-correction.md) is the old name. The gateway corrects an accepted completed attempt that is not awaiting checks. A failed attempt is not the predecessor. The refusal on `smoke-live-20261111T083049Z` is recorded. The accept path is uncovered.
