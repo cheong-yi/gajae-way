@@ -28,11 +28,11 @@ Each feature file has an H1, one paragraph, then `Sub-features`, `How to get to 
 
 ## Features
 
-- [Plan and switch](./plan-and-switch.md) passed on 2026-11-18 at 13:02:33 UTC. Evidence is `/home/cheongnet/gajaeway/verify-scratch/plan-switch-20261118T130118Z/evidence.txt`. One switch to `opencode-go/deepseek-v4.1-flash:high`, then the public attempt ended at 13:02:52 UTC in `awaiting_checks`. The mention was an operator-bot stand-in. This pass does not cover the other files.
+- [Plan and switch](./plan-and-switch.md) passed on 2026-11-19 at 03:57:31 UTC. Evidence is `/home/cheongnet/gajaeway/verify-scratch/plan-switch-20261119T0353Z/evidence.txt`. One switch to `opencode-go/deepseek-v4.1-flash:high`, then the public attempt ended at 03:57:45 UTC in `awaiting_checks`. The mention was an operator-bot stand-in. The repository had no remote, so that wait is not a checks pass. This pass does not cover the other files.
 - [Same-lane follow-up](./same-lane-follow-up.md) asks a settled lane for a second change. Driven on `smoke-live-20261111T083049Z` while `awaiting_checks`. The correction was refused, and a start is held for that wait. Not a cheap-model pass.
 - [New session starts strong](./new-session-starts-strong.md) starts a fresh lane after a switched one. Observed on `smoke-live-20261111T085741Z`. Operator-bot stand-in.
 - [Failed-attempt correction](./failed-attempt-correction.md) is the old name. The gateway corrects an accepted completed attempt that is not awaiting checks. A failed attempt is not the predecessor. The refusal on `smoke-live-20261111T083049Z` is recorded. The accept path is uncovered.
 - [Pane](./pane.md) is the secondmate view: `--firstmate` opens the pane and creates no lane, the opening line is the bot's notice, and the pane's ordinary work start creates the lane. The local check is `scripts/pane-order-check.sh`. No passing live run behind this order.
 - [Pane parent channel](./pane-parent-channel.md) records the matched `repo-<slug>` channel as the pane's child parent. The local adapter match is in the same check. The live Discord `parent_id` is uncovered.
 - [Scoped closeout](./scoped-closeout.md) retires a FirstMate lane with a closeout file. Uncovered. No real closeout file, and plain retire was not rerun.
-- [Awaiting checks](./awaiting-checks.md) is the pull-request checks cycle. Uncovered. A missing `origin` still starts that wait, and that is a confirmed bug, not a passing checks cycle.
+- [Awaiting checks](./awaiting-checks.md) is the pull-request checks cycle. Uncovered. A missing `origin` still starts that wait in this checkout and in upstream `dev`. That is a confirmed bug, not a passing checks cycle. GJC 0.21.1 does not have this state.

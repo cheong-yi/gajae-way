@@ -20,7 +20,7 @@ Preconditions:
 
 - The test gateway is already running. Do not restart it.
 - This feature is uncovered. There is no passing live evidence.
-- This checkout's expected live pane parent is channel `1570682840037728449`. The test gateway already has that channel. The test adapter process has not been restarted, so it does not have the new id in memory yet. Do not restart it.
+- This checkout's expected live pane parent is channel `1570682840037728449`. The test adapter restarted at 2026-11-19 03:43 UTC, so the old "adapter has not been restarted" note is stale. The matched live `parent_id` is still uncovered. Do not restart the adapter from this file.
 - Do not add a unit test that treats channel `1570682840037728449` as a pass. The live check is the Discord thread `parent_id`.
 
 - **Local check.** Run `.gjc/skills/verify-firstmate/scripts/pane-order-check.sh`. Exit 0 proves the adapter match and that the gateway records the channel the adapter reports. It does not prove Discord placed the thread there.
@@ -34,3 +34,4 @@ Preconditions:
 - A hit on `repo-gajae-way` for origin `gajae-way` is the expected live result for this checkout. Do not call that hit a false pass, and do not invent a unit test that passes by naming channel `1570682840037728449`.
 - The recorded pane child parent is the channel the adapter fetched, not the assignment thread's parent.
 - Driven on `pane-parent-20261113T062237Z` by an operator-bot stand-in, before this channel was the expected match and while the test adapter still lacked the new id. Pane thread `1570688678936842280` has `parent_id` `1511208447939706972`, not `1570682840037728449`. Not a pass.
+- On 2026-11-19 the no-remote plan-and-switch drive opened pane thread `1572822853169184789` under fallback channel `1511673764574793798`. That is the missing-slug parent, not the matched `repo-gajae-way` proof.
