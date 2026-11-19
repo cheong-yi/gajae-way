@@ -1596,7 +1596,7 @@ describe("FirstMate immutable store attribution", () => {
 });
 
 describe("work attempt boot reconciliation", () => {
-	test("boot heals a torn work-history settlement before normal recovery starts", async () => {
+	test("boot leaves a closed history beside an open runtime, and the read fails the same check upstream uses", async () => {
 		const f = await fixture();
 		f.database.transaction((tx) => prepareAttempt(f.database, tx, f.runtime, f.record));
 		f.database.transaction((tx) =>
@@ -1639,13 +1639,16 @@ describe("work attempt boot reconciliation", () => {
 			},
 		});
 		try {
-			expect(f.database.work.workAttemptGet(f.runtime.opRef)).toMatchObject({
-				decision: "recovery_indeterminate",
-				settledAt: END,
-				terminal: { reasonCode: "recovery_indeterminate" },
-			});
-			expect(f.database.work.workAttemptOpen()).toEqual([]);
-			expect(f.database.bindings.workLaneRows()[0]?.last_activity_at).toBe(END);
+			expect(() => f.database.work.workAttemptGet(f.runtime.opRef)).toThrow(WorkAttemptStateError);
+			try {
+				f.database.work.workAttemptGet(f.runtime.opRef);
+			} catch (error) {
+				expect(error).toBeInstanceOf(WorkAttemptStateError);
+				expect((error as WorkAttemptStateError).assertion).toBe("attempt.endedAt matches runtime.settledAt");
+			}
+			expect(
+				f.raw.query("SELECT settled_at FROM work_attempt_runtime WHERE op_ref = ?").get(f.runtime.opRef),
+			).toEqual({ settled_at: null });
 		} finally {
 			await server.stop("test shutdown");
 		}
