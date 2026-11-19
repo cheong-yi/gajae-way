@@ -1634,6 +1634,91 @@ export class WorkGroup {
 			throw new BrokerAuthorityError("quarantined");
 	}
 
+	/**
+	 * Closed lane history with an open runtime is not a completed result.
+	 * Record `recovery_indeterminate` at the history end time. Leave the history
+	 * text alone, and do not treat its end state as success.
+	 */
+	healTornHistory(tx: WriteTx): readonly {
+		readonly sessionKey: string;
+		readonly sessionId: string;
+		readonly epoch: number;
+		readonly settledAt: string;
+	}[] {
+		const rows = this.#db
+			.prepare(
+				"SELECT op_ref, job_id, lane_key, session_id, version, settled_at, delivery_id, record_json FROM work_attempt_runtime WHERE settled_at IS NULL AND NOT EXISTS (SELECT 1 FROM broker_quarantine q WHERE q.kind = 'work' AND q.subject_id = work_attempt_runtime.job_id)",
+			)
+			.all() as WorkAttemptDbRow[];
+		const healed: { sessionKey: string; sessionId: string; epoch: number; settledAt: string }[] = [];
+		for (const row of rows) {
+			let runtime: WorkAttemptRuntime;
+			try {
+				runtime = JSON.parse(row.record_json) as WorkAttemptRuntime;
+				validateWorkRuntime(runtime, this.instanceId);
+			} catch {
+				continue;
+			}
+			if (
+				runtime.opRef !== row.op_ref ||
+				runtime.jobId !== row.job_id ||
+				runtime.laneKey !== row.lane_key ||
+				runtime.sessionId !== row.session_id ||
+				runtime.version !== row.version ||
+				runtime.deliveryId !== row.delivery_id ||
+				runtime.settledAt !== null
+			)
+				continue;
+			const json = this.laneJobJson(runtime.jobId);
+			if (json === undefined || this.laneJobJsonByLaneKey(runtime.laneKey) !== json) continue;
+			let record: LaneJobRecord;
+			try {
+				record = parseLaneJobRecord(json);
+			} catch {
+				continue;
+			}
+			const attempt = record.attempts.find((item) => item.opRef === runtime.opRef);
+			if (
+				!attempt ||
+				attempt.endedAt === undefined ||
+				attempt.sessionId !== runtime.sessionId ||
+				attempt.startedAt !== runtime.startedAt
+			)
+				continue;
+			const settledAt = attempt.endedAt;
+			const next: WorkAttemptRuntime = {
+				...runtime,
+				version: runtime.version + 1,
+				terminal: runtime.terminal ?? {
+					kind: "local",
+					reasonCode: "recovery_indeterminate",
+					observedAt: settledAt,
+				},
+				output:
+					runtime.output.disposition === "pending"
+						? { ...runtime.output, disposition: "unavailable", nextReadAt: null }
+						: runtime.output,
+				decision: runtime.decision === "undecided" ? "recovery_indeterminate" : runtime.decision,
+				settledAt,
+			};
+			try {
+				validateWorkRuntime(next, this.instanceId);
+				this.#workValidateHistory(next, record);
+			} catch {
+				continue;
+			}
+			const changed = this.#db
+				.prepare(
+					"UPDATE work_attempt_runtime SET record_json = ?, version = ?, settled_at = ? WHERE op_ref = ? AND version = ? AND settled_at IS NULL",
+				)
+				.run(tx, JSON.stringify(next), next.version, next.settledAt, runtime.opRef, runtime.version).changes;
+			if (changed !== 1) continue;
+			this.#journal.record(tx, "attempt", runtime.opRef, "attempt_settled");
+			healed.push({ sessionKey: runtime.sessionKey, sessionId: runtime.sessionId, epoch: runtime.epoch, settledAt });
+		}
+		return healed;
+	}
+
 	workAttemptGet(opRef: string): WorkAttemptRuntime | undefined {
 		const row = this.#db
 			.prepare("SELECT * FROM work_attempt_runtime WHERE op_ref = ?")

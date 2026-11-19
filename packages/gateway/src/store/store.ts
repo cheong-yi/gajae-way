@@ -92,6 +92,16 @@ export class Store {
 		});
 	}
 
+	/** After journal replay, make a closed history readable without calling it a success. */
+	healTornWorkHistory(): number {
+		return this.transaction((tx) => {
+			const healed = this.work.healTornHistory(tx);
+			for (const item of healed)
+				this.bindings.touchBoundSession(tx, item.sessionKey, item.sessionId, item.epoch, item.settledAt);
+			return healed.length;
+		});
+	}
+
 	inspectBrokerAuthority(): BrokerAuthorityCensus {
 		let populated = false;
 		for (const table of Object.keys(TABLE_OWNER) as OwnedTable[]) {
