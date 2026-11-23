@@ -5,7 +5,7 @@ description: "Drive a FirstMate lane on the Gajaeway test home and prove the pre
 
 # Verify FirstMate
 
-This skill drives the running FirstMate test home the way a mention does. It does not launch a gateway. It does not cover a second product called prewalk. It verifies the order where the secondmate pane opens first and its ordinary work start creates the lane. The plan and the switch are one path, and that path is the feature `plan-and-switch`.
+This skill drives the running FirstMate test home the way a mention does. It does not launch a gateway. The path it verifies is prewalk, the `work.prewalk` setting. It verifies the order where the secondmate pane opens first and its ordinary work start creates the lane. The plan and the switch are one path, and that path is the feature `plan-and-switch`.
 
 Two speeds. Never mix them.
 

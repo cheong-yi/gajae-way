@@ -11,8 +11,10 @@
 #   3  no worker session JSONL since --since
 #   4  the attempt ended, and the public end is missing or before the switch
 #   5  a worker exists and the attempt is still open. Not a result.
-#   6  the first successful edit-type tool result was not from the planning model after a successful
-#      todo_write, or a later one was not from the switch model after the lane_model_switch model_change
+#   6  the first successful edit-type result was not from the planning model after a successful
+#      todo_write, a later result before the switch came from the switch model, or a result
+#      after the switch came from the planning model. Results before the switch line are the
+#      first batch: the switch is recorded after that turn finishes.
 #  64  usage
 set -uo pipefail
 
@@ -117,14 +119,14 @@ for file in "$SESSIONS"/*/*.jsonl; do
 					($later[]
 						| if .assistant == null
 							then "FAIL later edit has no assistant message tool=\(.tool) toolCallId=\(.toolCallId) result_index=\(.index)"
-							elif (.index < $switch_index) or (.assistant.index < $switch_index)
-							then "FAIL later edit came before the lane_model_switch tool=\(.tool) result_index=\(.index) switch_index=\($switch_index)"
-							elif (on_switch(.assistant; $switch_model) | not)
+							elif ((.index < $switch_index) or (.assistant.index < $switch_index)) and on_switch(.assistant; $switch_model)
+							then "FAIL later edit came from the switch model before the lane_model_switch tool=\(.tool) result_index=\(.index) switch_index=\($switch_index)"
+							elif ((.index < $switch_index) or (.assistant.index < $switch_index) | not) and (on_switch(.assistant; $switch_model) | not)
 							then "FAIL later edit came from the planning model tool=\(.tool) assistant_model=\(.assistant.model) switch_model=\($switch_model)"
 							else empty end)
 				]) as $violations
 				| if ($violations | length) > 0 then $violations[]
-					else "PASS edits first on planning model \($first.assistant.model) after todo_write, then \($later | length) on \($switch_model) after the switch" end
+					else "PASS edits first on planning model \($first.assistant.model) after todo_write, \($later | map(select(.index < $switch_index)) | length) more in that batch, then \($later | map(select(.index >= $switch_index)) | length) on \($switch_model) after the switch" end
 			end
 	' -- "$file" 2>/dev/null)
 	if [[ -n $edit_report ]]; then

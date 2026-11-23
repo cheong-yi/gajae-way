@@ -1215,6 +1215,48 @@ export class WorkLaneManager {
 		}
 	}
 	/**
+	 * Closes a mapped reservation on the same clocks as an ordinary lane.
+	 * The record is an abandonment, not a preserving release. An open attempt stays.
+	 * A dirty checkout is held. The assignment row and the worktree stay.
+	 */
+	async sweepFirstmate(now = this.#now()): Promise<{
+		abandoned: string[];
+		held: { name: string; reason: string }[];
+	}> {
+		if (this.#stopped) return { abandoned: [], held: [] };
+		const abandoned: string[] = [];
+		const held: { name: string; reason: string }[] = [];
+		for (const name of this.#db.work.firstmate.reservingNames()) {
+			if (!this.#firstmateSweepDue(name, now)) continue;
+			const result = await this.abandonFirstmate(name);
+			if (result.abandoned) abandoned.push(name);
+			else {
+				held.push({ name, reason: result.reason });
+				console.error(`firstmate_sweep_held name=${name} reason=${result.reason}`);
+			}
+		}
+		return { abandoned, held };
+	}
+
+	#firstmateSweepDue(name: string, now: number): boolean {
+		if (this.#options.lanes.activeLanes(now).some((lane) => lane.name === name))
+			return this.#options.lanes.boundSweepReason(name, now) !== undefined;
+		let job: LaneJobRecord | undefined;
+		try {
+			job = this.#job(name);
+		} catch {
+			return false;
+		}
+		if (job?.attempts.some((attempt) => attempt.endedAt === undefined)) return false;
+		if (job && (job.state === "done" || job.state === "aborted")) return true;
+		const clock = this.#db.bindings.sessionClock(workSessionKey(name));
+		const stamp = clock?.lastActivityAt ?? clock?.createdAt;
+		if (!stamp) return false;
+		const at = Date.parse(stamp);
+		return Number.isFinite(at) && now - at >= this.#options.lanes.idleRetireMs;
+	}
+
+	/**
 	 * Abandonment is the preserving release with no outcome to approve. It closes
 	 * the session through the same lock a scoped release uses, records the row
 	 * that frees the reservation, and aborts the job in that same transaction.

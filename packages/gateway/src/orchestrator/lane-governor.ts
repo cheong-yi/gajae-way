@@ -391,7 +391,7 @@ export class LaneGovernor {
 		if (this.#stopped) return 0;
 		let retired = 0;
 		for (const lane of this.activeLanes(now)) {
-			// A live mapped lane ends only through its owner's release or abandonment.
+			// Mapped lanes are not retired here. Their deadline uses this same predicate and records abandonment.
 			if (this.#mapped(lane.name)) continue;
 			const reason = this.#sweepReason(lane);
 			if (!reason) continue;
@@ -669,6 +669,12 @@ export class LaneGovernor {
 		if (lane.attemptOpen) return undefined;
 		if (TERMINAL_JOB_STATES.has(lane.state)) return `job_${lane.state}` as SweepReason;
 		return lane.idleMs >= this.idleRetireMs ? "idle" : undefined;
+	}
+
+	/** The ordinary sweep predicate for one bound lane. Undefined when it is not bound or must stay. */
+	boundSweepReason(name: string, now = this.#now()): SweepReason | undefined {
+		const lane = this.activeLanes(now).find((item) => item.name === name);
+		return lane ? this.#sweepReason(lane) : undefined;
 	}
 
 	/**

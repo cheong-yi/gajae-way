@@ -76,7 +76,7 @@ Do this in order:
 - The switch fires only on a successful `edit`, `write`, `apply_patch` or `ast_edit` result after a successful `todo_write`. A run that never edits never switches. The first run names `todo_write` as a coached step.
 - The second run has no planning tool call. A reply with no tool calls no longer ends planning: it gets the continue nudge, and the lane still switches only after the first edit batch following `todo_write`.
 - Edits are not blocked. An edit before `todo_write` is allowed and does not switch the model.
-- Exit `6` means the first successful edit-type result did not come from the planning model after a successful `todo_write`, or a later one did not come from the switch model after the `lane_model_switch` line.
+- Exit `6` means the first successful edit-type result did not come from the planning model after a successful `todo_write`, a result before the switch line came from the switch model, or a result after the switch line came from the planning model. File changes before the switch line are the first batch. The switch line is written after that turn finishes.
 - A child `task` call can stop the lane before the switch. This journey forbids that call. A run that uses `task` is a failure of this feature even if a later wake switches.
 - `awaiting_checks` after `end_turn` is the public end of this attempt. It is not a passing pull-request check. This repository has no remote.
 - A missing switch line is a failure. Do not accept the Discord reply as a substitute.

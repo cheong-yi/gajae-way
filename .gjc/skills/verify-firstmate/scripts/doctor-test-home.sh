@@ -62,8 +62,7 @@ done
 if [[ ${#daemons[@]} -eq 0 ]]; then
 	fail "no gateway daemon is running with GAJAEWAY_HOME=$TEST_HOME"
 else
-	config_mtime=$(stat -c %Y -- "$CONFIG")
-	now=$(date +%s)
+	config_mtime=$(stat -c %.9Y -- "$CONFIG")
 	for pid in "${daemons[@]}"; do
 		mapfile -d '' -t argv <"/proc/$pid/cmdline"
 		exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
@@ -72,12 +71,12 @@ else
 		else
 			fail "daemon pid=$pid command=${argv[0]} exe=${exe:-unreadable}, expected $BINARY"
 		fi
-		# work.* is restart-required: a daemon older than config.json runs the old policy.
-		started=$((now - $(ps -o etimes= -p "$pid" | tr -d ' ')))
-		if ((started > config_mtime)); then
-			pass "daemon pid=$pid started $(date -u -d "@$started" +%FT%TZ) after config.json mtime $(date -u -d "@$config_mtime" +%FT%TZ)"
+		# work.* is restart-required. Compare fractional mtimes: whole seconds hide a restart in the same second as the config write.
+		started=$(stat -c %.9Y -- "/proc/$pid" 2>/dev/null || true)
+		if [[ -n $started ]] && awk -v started="$started" -v config="$config_mtime" 'BEGIN { exit !(started > config) }'; then
+			pass "daemon pid=$pid started $started after config.json mtime $config_mtime"
 		else
-			fail "daemon pid=$pid started $(date -u -d "@$started" +%FT%TZ), before config.json mtime $(date -u -d "@$config_mtime" +%FT%TZ); work.prewalk is not live"
+			fail "daemon pid=$pid started ${started:-unknown}, not after config.json mtime $config_mtime; work.prewalk is not live"
 		fi
 	done
 fi

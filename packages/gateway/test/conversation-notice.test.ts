@@ -64,6 +64,8 @@ test("every conversation is told to stay responsive: no foreground waits, answer
 	expect(notice).toContain('gajaeway work start <name> --cwd "$PWD" "<task>"');
 	expect(notice).toContain("--repo <path-or-url>");
 	expect(notice).toContain("internal report, not a chat post");
+	expect(notice).toContain("FirstMate must not use that ordinary start for an assignment");
+	expect(notice).toContain("The secondmate starts the lane");
 	expect(notice).not.toContain("--notify");
 	// Only chat platforms get the gateway's 👀 acknowledgement, so only they are told about it.
 	expect(currentConversationNotice(channel)).toContain("The gateway already marks the message 👀");
