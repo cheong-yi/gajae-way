@@ -11,7 +11,8 @@
 #   3  no worker session JSONL since --since
 #   4  the attempt ended, and the public end is missing or before the switch
 #   5  a worker exists and the attempt is still open. Not a result.
-#   6  a successful edit-type tool result came before the lane_model_switch model_change or from the planning model
+#   6  the first successful edit-type tool result was not from the planning model after a successful
+#      todo_write, or a later one was not from the switch model after the lane_model_switch model_change
 #  64  usage
 set -uo pipefail
 
@@ -70,7 +71,10 @@ for file in "$SESSIONS"/*/*.jsonl; do
 	echo "PASS model_change $switches"
 	edit_report=$(jq -s -r '
 		. as $entries
-		| ([$entries | to_entries[]
+		| def on_switch($assistant; $switch_model):
+			($assistant != null)
+			and (($assistant.model == $switch_model) or ($switch_model | startswith($assistant.model + ":")));
+		([$entries | to_entries[]
 			| select(.value.type == "model_change" and ((.value.reason // "") | startswith("lane_model_switch ")))]
 			| first) as $switch
 		| select($switch != null)
@@ -86,21 +90,42 @@ for file in "$SESSIONS"/*/*.jsonl; do
 		| ([$entries | to_entries[]
 			| select(.value.type == "message" and .value.message.role == "toolResult")
 			| select(.value.message.isError == false)
+			| select(.value.message.toolName == "todo_write")
+			| .key]) as $todos
+		| ([$entries | to_entries[]
+			| select(.value.type == "message" and .value.message.role == "toolResult")
+			| select(.value.message.isError == false)
 			| select(.value.message.toolName == "edit" or .value.message.toolName == "write"
-				or .value.message.toolName == "apply_patch" or .value.message.toolName == "ast_edit")]) as $results
-		| ([$results[]
+				or .value.message.toolName == "apply_patch" or .value.message.toolName == "ast_edit")
 			| .key as $result_index
 			| .value.message as $result
 			| ($assistants | map(select(.calls | index($result.toolCallId))) | first) as $assistant
-			| (($assistant != null)
-				and (($assistant.model == $switch_model) or ($switch_model | startswith($assistant.model + ":")))) as $after_on_executor
-			| select(($result_index < $switch_index) or ($assistant == null) or ($assistant.index < $switch_index)
-				or ($after_on_executor | not))
-			| "FAIL edit before switch or from planning model tool=\($result.toolName) toolCallId=\($result.toolCallId)"
-				+ " result_index=\($result_index) assistant_model=\(if $assistant == null then "-" else $assistant.model end)"
-				+ " switch_model=\($switch_model)"]) as $violations
-		| if ($violations | length) > 0 then $violations[]
-			else "PASS edits after switch on \($switch_model) count=\($results | length)" end
+			| {index: $result_index, tool: $result.toolName, toolCallId: $result.toolCallId, assistant: $assistant}]) as $edits
+		| if ($edits | length) == 0 then "PASS edits none on \($switch_model); no edit-type result recorded"
+			else
+				($edits[0]) as $first
+				| ($edits[1:]) as $later
+				| ([
+					(if $first.assistant == null
+						then "FAIL first edit has no assistant message tool=\($first.tool) toolCallId=\($first.toolCallId)"
+						elif on_switch($first.assistant; $switch_model)
+						then "FAIL first edit came from the switch model tool=\($first.tool) assistant_model=\($first.assistant.model)"
+						else empty end),
+					(if ([$todos[] | select(. < $first.index)] | length) == 0
+						then "FAIL first edit came before a successful todo_write tool=\($first.tool) result_index=\($first.index)"
+						else empty end),
+					($later[]
+						| if .assistant == null
+							then "FAIL later edit has no assistant message tool=\(.tool) toolCallId=\(.toolCallId) result_index=\(.index)"
+							elif (.index < $switch_index) or (.assistant.index < $switch_index)
+							then "FAIL later edit came before the lane_model_switch tool=\(.tool) result_index=\(.index) switch_index=\($switch_index)"
+							elif (on_switch(.assistant; $switch_model) | not)
+							then "FAIL later edit came from the planning model tool=\(.tool) assistant_model=\(.assistant.model) switch_model=\($switch_model)"
+							else empty end)
+				]) as $violations
+				| if ($violations | length) > 0 then $violations[]
+					else "PASS edits first on planning model \($first.assistant.model) after todo_write, then \($later | length) on \($switch_model) after the switch" end
+			end
 	' -- "$file" 2>/dev/null)
 	if [[ -n $edit_report ]]; then
 		printf '%s\n' "$edit_report"

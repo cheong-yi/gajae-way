@@ -216,26 +216,26 @@ test("work.allowNested is a boolean restart-required policy and defaults disable
 	if (result.ok) expect(result.config.work).toEqual({ allowNested: false });
 });
 
-test("work.switchAfterEdit is an absent-off restart-required lane policy", async () => {
+test("work.planThenSwitch is an absent-off restart-required lane policy", async () => {
 	const path = await home();
 	const defaults = await loadConfig({ home: path });
-	expect(defaults.work?.switchAfterEdit).toBeUndefined();
-	expect(parseConfigFile({ schemaVersion: 1, work: { switchAfterEdit: true } }).work).toEqual({
-		switchAfterEdit: true,
+	expect(defaults.work?.planThenSwitch).toBeUndefined();
+	expect(parseConfigFile({ schemaVersion: 1, work: { planThenSwitch: true } }).work).toEqual({
+		planThenSwitch: true,
 	});
-	expect(parseConfigFile({ schemaVersion: 1, work: { switchAfterEdit: false } }).work).toEqual({
-		switchAfterEdit: false,
+	expect(parseConfigFile({ schemaVersion: 1, work: { planThenSwitch: false } }).work).toEqual({
+		planThenSwitch: false,
 	});
 	for (const invalid of ["true", 1, null])
-		expect(() => parseConfigFile({ schemaVersion: 1, work: { switchAfterEdit: invalid } })).toThrow(
-			"work.switchAfterEdit",
+		expect(() => parseConfigFile({ schemaVersion: 1, work: { planThenSwitch: invalid } })).toThrow(
+			"work.planThenSwitch",
 		);
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { switchAfterEdit: false } }));
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { planThenSwitch: false } }));
 	const current = await loadConfig({ home: path });
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { switchAfterEdit: true } }));
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { planThenSwitch: true } }));
 	const result = await reloadConfig(current);
 	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["work"] });
-	if (result.ok) expect(result.config.work).toEqual({ switchAfterEdit: false });
+	if (result.ok) expect(result.config.work).toEqual({ planThenSwitch: false });
 });
 
 for (const [work, field] of [

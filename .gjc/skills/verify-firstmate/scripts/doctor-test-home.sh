@@ -24,10 +24,10 @@ fail() {
 }
 
 # 1. Lane switch policy is on in the file the gateway loads.
-if [[ $(jq -r '.work.switchAfterEdit' "$CONFIG" 2>/dev/null) == true ]]; then
-	pass "config.work.switchAfterEdit=true ($CONFIG)"
+if [[ $(jq -r '.work.planThenSwitch' "$CONFIG" 2>/dev/null) == true ]]; then
+	pass "config.work.planThenSwitch=true ($CONFIG)"
 else
-	fail "config.work.switchAfterEdit is not true ($CONFIG)"
+	fail "config.work.planThenSwitch is not true ($CONFIG)"
 fi
 
 # 2. The installed pin was patched with this checkout's matching patch bytes.
@@ -41,7 +41,7 @@ else
 fi
 
 # 3. The deployed gateway binary carries the flag and the env name it forwards.
-for needle in switchAfterEdit GAJAEWAY_LANE_SWITCH; do
+for needle in planThenSwitch GAJAEWAY_LANE_SWITCH; do
 	if grep -a -q -F -- "$needle" "$BINARY" 2>/dev/null; then
 		pass "$BINARY contains $needle"
 	else
@@ -77,7 +77,7 @@ else
 		if ((started > config_mtime)); then
 			pass "daemon pid=$pid started $(date -u -d "@$started" +%FT%TZ) after config.json mtime $(date -u -d "@$config_mtime" +%FT%TZ)"
 		else
-			fail "daemon pid=$pid started $(date -u -d "@$started" +%FT%TZ), before config.json mtime $(date -u -d "@$config_mtime" +%FT%TZ); work.switchAfterEdit is not live"
+			fail "daemon pid=$pid started $(date -u -d "@$started" +%FT%TZ), before config.json mtime $(date -u -d "@$config_mtime" +%FT%TZ); work.planThenSwitch is not live"
 		fi
 	done
 fi

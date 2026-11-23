@@ -763,7 +763,7 @@ test("model thinking suffix is applied on create and explicit model changes", as
 	);
 });
 
-test("only a lane bind asks for switchAfterEdit, as exactly one create env entry", async () => {
+test("only a lane bind asks for planThenSwitch, as exactly one create env entry", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-switch-"));
 	database = await Store.open(join(home, "gateway.db"));
 	const authority = initializeTestBrokerAuthority(database, join(home, "agent"));
@@ -784,7 +784,7 @@ test("only a lane bind asks for switchAfterEdit, as exactly one create env entry
 		cli: run,
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
-	await port.bind({ originKey: "work/task/a", epoch: 0, repo, codingRegister: true, switchAfterEdit: true });
+	await port.bind({ originKey: "work/task/a", epoch: 0, repo, codingRegister: true, planThenSwitch: true });
 	await port.bind({ originKey: "discord/dm/persona", epoch: 0, repo });
 	const createInput = (index: number) => {
 		const args = calls[index]!;
@@ -797,7 +797,7 @@ test("only a lane bind asks for switchAfterEdit, as exactly one create env entry
 });
 
 
-test("a journaled create replays its own env instead of the current switchAfterEdit flag", async () => {
+test("a journaled create replays its own env instead of the current planThenSwitch flag", async () => {
 	home = await mkdtemp(join(tmpdir(), "gajaeway-session-switch-replay-"));
 	const store = await Store.open(join(home, "gateway.db"));
 	database = store;
@@ -825,7 +825,7 @@ test("a journaled create replays its own env instead of the current switchAfterE
 		cli: capture,
 		tailRunner: new TailRunner({ stream: noRelay, repo }),
 	});
-	await capturePort.bind({ originKey: "work/task/journal-on", epoch: 0, repo, switchAfterEdit: true });
+	await capturePort.bind({ originKey: "work/task/journal-on", epoch: 0, repo, planThenSwitch: true });
 	await capturePort.bind({ originKey: "work/task/journal-off", epoch: 0, repo });
 	const enabledRequest = journaled[0]!;
 	const plainRequest = journaled[1]!;
@@ -857,7 +857,7 @@ test("a journaled create replays its own env instead of the current switchAfterE
 			}),
 		);
 
-	// Enabled create left pending, then a restart reads switchAfterEdit=false: the
+	// Enabled create left pending, then a restart reads planThenSwitch=false: the
 	// journaled env wins, so the original session is neither closed nor replaced.
 	const enabledOrigin = "work/task/replay-on";
 	const enabledScope = JSON.stringify([enabledOrigin, 0]);
@@ -868,7 +868,7 @@ test("a journaled create replays its own env instead of the current switchAfterE
 		repo,
 	});
 	seedCreate(enabledOrigin, "gw-bind-journal-on", enabledRequest);
-	await expect(port.bind({ originKey: enabledOrigin, epoch: 0, repo, switchAfterEdit: false })).resolves.toMatchObject({
+	await expect(port.bind({ originKey: enabledOrigin, epoch: 0, repo, planThenSwitch: false })).resolves.toMatchObject({
 		sessionId: "sdk-original",
 		epoch: 0,
 	});
@@ -877,12 +877,12 @@ test("a journaled create replays its own env instead of the current switchAfterE
 	expect(store.bindings.brokerOperation(authority, "session.create", enabledScope)).toBeUndefined();
 	expect(store.bindings.getSessionRecord(enabledOrigin)?.epoch).toBe(0);
 
-	// Plain create left pending, then a restart reads switchAfterEdit=true: the
+	// Plain create left pending, then a restart reads planThenSwitch=true: the
 	// ambiguous intent replays under its original request, with no close.
 	const plainOrigin = "work/task/replay-off";
 	const plainScope = JSON.stringify([plainOrigin, 0]);
 	seedCreate(plainOrigin, "gw-bind-journal-off", plainRequest);
-	await expect(port.bind({ originKey: plainOrigin, epoch: 0, repo, switchAfterEdit: true })).resolves.toMatchObject({
+	await expect(port.bind({ originKey: plainOrigin, epoch: 0, repo, planThenSwitch: true })).resolves.toMatchObject({
 		sessionId: "sdk-replayed",
 		epoch: 0,
 	});
