@@ -9,7 +9,7 @@ export type MigrationStatement<T> = Omit<ReturnType<Database["query"]>, "all" | 
 	all(...params: SQLQueryBindings[]): T[];
 	get(...params: SQLQueryBindings[]): T | null;
 };
-export const LATEST_SCHEMA_VERSION = 44;
+export const LATEST_SCHEMA_VERSION = 46;
 
 export interface MigrationHost {
 	readonly database: {
@@ -935,6 +935,35 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 		});
 	}
 	if (current < 43) {
+		// Follow-up to #738: the idle-fenced close (`session.close` with `ifIdle: true`)
+		// is journaled as its own operation kind, distinct from the forced close.
+		host.withTransaction(() => {
+			host.database.execute(`
+				CREATE TABLE broker_operations_v43 (
+					authority_key TEXT NOT NULL,
+					operation TEXT NOT NULL CHECK(operation IN ('session.create','turn.prompt','session.close','session.close_if_idle')),
+					scope TEXT NOT NULL,
+					operation_ref TEXT NOT NULL,
+					request_json TEXT NOT NULL,
+					state TEXT NOT NULL CHECK(state IN ('pending','complete')),
+					result_json TEXT,
+					created_at TEXT NOT NULL,
+					completed_at TEXT,
+					PRIMARY KEY(authority_key, operation, scope),
+					CHECK((state = 'complete' AND result_json IS NOT NULL AND completed_at IS NOT NULL) OR (state = 'pending' AND result_json IS NULL AND completed_at IS NULL))
+				);
+				INSERT INTO broker_operations_v43 (authority_key, operation, scope, operation_ref, request_json, state, result_json, created_at, completed_at)
+					SELECT authority_key, operation, scope, operation_ref, request_json, state, result_json, created_at, completed_at FROM broker_operations;
+				DROP TABLE broker_operations;
+				ALTER TABLE broker_operations_v43 RENAME TO broker_operations;
+				CREATE INDEX IF NOT EXISTS broker_operations_completed ON broker_operations(state, completed_at);
+			`);
+			host.database
+				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+				.run(43, new Date().toISOString());
+		});
+	}
+	if (current < 44) {
 		// One migration for the whole FirstMate record. Owner evidence is independent of the
 		// mutable native journal projections: no historical task import, no approval inference,
 		// no reconstruction from native rows. thread_key, worktree_path, and git_dir are not
@@ -1006,14 +1035,14 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 			}
 			host.database
 				.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-				.run(43, new Date().toISOString());
+				.run(44, new Date().toISOString());
 		});
 	}
 	const imagesColumnMissing = !host.database
 		.statement<{ name: string }>("PRAGMA table_info(inbound_messages)")
 		.all()
 		.some((row) => row.name === "images_json");
-	if (current < 44 || imagesColumnMissing) {
+	if (current < 45 || imagesColumnMissing) {
 		// Migration 42 was recorded on a binary that inserted the version row
 		// without adding images_json. A later recorded version does not re-run 42.
 		host.withTransaction(() => {
@@ -1027,11 +1056,60 @@ CREATE INDEX monitor_events_monitor ON monitor_events(monitor_id, fired_at);`);
 				host.database.execute("ALTER TABLE inbound_messages ADD COLUMN images_json TEXT");
 			const recorded = host.database
 				.statement<{ version: number }>("SELECT version FROM schema_migrations WHERE version = ?")
-				.get(44);
+				.get(45);
 			if (recorded === null)
 				host.database
 					.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
-					.run(44, new Date().toISOString());
+					.run(45, new Date().toISOString());
+		});
+	}
+	const operationsSql =
+		(
+			host.database
+				.statement<{ sql: string | null }>("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'broker_operations'")
+				.get()?.sql ?? ""
+		);
+	if (current < 46 || (operationsSql !== "" && !operationsSql.includes("session.close_if_idle"))) {
+		// A database that recorded schema 43 before this body rebuilt broker_operations
+		// will not re-run that block. The version row does not prove the constraint.
+		host.withTransaction(() => {
+			const sql =
+				(
+					host.database
+						.statement<{ sql: string | null }>(
+							"SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'broker_operations'",
+						)
+						.get()?.sql ?? ""
+				);
+			if (sql !== "" && !sql.includes("session.close_if_idle")) {
+				host.database.execute(`
+					CREATE TABLE broker_operations_v43 (
+						authority_key TEXT NOT NULL,
+						operation TEXT NOT NULL CHECK(operation IN ('session.create','turn.prompt','session.close','session.close_if_idle')),
+						scope TEXT NOT NULL,
+						operation_ref TEXT NOT NULL,
+						request_json TEXT NOT NULL,
+						state TEXT NOT NULL CHECK(state IN ('pending','complete')),
+						result_json TEXT,
+						created_at TEXT NOT NULL,
+						completed_at TEXT,
+						PRIMARY KEY(authority_key, operation, scope),
+						CHECK((state = 'complete' AND result_json IS NOT NULL AND completed_at IS NOT NULL) OR (state = 'pending' AND result_json IS NULL AND completed_at IS NULL))
+					);
+					INSERT INTO broker_operations_v43 (authority_key, operation, scope, operation_ref, request_json, state, result_json, created_at, completed_at)
+						SELECT authority_key, operation, scope, operation_ref, request_json, state, result_json, created_at, completed_at FROM broker_operations;
+					DROP TABLE broker_operations;
+					ALTER TABLE broker_operations_v43 RENAME TO broker_operations;
+					CREATE INDEX IF NOT EXISTS broker_operations_completed ON broker_operations(state, completed_at);
+				`);
+			}
+			const recorded = host.database
+				.statement<{ version: number }>("SELECT version FROM schema_migrations WHERE version = ?")
+				.get(46);
+			if (recorded === null)
+				host.database
+					.statement("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)")
+					.run(46, new Date().toISOString());
 		});
 	}
 }

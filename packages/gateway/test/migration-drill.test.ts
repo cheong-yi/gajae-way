@@ -596,11 +596,12 @@ test("a database that recorded migration 25 before the AGENTS.md columns were ad
 	}
 });
 
-test("FirstMate is one migration at schema 43 after upstream 40 41 and 42", async () => {
+test("FirstMate is one migration at schema 44 after upstream schema 43", async () => {
 	const source = await Bun.file(new URL("../src/store/migrations.ts", import.meta.url)).text();
-	const marker = "if (current " + String.fromCharCode(60) + " 43)";
+	const marker = "if (current " + String.fromCharCode(60) + " 44)";
 	const start = source.indexOf(marker);
-	expect(LATEST_SCHEMA_VERSION).toBe(44);
+	expect(LATEST_SCHEMA_VERSION).toBe(46);
+	expect(source.slice(0, start)).toContain("session.close_if_idle");
 	expect(start).toBeGreaterThan(0);
 	const nextMarker = "if (current " + String.fromCharCode(60);
 	const next = source.indexOf(nextMarker, start + marker.length);
@@ -629,9 +630,9 @@ test("FirstMate is one migration at schema 43 after upstream 40 41 and 42", asyn
 			DROP TABLE firstmate_attempts;
 			DROP TABLE firstmate_abandonments;
 			DROP TABLE firstmate_assignments;
-			DELETE FROM schema_migrations WHERE version > 42;
+			DELETE FROM schema_migrations WHERE version > 43;
 		`);
-		expect(rewound.query<{ n: number }, []>("SELECT MAX(version) AS n FROM schema_migrations").get()?.n).toBe(42);
+		expect(rewound.query<{ n: number }, []>("SELECT MAX(version) AS n FROM schema_migrations").get()?.n).toBe(43);
 		rewound.close();
 
 		const upgraded = await Store.open(path);
@@ -639,9 +640,9 @@ test("FirstMate is one migration at schema 43 after upstream 40 41 and 42", asyn
 		upgraded.close();
 		const after = new Database(path, { readonly: true });
 		const added = after
-			.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version > 42 AND version < 44")
+			.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version > 43 AND version < 45")
 			.all();
-		expect(added).toEqual([{ version: 43 }]);
+		expect(added).toEqual([{ version: 44 }]);
 		const tables = after
 			.query<{ name: string }, []>("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'firstmate_%' ORDER BY name")
 			.all()
@@ -660,7 +661,7 @@ test("FirstMate is one migration at schema 43 after upstream 40 41 and 42", asyn
 	}
 });
 
-test("schema 44 adds images_json when migration 42 was recorded without it", async () => {
+test("schema 45 adds images_json when migration 42 was recorded without it", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-drill-images-json-"));
 	const path = join(directory, "gateway.db");
 	try {
@@ -679,10 +680,57 @@ test("schema 44 adds images_json when migration 42 was recorded without it", asy
 			.query<{ name: string }, []>("PRAGMA table_info(inbound_messages)")
 			.all()
 			.map((column) => column.name);
-		const added = after.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version = 44").all();
+		const added = after.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version = 45").all();
 		after.close();
 		expect(columns).toContain("images_json");
-		expect(added).toEqual([{ version: 44 }]);
+		expect(added).toEqual([{ version: 45 }]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("schema 46 rebuilds broker_operations when recorded schema 43 lacks session.close_if_idle", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "gajaeway-drill-close-if-idle-"));
+	const path = join(directory, "gateway.db");
+	try {
+		const current = await Store.open(path);
+		current.close();
+		const raw = new Database(path);
+		raw.exec(`
+			CREATE TABLE broker_operations_old (
+				authority_key TEXT NOT NULL,
+				operation TEXT NOT NULL CHECK(operation IN ('session.create','turn.prompt','session.close')),
+				scope TEXT NOT NULL,
+				operation_ref TEXT NOT NULL,
+				request_json TEXT NOT NULL,
+				state TEXT NOT NULL CHECK(state IN ('pending','complete')),
+				result_json TEXT,
+				created_at TEXT NOT NULL,
+				completed_at TEXT,
+				PRIMARY KEY(authority_key, operation, scope),
+				CHECK((state = 'complete' AND result_json IS NOT NULL AND completed_at IS NOT NULL) OR (state = 'pending' AND result_json IS NULL AND completed_at IS NULL))
+			);
+			INSERT INTO broker_operations_old SELECT * FROM broker_operations;
+			DROP TABLE broker_operations;
+			ALTER TABLE broker_operations_old RENAME TO broker_operations;
+		`);
+		const recorded = raw.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version = 43").get();
+		expect(recorded?.version).toBe(43);
+		expect(String(raw.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE name = 'broker_operations'").get()?.sql)).not.toContain(
+			"session.close_if_idle",
+		);
+		raw.close();
+
+		const upgraded = await Store.open(path);
+		expect(upgraded.schemaVersion).toBe(LATEST_SCHEMA_VERSION);
+		upgraded.close();
+
+		const after = new Database(path, { readonly: true });
+		const sql = String(after.query<{ sql: string }, []>("SELECT sql FROM sqlite_master WHERE name = 'broker_operations'").get()?.sql);
+		const heal = after.query<{ version: number }, []>("SELECT version FROM schema_migrations WHERE version = 46").all();
+		after.close();
+		expect(sql).toContain("session.close_if_idle");
+		expect(heal).toEqual([{ version: 46 }]);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
