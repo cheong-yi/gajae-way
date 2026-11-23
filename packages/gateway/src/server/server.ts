@@ -1332,7 +1332,7 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		sessionModel: options.config.model,
 		brokerGeneration: () => options.broker?.generation ?? 0,
 		allowNested: () => runtime.config.work?.allowNested === true,
-		planThenSwitch: () => runtime.config.work?.planThenSwitch === true,
+		prewalk: () => runtime.config.work?.prewalk === true,
 		personaHold: (originKey) => personaSessions.admissionHold(originKey),
 		notifyPersona: (originKey) => {
 			void personaSessions.notifyInbound(originKey);

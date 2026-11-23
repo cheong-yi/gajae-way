@@ -193,8 +193,8 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	return result;
 }
 
-test("work.start asks for planThenSwitch on the lane bind only when configured", async () => {
-	const enabled = await fixture({ planThenSwitch: () => true });
+test("work.start asks for prewalk on the lane bind only when configured", async () => {
+	const enabled = await fixture({ prewalk: () => true });
 	const binds: SessionBindInput[] = [];
 	const bind = enabled.port.bind.bind(enabled.port);
 	enabled.port.bind = async (input) => {
@@ -203,7 +203,7 @@ test("work.start asks for planThenSwitch on the lane bind only when configured",
 	};
 	await started(enabled);
 	expect(binds).toHaveLength(1);
-	expect(binds[0]).toMatchObject({ planThenSwitch: true, codingRegister: true });
+	expect(binds[0]).toMatchObject({ prewalk: true, codingRegister: true });
 
 	const disabled = await fixture();
 	const disabledBinds: SessionBindInput[] = [];
@@ -214,7 +214,7 @@ test("work.start asks for planThenSwitch on the lane bind only when configured",
 	};
 	await started(disabled);
 	expect(disabledBinds).toHaveLength(1);
-	expect(disabledBinds[0]?.planThenSwitch).toBe(false);
+	expect(disabledBinds[0]?.prewalk).toBe(false);
 });
 
 test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
