@@ -11,6 +11,7 @@
 #   3  no worker session JSONL since --since
 #   4  the attempt ended, and the public end is missing or before the switch
 #   5  a worker exists and the attempt is still open. Not a result.
+#   6  a successful edit-type tool result came before the lane_model_switch model_change or from the planning model
 #  64  usage
 set -uo pipefail
 
@@ -35,6 +36,7 @@ workers=0
 missing=0
 pending=0
 late=0
+edits=0
 for file in "$SESSIONS"/*/*.jsonl; do
 	[[ -f $file ]] || continue
 	header=$(head -n 1 -- "$file" | jq -r --argjson since "$since" '
@@ -66,6 +68,44 @@ for file in "$SESSIONS"/*/*.jsonl; do
 		continue
 	fi
 	echo "PASS model_change $switches"
+	edit_report=$(jq -s -r '
+		. as $entries
+		| ([$entries | to_entries[]
+			| select(.value.type == "model_change" and ((.value.reason // "") | startswith("lane_model_switch ")))]
+			| first) as $switch
+		| select($switch != null)
+		| ($switch.key) as $switch_index
+		| ($switch.value.model // "" | sub(":(minimal|low|medium|high|xhigh|max|off)$"; "")) as $switch_model
+		| ([$entries | to_entries[]
+			| select(.value.type == "message" and .value.message.role == "assistant")
+			| {
+				index: .key,
+				model: "\(.value.message.provider)/\(.value.message.model)",
+				calls: [.value.message.content[]? | select(.type == "toolCall") | .id],
+			}]) as $assistants
+		| ([$entries | to_entries[]
+			| select(.value.type == "message" and .value.message.role == "toolResult")
+			| select(.value.message.isError == false)
+			| select(.value.message.toolName == "edit" or .value.message.toolName == "write"
+				or .value.message.toolName == "apply_patch" or .value.message.toolName == "ast_edit")]) as $results
+		| ([$results[]
+			| .key as $result_index
+			| .value.message as $result
+			| ($assistants | map(select(.calls | index($result.toolCallId))) | first) as $assistant
+			| (($assistant != null)
+				and (($assistant.model == $switch_model) or ($switch_model | startswith($assistant.model + ":")))) as $after_on_executor
+			| select(($result_index < $switch_index) or ($assistant == null) or ($assistant.index < $switch_index)
+				or ($after_on_executor | not))
+			| "FAIL edit before switch or from planning model tool=\($result.toolName) toolCallId=\($result.toolCallId)"
+				+ " result_index=\($result_index) assistant_model=\(if $assistant == null then "-" else $assistant.model end)"
+				+ " switch_model=\($switch_model)"]) as $violations
+		| if ($violations | length) > 0 then $violations[]
+			else "PASS edits after switch on \($switch_model) count=\($results | length)" end
+	' -- "$file" 2>/dev/null)
+	if [[ -n $edit_report ]]; then
+		printf '%s\n' "$edit_report"
+		edits=$((edits + $(grep -c '^FAIL ' <<<"$edit_report")))
+	fi
 	base=$(basename -- "$header")
 	job=${base#wt-}
 	if [[ $base != wt-* || -z $job ]]; then
@@ -138,6 +178,8 @@ elif ((workers == 0)); then
 	exit 3
 elif ((missing > 0)); then
 	exit 1
+elif ((edits > 0)); then
+	exit 6
 elif ((late > 0)); then
 	exit 4
 elif ((pending > 0)); then
