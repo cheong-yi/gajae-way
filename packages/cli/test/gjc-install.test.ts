@@ -55,11 +55,11 @@ test("installPinnedGjc installs in a versioned prefix, verifies it, and flips cu
 	}
 });
 
-test("installPinnedGjc applies the 0.21.1 lane-switch patch after bun install and before verification", async () => {
+test("installPinnedGjc applies the 0.22.0 lane-switch patch after bun install and before verification", async () => {
 	const directory = await home();
 	const { runner, commands, cwds } = installRunner();
 	try {
-		await installPinnedGjc({ home: directory, version: "0.21.1", runner });
+		await installPinnedGjc({ home: directory, version: "0.22.0", runner });
 		const installIndex = commands.findIndex((command) => command[0] === "bun");
 		const patchIndex = commands.findIndex((command) => command[0] === "patch");
 		const verifyIndex = commands.findIndex((command) => command[1] === "--version");
@@ -78,34 +78,31 @@ test("installPinnedGjc applies the 0.21.1 lane-switch patch after bun install an
 		]);
 		expect(cwds[patchIndex]).toMatch(/\/\.staging-[^/]+$/);
 		const layout = homeLayout(directory);
-		expect(await readdir(join(layout.gjcPrefix, "0.21.1"))).not.toContain(".gjc-lane-switch.patch");
+		expect(await readdir(join(layout.gjcPrefix, "0.22.0"))).not.toContain(".gjc-lane-switch.patch");
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
 });
 
-test("the embedded 0.21.1 lane-switch patch applies to pristine sources with GNU patch --fuzz=0", async () => {
+test("the embedded 0.22.0 lane-switch patch applies to pristine sources with GNU patch --fuzz=0", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "gajaeway-lane-switch-"));
 	const source =
-		process.env.GAJAEWAY_GJC_0_21_1_PRISTINE ??
-		"/home/cheongnet/gajaeway/state/workspace/gjc-lane-switch-0.21.1-pristine";
+		process.env.GAJAEWAY_GJC_0_22_0_PRISTINE ??
+		"/home/cheongnet/gajaeway/verify-scratch/gjc-lane-switch-0.22.0-pristine";
 	try {
 		const version = Bun.spawnSync(["patch", "--version"], { stdout: "pipe", stderr: "pipe" });
 		expect(version.stdout.toString()).toContain("GNU patch");
 		const patchText = await readFile(
-			join(import.meta.dir, "../src/patches/gajae-code/0.21.1-lane-switch.patch"),
+			join(import.meta.dir, "../src/patches/gajae-code/0.22.0-lane-switch.patch"),
 			"utf8",
 		);
-		const patchPath = join(directory, "0.21.1-lane-switch.patch");
+		const patchPath = join(directory, "0.22.0-lane-switch.patch");
 		await writeFile(patchPath, patchText);
 		const installed = [
 			"agent-core/src/agent-loop.ts",
 			"agent-core/src/agent.ts",
 			"agent-core/src/types.ts",
-			"coding-agent/src/commands/sdk.ts",
-			"coding-agent/src/sdk/host/session-runtime.ts",
 			"coding-agent/src/session/agent-session.ts",
-			"coding-agent/src/session/client-bridge.ts",
 		];
 		for (const relative of installed) {
 			const destination = join(directory, "node_modules", "@gajae-code", relative);
@@ -137,6 +134,10 @@ test("the embedded 0.21.1 lane-switch patch applies to pristine sources with GNU
 		);
 		expect(session).toContain("installLaneModelSwitch({");
 		expect(session).toContain('process.env.GAJAEWAY_LANE_SWITCH === "1"');
+		// The switch's marker, with the executor's thinking level, reaches the shared-session model_change.
+		expect(session).toContain("metadata: marker,");
+		expect(session).toContain('{ type: "model_change", model: selector, role: "default", metadata: options.metadata }');
+		expect(session).toContain("metadata?: { reason?: string; thinkingLevel?: string | null };");
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -149,8 +150,8 @@ test("a lane-switch patch that does not apply cleanly fails", async () => {
 		const destination = join(directory, "node_modules", "@gajae-code", installed);
 		await mkdir(dirname(destination), { recursive: true });
 		await writeFile(destination, "// tampered source\n");
-		const patchPath = join(directory, "0.21.1-lane-switch.patch");
-		await writeFile(patchPath, await readFile(join(import.meta.dir, "../src/patches/gajae-code/0.21.1-lane-switch.patch")));
+		const patchPath = join(directory, "0.22.0-lane-switch.patch");
+		await writeFile(patchPath, await readFile(join(import.meta.dir, "../src/patches/gajae-code/0.22.0-lane-switch.patch")));
 		const child = Bun.spawn(
 			["patch", "--batch", "--forward", "--fuzz=0", "--strip=1", "--directory=node_modules/@gajae-code", "--input", patchPath],
 			{ cwd: directory, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
@@ -178,7 +179,7 @@ test("a failed lane-switch patch fails the install before verification and leave
 			const result = await failing.runner(command, cwd);
 			return command[0] === "patch" ? { exitCode: 1, stdout: "", stderr: "error: patch does not apply" } : result;
 		};
-		await expect(installPinnedGjc({ home: directory, version: "0.21.1", runner: patchFails })).rejects.toThrow(
+		await expect(installPinnedGjc({ home: directory, version: "0.22.0", runner: patchFails })).rejects.toThrow(
 			"error: patch does not apply",
 		);
 		expect(failing.commands.map((command) => command[0])).toEqual(["bun", "patch"]);
@@ -211,12 +212,12 @@ test("an existing unpatched pin is refused without patching it in place", async 
 	const { runner, commands } = installRunner();
 	try {
 		const layout = homeLayout(directory);
-		await mkdir(join(layout.gjcPrefix, "0.21.1"), { recursive: true });
-		await expect(installPinnedGjc({ home: directory, version: "0.21.1", runner })).rejects.toThrow(
+		await mkdir(join(layout.gjcPrefix, "0.22.0"), { recursive: true });
+		await expect(installPinnedGjc({ home: directory, version: "0.22.0", runner })).rejects.toThrow(
 			"lacks the required lane-switch patch",
 		);
 		expect(commands).toEqual([]);
-		expect(await readdir(join(layout.gjcPrefix, "0.21.1"))).toEqual([]);
+		expect(await readdir(join(layout.gjcPrefix, "0.22.0"))).toEqual([]);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}
@@ -226,9 +227,9 @@ test("an existing patched pin verifies without applying the patch twice", async 
 	const directory = await home();
 	const { runner, commands } = installRunner();
 	try {
-		await installPinnedGjc({ home: directory, version: "0.21.1", runner });
+		await installPinnedGjc({ home: directory, version: "0.22.0", runner });
 		commands.length = 0;
-		await installPinnedGjc({ home: directory, version: "0.21.1", runner });
+		await installPinnedGjc({ home: directory, version: "0.22.0", runner });
 		expect(commands).toHaveLength(1);
 		expect(commands[0]?.[1]).toBe("--version");
 	} finally {
@@ -244,6 +245,23 @@ test("installPinnedGjc prunes old versions while retaining current and its prede
 		const layout = homeLayout(directory);
 		expect(await readlink(layout.gjcCurrent)).toBe("0.22.0");
 		expect((await readdir(layout.gjcPrefix)).sort()).toEqual(["0.19.0", "0.22.0", "current"]);
+	} finally {
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("the gateway's GJC pin carries the only lane-switch patch, and installing the pin applies it", async () => {
+	// A renewal that takes upstream's newer pin without porting the patch fails here.
+	const manifest = JSON.parse(await readFile(join(import.meta.dir, "../../gateway/package.json"), "utf8")) as {
+		gjc: { version: string };
+	};
+	const pin = manifest.gjc.version;
+	expect(await readdir(join(import.meta.dir, "../src/patches/gajae-code"))).toEqual([`${pin}-lane-switch.patch`]);
+	const directory = await home();
+	const { runner, commands } = installRunner();
+	try {
+		await installPinnedGjc({ home: directory, version: pin, runner });
+		expect(commands.some((command) => command[0] === "patch")).toBe(true);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

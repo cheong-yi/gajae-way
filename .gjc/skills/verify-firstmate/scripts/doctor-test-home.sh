@@ -31,7 +31,7 @@ else
 fi
 
 # 2. The installed pin was patched with this checkout's matching patch bytes.
-#    A leftover 0.20.0 receipt does not prove the running pin.
+#    A leftover receipt for an older version does not prove the running pin.
 expected=$(sha256sum -- "$PATCH" 2>/dev/null | cut -d' ' -f1)
 recorded=$(tr -d '[:space:]' <"$STAMP" 2>/dev/null)
 if [[ -n $PIN && -f $PATCH && -n $expected && $recorded == "$expected" && $(readlink "$TEST_HOME/gjc/current" 2>/dev/null) == "$PIN" ]]; then

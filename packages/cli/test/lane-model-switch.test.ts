@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const modulePath = "coding-agent/src/session/lane-model-switch.ts";
-const patchPath = join(import.meta.dir, "../src/patches/gajae-code/0.21.1-lane-switch.patch");
+const patchPath = join(import.meta.dir, "../src/patches/gajae-code/0.22.0-lane-switch.patch");
 
 function extractHunk(patch: string): { count: number; body: string[] } {
 	const lines = patch.split("\n");
@@ -39,12 +39,17 @@ interface LaneOptions {
 	enabled: boolean;
 	resolveExecutor: () => Promise<{ model: any; thinkingLevel?: string } | undefined>;
 	waitForPersistence: () => Promise<void>;
-	commit: (model: any, thinkingLevel: string | undefined) => Promise<void>;
+	commit: (model: any, thinkingLevel: string | undefined, marker: Marker) => Promise<void>;
 	currentModel: () => any;
 	currentThinkingLevel: () => string | undefined;
 	activeToolNames: () => readonly string[];
 	notify: (message: string) => void;
 	warn: (message: string) => void;
+}
+
+interface Marker {
+	reason: string;
+	thinkingLevel: string | null;
 }
 
 interface LaneModule {
@@ -114,7 +119,7 @@ function harness(options: HarnessOptions = {}) {
 	const steers: any[] = [];
 	const notices: string[] = [];
 	const warns: string[] = [];
-	const commits: Array<{ model: any; thinkingLevel: string | undefined }> = [];
+	const commits: Array<{ model: any; thinkingLevel: string | undefined; marker: Marker }> = [];
 	const events: string[] = [];
 	const steeringQueue: any[] = [];
 	const state = { messages: [...(options.stateMessages ?? [])] };
@@ -158,9 +163,9 @@ function harness(options: HarnessOptions = {}) {
 			events.push("persist");
 			await options.persist?.();
 		},
-		commit: async (committedModel, committedLevel) => {
+		commit: async (committedModel, committedLevel, marker) => {
 			events.push("commit");
-			commits.push({ model: committedModel, thinkingLevel: committedLevel });
+			commits.push({ model: committedModel, thinkingLevel: committedLevel, marker });
 			await commit();
 		},
 		currentModel: options.currentModel ?? (() => model),
@@ -274,7 +279,13 @@ test("one switch after the first edit batch once todo exists, awaited before the
 	releaseCommit();
 	await pending;
 
-	expect(laneRun.commits).toEqual([{ model: laneRun.target, thinkingLevel: "high" }]);
+	expect(laneRun.commits).toEqual([
+		{
+			model: laneRun.target,
+			thinkingLevel: "high",
+			marker: { reason: "lane_model_switch executor/cheap:high", thinkingLevel: "high" },
+		},
+	]);
 	expect(customTypes(laneRun.steers)).toContain("prewalk-checklist");
 	expect(laneRun.events.indexOf("persist")).toBeLessThan(laneRun.events.indexOf("commit"));
 	expect(laneRun.events.indexOf("commit")).toBeLessThan(laneRun.events.indexOf("steer:prewalk-checklist"));
@@ -387,4 +398,51 @@ test("a session that does not enable the lane installs nothing (GAJAEWAY_LANE_SW
 	expect(laneRun.steers).toHaveLength(0);
 	expect(laneRun.notices).toHaveLength(0);
 	expect(laneRun.warns).toHaveLength(0);
+});
+
+test("the switch applies the executor role's configured thinking level and records it on the marker", async () => {
+	// The test home's executor role is opencode-go/deepseek-v4.1-flash:high while
+	// the planner runs at medium.
+	const target = { provider: "opencode-go", id: "deepseek-v4.1-flash" };
+	const laneRun = harness({
+		model: { provider: "anthropic", id: "claude-opus-5-5" },
+		target,
+		currentThinkingLevel: () => "medium",
+		resolveExecutor: async () => ({ model: target, thinkingLevel: "high" }),
+	});
+	await laneRun.end([result("todo_write")]);
+	await laneRun.end([result("edit")]);
+	expect(laneRun.warns).toEqual([]);
+	expect(laneRun.commits).toEqual([
+		{
+			model: target,
+			thinkingLevel: "high",
+			marker: { reason: "lane_model_switch opencode-go/deepseek-v4.1-flash:high", thinkingLevel: "high" },
+		},
+	]);
+	expect(laneRun.notices).toContain(
+		"lane_model_switch opencode-go/deepseek-v4.1-flash:high: switched after the first edit result",
+	);
+});
+
+test("an executor role with no thinking level records a null level and a bare selector", async () => {
+	const laneRun = harness({ resolveExecutor: async () => ({ model: { provider: "executor", id: "cheap" } }) });
+	await laneRun.end([result("todo_write")]);
+	await laneRun.end([result("edit")]);
+	expect(laneRun.commits).toHaveLength(1);
+	expect(laneRun.commits[0]?.thinkingLevel).toBeUndefined();
+	expect(laneRun.commits[0]?.marker).toEqual({ reason: "lane_model_switch executor/cheap", thinkingLevel: null });
+});
+
+test("the same model at a different configured thinking level still switches to that level", async () => {
+	const model = { provider: "executor", id: "cheap" };
+	const laneRun = harness({
+		model,
+		target: model,
+		currentThinkingLevel: () => "low",
+		resolveExecutor: async () => ({ model, thinkingLevel: "high" }),
+	});
+	await laneRun.end([result("todo_write")]);
+	await laneRun.end([result("edit")]);
+	expect(laneRun.commits.map(commit => [commit.thinkingLevel, commit.marker.thinkingLevel])).toEqual([["high", "high"]]);
 });

@@ -15,6 +15,8 @@
 #      todo_write, a later result before the switch came from the switch model, or a result
 #      after the switch came from the planning model. Results before the switch line are the
 #      first batch: the switch is recorded after that turn finishes.
+#   7  the switch's model_change thinkingLevel is missing or differs from the level that switch
+#      applied, the level suffix on the next default configured_model_chain entry
 #  64  usage
 set -uo pipefail
 
@@ -40,6 +42,7 @@ missing=0
 pending=0
 late=0
 edits=0
+thinking=0
 for file in "$SESSIONS"/*/*.jsonl; do
 	[[ -f $file ]] || continue
 	header=$(head -n 1 -- "$file" | jq -r --argjson since "$since" '
@@ -71,6 +74,22 @@ for file in "$SESSIONS"/*/*.jsonl; do
 		continue
 	fi
 	echo "PASS model_change $switches"
+	thinking_report=$(jq -s -r '
+		. as $entries
+		| ([$entries | to_entries[]
+			| select(.value.type == "model_change" and ((.value.reason // "") | startswith("lane_model_switch ")))]
+			| first) as $switch
+		| ([$entries | to_entries[]
+			| select(.key > $switch.key and .value.type == "configured_model_chain" and .value.role == "default")]
+			| first) as $chain
+		| ($switch.value.thinkingLevel // null) as $marker
+		| ((($chain.value.entries[0] // "") | capture(":(?<level>minimal|low|medium|high|xhigh|max|off)$") | .level) // null) as $applied
+		| if $chain == null then "FAIL switch thinking level: no default configured_model_chain after the switch"
+			elif $marker != $applied then "FAIL switch thinking level marker=\($marker) applied=\($applied)"
+			else "PASS switch thinking level \($marker) matches the applied chain \($chain.value.entries[0])" end
+	' -- "$file" 2>/dev/null)
+	echo "$thinking_report"
+	[[ $thinking_report == PASS* ]] || thinking=$((thinking + 1))
 	edit_report=$(jq -s -r '
 		. as $entries
 		| def on_switch($assistant; $switch_model):
@@ -207,6 +226,8 @@ elif ((missing > 0)); then
 	exit 1
 elif ((edits > 0)); then
 	exit 6
+elif ((thinking > 0)); then
+	exit 7
 elif ((late > 0)); then
 	exit 4
 elif ((pending > 0)); then

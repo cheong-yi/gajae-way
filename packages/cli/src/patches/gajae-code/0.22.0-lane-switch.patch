@@ -44,7 +44,7 @@ diff --git a/agent-core/src/types.ts b/agent-core/src/types.ts
 diff --git a/agent-core/src/agent.ts b/agent-core/src/agent.ts
 --- a/agent-core/src/agent.ts
 +++ b/agent-core/src/agent.ts
-@@ -662,6 +662,11 @@
+@@ -664,6 +664,11 @@
  	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
  	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
  	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
@@ -56,7 +56,7 @@ diff --git a/agent-core/src/agent.ts b/agent-core/src/agent.ts
  
  	constructor(opts: AgentOptions = {}) {
  		this.#state = { ...this.#state, ...opts.initialState };
-@@ -2217,6 +2222,15 @@
+@@ -2264,6 +2269,15 @@
  			onHarmonyLeak: this.#onHarmonyLeak,
  			getToolChoice,
  			getReasoning: () => this.#state.thinkingLevel,
@@ -102,7 +102,7 @@ diff --git a/agent-core/src/agent-loop.ts b/agent-core/src/agent-loop.ts
 diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/session/agent-session.ts
 --- a/coding-agent/src/session/agent-session.ts
 +++ b/coding-agent/src/session/agent-session.ts
-@@ -564,6 +564,7 @@
+@@ -568,6 +568,7 @@
  	FoldCoordinator,
  	type ForegroundFoldOutcome,
  } from "./fold-coordinator";
@@ -110,7 +110,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
  import {
  	type BashExecutionMessage,
-@@ -7232,6 +7233,42 @@
+@@ -7288,6 +7289,42 @@
  		// (session persistence, hooks, auto-compaction, retry logic)
  		this.#unsubscribeAgent = this.agent.subscribeCanonicalEvents(this.#trackAgentEvent);
  
@@ -136,11 +136,11 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
 +				return { model: resolved.model, thinkingLevel: resolved.thinkingLevel };
 +			},
 +			waitForPersistence: () => this.sessionManager.flush(),
-+			commit: async (model, thinkingLevel) => {
++			commit: async (model, thinkingLevel, marker) => {
 +				await this.setModelTemporary(model, thinkingLevel, {
 +					persistAsSessionDefault: true,
 +					cause: "user-selection",
-+					metadata: { reason: `lane_model_switch ${model.provider}/${model.id}` },
++					metadata: marker,
 +				});
 +			},
 +			currentModel: () => this.model,
@@ -153,21 +153,22 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  		// Re-evaluate append-only context mode when the setting changes at runtime.
  		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
  		// SDK ToolSession callbacks capture the just-constructed session. Defer the
-@@ -24064,7 +24101,12 @@
+@@ -24689,7 +24726,13 @@
  	async #setSharedSessionDefaultModel(
  		model: Model,
  		thinkingLevel: ThinkingLevel | undefined,
--		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void },
+-		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void; cause?: ModelChangeCause },
 +		options: {
 +			signal?: AbortSignal;
 +			shouldMutate?: () => boolean;
 +			onMutationStarted?: () => void;
-+			metadata?: { reason?: string };
++			cause?: ModelChangeCause;
++			metadata?: { reason?: string; thinkingLevel?: string | null };
 +		},
  	): Promise<void> {
  		const operation = "set session model";
  		const assertMode = this.#controlPublicationModeFence(operation);
-@@ -24129,7 +24171,9 @@
+@@ -24754,7 +24797,9 @@
  			);
  			throw new ModelProfileApplyCommittedError(selector, committedOwnership!.version, error);
  		};
@@ -177,17 +178,17 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
 +		];
  		if (effectiveLevel !== this.#thinkingLevel)
  			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
- 		entries.push({
-@@ -24325,6 +24369,8 @@
+ 		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
+@@ -24952,6 +24997,8 @@
  			persistAsSessionDefault?: boolean;
  			cause?: ModelChangeCause;
  			reason?: TemporaryModelReason;
 +			/** Recorded on the session-log model_change, so a marker survives replay. */
-+			metadata?: { reason?: string };
++			metadata?: { reason?: string; thinkingLevel?: string | null };
  			providerSessionScope?: TemporaryProviderSessionScope;
  			signal?: AbortSignal;
  			shouldMutate?: () => boolean;
-@@ -24446,6 +24492,7 @@
+@@ -25073,6 +25120,7 @@
  			this.sessionManager.appendModelChange(
  				`${model.provider}/${model.id}`,
  				options?.persistAsSessionDefault ? "default" : "temporary",
@@ -198,7 +199,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
 diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/session/lane-model-switch.ts
 --- a/coding-agent/src/session/lane-model-switch.ts
 +++ b/coding-agent/src/session/lane-model-switch.ts
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,182 @@
 +import type { Agent, AgentMessage, CompletedTurnContext, ThinkingLevel } from "@gajae-code/agent-core";
 +import type { Model, ToolResultMessage } from "@gajae-code/ai/core";
 +
@@ -233,10 +234,23 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 +const TODO_TOOL = "todo_write";
 +/**
 + * Tools whose successful result arms the switch. A plain shell run never does:
-+ * GJC 0.21.1 carries no tool-command dispatch provenance, so `bash` is not an
++ * GJC 0.22.0 carries no tool-command dispatch provenance, so `bash` is not an
 + * action.
 + */
 +const IMPLEMENTATION_TOOLS: ReadonlySet<string> = new Set(["edit", "write", "apply_patch", "ast_edit"]);
++
++/** Session-log metadata on the switch's model_change: the `lane_model_switch` marker. */
++export interface LaneModelSwitchMarker {
++	reason: string;
++	/** The executor role's configured thinking level, or null when the role sets none. */
++	thinkingLevel: ThinkingLevel | null;
++}
++
++/** The marker for a switch to `model` at `thinkingLevel`, as `provider/id[:level]`. */
++export function laneModelSwitchMarker(model: Model, thinkingLevel: ThinkingLevel | undefined): LaneModelSwitchMarker {
++	const selector = `${model.provider}/${model.id}${thinkingLevel === undefined ? "" : `:${thinkingLevel}`}`;
++	return { reason: `lane_model_switch ${selector}`, thinkingLevel: thinkingLevel ?? null };
++}
 +
 +/** Capabilities the lane switch borrows from its owning session. */
 +export interface LaneModelSwitchHost {
@@ -245,8 +259,11 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 +	resolveExecutor: () => Promise<{ model: Model; thinkingLevel?: ThinkingLevel } | undefined>;
 +	/** Resolves once the completed turn's assistant message and tool results are durable. */
 +	waitForPersistence: () => Promise<void>;
-+	/** Commits the session default model and publishes the `lane_model_switch` marker with it. */
-+	commit: (model: Model, thinkingLevel: ThinkingLevel | undefined) => Promise<void>;
++	/**
++	 * Commits the session default model at the executor's thinking level and
++	 * records `marker` on the same model_change entry.
++	 */
++	commit: (model: Model, thinkingLevel: ThinkingLevel | undefined, marker: LaneModelSwitchMarker) => Promise<void>;
 +	currentModel: () => Model | undefined;
 +	currentThinkingLevel: () => ThinkingLevel | undefined;
 +	activeToolNames: () => readonly string[];
@@ -324,11 +341,10 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 +				);
 +				return;
 +			}
-+			await options.commit(target.model, target.thinkingLevel);
++			const marker = laneModelSwitchMarker(target.model, target.thinkingLevel);
++			await options.commit(target.model, target.thinkingLevel, marker);
 +			steer(CHECKLIST_MESSAGE_TYPE, PREWALK_CHECKLIST);
-+			options.notify(
-+				`lane_model_switch switched to ${target.model.provider}/${target.model.id} after the first ${actionTool} result`,
-+			);
++			options.notify(`${marker.reason}: switched after the first ${actionTool} result`);
 +		} catch (error) {
 +			options.warn(`lane_model_switch failed; keeping the current model: ${String(error)}`);
 +		}

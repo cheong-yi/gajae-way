@@ -85,6 +85,10 @@ All are executable and live in `.gjc/skills/verify-firstmate/scripts/`.
 
 `VERIFY_GAJAEWAY_TEST_HOME` and `VERIFY_GAJAEWAY_GJC_LOG_DIR` override the test home and the log directory. The marker inside a created repository is `verify-gajaeway-disposable`, so destroy still recognizes repositories the older helper created.
 
+## Upstream renewal
+
+GJC pin on an upstream merge: the merged pin in `packages/gateway/package.json` (`gjc.version`) is the newer of the fork's pin and upstream's pin by semver. Never keep the older one from either side. When upstream's pin is newer, the renewal is not done until three things hold. The lane-switch patch exists as `packages/cli/src/patches/gajae-code/<pin>-lane-switch.patch` and applies to that release with `patch --fuzz=0`, or it is dropped because that release ships the same lane switch. No doc, test, or skill still names the old pin as current. `/verify-firstmate` passes again on the test home with the new pin installed. A renewal that moved the pin and skipped that rerun has not verified this path.
+
 ## Maintenance
 
 Use `/maintain-verification-skill` to keep this map honest. That pass may fix this skill. It may not edit the product to make a failed drive look passed.
