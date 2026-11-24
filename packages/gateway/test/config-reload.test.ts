@@ -216,26 +216,26 @@ test("work.allowNested is a boolean restart-required policy and defaults disable
 	if (result.ok) expect(result.config.work).toEqual({ allowNested: false });
 });
 
-test("work.switchAfterEdit is an absent-off restart-required lane policy", async () => {
+test("work.prewalk is an absent-off restart-required lane policy", async () => {
 	const path = await home();
 	const defaults = await loadConfig({ home: path });
-	expect(defaults.work?.switchAfterEdit).toBeUndefined();
-	expect(parseConfigFile({ schemaVersion: 1, work: { switchAfterEdit: true } }).work).toEqual({
-		switchAfterEdit: true,
+	expect(defaults.work?.prewalk).toBeUndefined();
+	expect(parseConfigFile({ schemaVersion: 1, work: { prewalk: true } }).work).toEqual({
+		prewalk: true,
 	});
-	expect(parseConfigFile({ schemaVersion: 1, work: { switchAfterEdit: false } }).work).toEqual({
-		switchAfterEdit: false,
+	expect(parseConfigFile({ schemaVersion: 1, work: { prewalk: false } }).work).toEqual({
+		prewalk: false,
 	});
 	for (const invalid of ["true", 1, null])
-		expect(() => parseConfigFile({ schemaVersion: 1, work: { switchAfterEdit: invalid } })).toThrow(
-			"work.switchAfterEdit",
+		expect(() => parseConfigFile({ schemaVersion: 1, work: { prewalk: invalid } })).toThrow(
+			"work.prewalk",
 		);
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { switchAfterEdit: false } }));
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { prewalk: false } }));
 	const current = await loadConfig({ home: path });
-	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { switchAfterEdit: true } }));
+	await Bun.write(join(path, "config.json"), JSON.stringify({ schemaVersion: 1, work: { prewalk: true } }));
 	const result = await reloadConfig(current);
 	expect(result).toMatchObject({ ok: true, changed: [], restartRequired: ["work"] });
-	if (result.ok) expect(result.config.work).toEqual({ switchAfterEdit: false });
+	if (result.ok) expect(result.config.work).toEqual({ prewalk: false });
 });
 
 for (const [work, field] of [

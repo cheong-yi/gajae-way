@@ -39,10 +39,12 @@ export interface WorkLaneConfig {
 	readonly idleRetireMs?: number;
 	readonly allowNested?: boolean;
 	/**
-	 * Ask each new lane session host to switch models after an edit. Absent means
-	 * off, and it never applies to persona or monitor binds.
+	 * Ask each new lane session host to plan on its planning model, which also
+	 * makes the first edit batch once a todo list exists, then switch once to the
+	 * switch model. Absent means off, and it never applies to persona or monitor
+	 * binds.
 	 */
-	readonly switchAfterEdit?: boolean;
+	readonly prewalk?: boolean;
 }
 
 /**
@@ -617,12 +619,12 @@ function parseWork(value: unknown): WorkLaneConfig {
 	const input = requireObject(value, "work");
 	if (
 		Object.keys(input).some(
-			(key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested" && key !== "switchAfterEdit",
+			(key) => key !== "maxLanes" && key !== "idleRetireMs" && key !== "allowNested" && key !== "prewalk",
 		)
 	)
 		throw new ConfigError(
 			"config_invalid",
-			"work may only contain maxLanes, idleRetireMs, allowNested, and switchAfterEdit",
+			"work may only contain maxLanes, idleRetireMs, allowNested, and prewalk",
 		);
 	if (
 		input.maxLanes !== undefined &&
@@ -641,13 +643,13 @@ function parseWork(value: unknown): WorkLaneConfig {
 		);
 	if (input.allowNested !== undefined && typeof input.allowNested !== "boolean")
 		throw new ConfigError("config_invalid", "work.allowNested must be a boolean");
-	if (input.switchAfterEdit !== undefined && typeof input.switchAfterEdit !== "boolean")
-		throw new ConfigError("config_invalid", "work.switchAfterEdit must be a boolean");
+	if (input.prewalk !== undefined && typeof input.prewalk !== "boolean")
+		throw new ConfigError("config_invalid", "work.prewalk must be a boolean");
 	return {
 		...(input.maxLanes === undefined ? {} : { maxLanes: input.maxLanes as number }),
 		...(input.idleRetireMs === undefined ? {} : { idleRetireMs: input.idleRetireMs as number }),
 		...(input.allowNested === undefined ? {} : { allowNested: input.allowNested as boolean }),
-		...(input.switchAfterEdit === undefined ? {} : { switchAfterEdit: input.switchAfterEdit as boolean }),
+		...(input.prewalk === undefined ? {} : { prewalk: input.prewalk as boolean }),
 	};
 }
 

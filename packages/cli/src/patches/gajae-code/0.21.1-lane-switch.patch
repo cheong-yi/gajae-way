@@ -1,99 +1,104 @@
-diff --git a/agent-core/src/agent-loop.ts b/agent-core/src/agent-loop.ts
---- a/agent-core/src/agent-loop.ts
-+++ b/agent-core/src/agent-loop.ts
-@@ -4200,6 +4200,7 @@
- 						? undefined
- 						: { value: getLogicalTurnToolChoice() },
- 					attemptTransaction,
-+					commitMessages,
- 				);
- 				const detection = detectHarmonyLeakInAssistantMessage(message);
- 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
-@@ -4870,8 +4871,12 @@
- 	provisionalToolTransaction?: ManagedAttemptTransaction,
- 	toolChoiceOverride?: { value: ToolChoice | undefined },
- 	managedAttemptTransaction?: ManagedAttemptTransaction,
-+	commitPolicyMessages?: (messages: AgentMessage[], scope?: AttemptScope) => void,
- ): Promise<AssistantMessage> {
- 	const managedDegradedFieldDiagnostics = new Set<string>();
-+	const policyMessages = await config.beforeModelCall?.(context.messages);
-+	config = { ...config, model: config.getModel?.() ?? config.model };
-+	if (policyMessages?.length) commitPolicyMessages?.(policyMessages, scope);
- 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
- 	let messages = context.messages;
- 	// Revoke before invoking any caller-controlled transform so it cannot retain
-diff --git a/agent-core/src/agent.ts b/agent-core/src/agent.ts
---- a/agent-core/src/agent.ts
-+++ b/agent-core/src/agent.ts
-@@ -645,6 +645,7 @@
- 	}
- 
- 	streamFn: StreamFn;
-+	beforeModelCall?: AgentLoopConfig["beforeModelCall"];
- 	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
- 	getAuthCredentialType?: (provider: string) => "api_key" | "oauth" | undefined;
- 	/**
-@@ -2149,6 +2150,8 @@
- 			preferWebsockets: this.#preferWebsockets,
- 			convertToLlm: this.#convertToLlm,
- 			transformContext: this.#transformContext,
-+			getModel: () => this.#state.model,
-+			beforeModelCall: messages => this.beforeModelCall?.(messages) ?? Promise.resolve(undefined),
- 			attemptMinter: {
- 				mint: () => {
- 					const scope = this.#attemptAuthority.mintMain();
 diff --git a/agent-core/src/types.ts b/agent-core/src/types.ts
 --- a/agent-core/src/types.ts
 +++ b/agent-core/src/types.ts
-@@ -528,6 +528,9 @@
- 	 * the next model call instead of waiting for the next prompt.
- 	 */
+@@ -530,6 +530,22 @@
  	getReasoning?: () => Effort | undefined;
-+	/** Await session policy before reading the live model for a provider call. */
-+	beforeModelCall?: (messages: AgentMessage[]) => Promise<AgentMessage[] | undefined>;
-+	getModel?: () => Model | undefined;
  
  	/**
++	 * Live model override for the provider call. Read once at the top of every
++	 * loop iteration, so a session policy that switches the model at a completed
++	 * turn boundary applies to the next model call instead of the next prompt.
++	 */
++	getModel?: () => Model | undefined;
++
++	/**
++	 * Awaited at each completed assistant-turn boundary, after the turn's tool
++	 * results are committed and before steering messages are drained. The hook
++	 * may steer, retract a hidden message from the live context, or switch the
++	 * session model: all of it lands on the turn that follows. Unset means the
++	 * loop does no work here.
++	 */
++	onCompletedTurn?: (turn: CompletedTurnContext) => Promise<void> | void;
++
++	/**
  	 * Called after a tool call has been validated and is about to execute.
-diff --git a/coding-agent/src/commands/sdk.ts b/coding-agent/src/commands/sdk.ts
---- a/coding-agent/src/commands/sdk.ts
-+++ b/coding-agent/src/commands/sdk.ts
-@@ -88,6 +88,7 @@
- } from "../sdk/startup-capability";
- import { runSdkServe, SdkServeError } from "../sdk/transport/serve-cli";
- import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
-+import { withSdkHostTurnDeferral } from "../session/client-bridge";
- import { type CapturedSessionTranscriptSnapshot, SessionManager } from "../session/session-manager";
+ 	 *
+ 	 * Return `{ block: true }` to prevent execution. The loop emits an error tool
+@@ -598,6 +614,16 @@
+ /** A single tool-call content block emitted by an assistant message. */
+ export type AgentToolCall = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
  
- export async function lifecycleArgs(
-@@ -1323,6 +1324,7 @@
- 	}
- 	const { parsed } = opened;
- 	const { session, startDeferredMemoryBackend } = created;
-+	session.setClientBridge(withSdkHostTurnDeferral(session.clientBridge));
- 	let lifecycleTranscriptPath: string | undefined;
- 	session.registerToolSessionTransitionCleanup(async () => {
- 		await session.sessionManager.ensureOnDisk();
-diff --git a/coding-agent/src/sdk/host/session-runtime.ts b/coding-agent/src/sdk/host/session-runtime.ts
---- a/coding-agent/src/sdk/host/session-runtime.ts
-+++ b/coding-agent/src/sdk/host/session-runtime.ts
-@@ -42,6 +42,7 @@
- import { normalizeGoal } from "../../goals/state";
- import { toAgentWireEventPayload } from "../../modes/shared/agent-wire/event-envelope";
- import type { AgentSessionEvent, QueuedRunStartFailure } from "../../session/agent-session";
-+import { withSdkHostTurnDeferral } from "../../session/client-bridge";
- import type { SdkRunCapability } from "../../session/sdk-run-capability";
- import {
- 	boundTerminalRetentionState,
-@@ -7902,7 +7903,7 @@
- 		};
- 		const removeProviderDefinitions = (capability: string): void => {
- 			if (capability === "permission") ctx.setSdkPermissionProvider?.(undefined);
--			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
-+			if (capability === "fs") ctx.setSdkClientBridge?.(withSdkHostTurnDeferral(undefined));
- 		};
- 		externalPermissions.installControls(
- 			controlSurface,
++/** One completed assistant turn, delivered to {@link AgentLoopConfig.onCompletedTurn}. */
++export interface CompletedTurnContext {
++	/** The assistant message that ended the turn. */
++	message: AssistantMessage;
++	/** Every tool result the message produced; empty for a reply with no tool calls. */
++	toolResults: ToolResultMessage[];
++	/** The run's live context array, so a policy can retract a hidden message in place. */
++	messages: AgentMessage[];
++}
++
+ /**
+  * Result returned from `beforeToolCall`.
+  *
+diff --git a/agent-core/src/agent.ts b/agent-core/src/agent.ts
+--- a/agent-core/src/agent.ts
++++ b/agent-core/src/agent.ts
+@@ -662,6 +662,11 @@
+ 	onQueuedRunStartDecision?: (decision: AgentQueuedRunStartDecision) => void;
+ 	/** Invoked with the steering messages dequeued mid-run for the current turn. Reassign at any time. */
+ 	onSteeringConsumed?: AgentLoopConfig["onSteeringConsumed"];
++	/**
++	 * Awaited at each completed assistant-turn boundary, before steering is drained.
++	 * Reassign at any time to install or clear the policy.
++	 */
++	onCompletedTurn?: AgentLoopConfig["onCompletedTurn"];
+ 
+ 	constructor(opts: AgentOptions = {}) {
+ 		this.#state = { ...this.#state, ...opts.initialState };
+@@ -2217,6 +2222,15 @@
+ 			onHarmonyLeak: this.#onHarmonyLeak,
+ 			getToolChoice,
+ 			getReasoning: () => this.#state.thinkingLevel,
++			// Both stay off unless a completed-turn policy is installed, so an
++			// unpatched session keeps the loop's run-start model bytes.
++			getModel: this.onCompletedTurn ? () => this.#state.model : undefined,
++			onCompletedTurn: this.onCompletedTurn
++				? async turn => {
++						if (this.#activeRunId !== runId) return;
++						await this.onCompletedTurn?.(turn);
++					}
++				: undefined,
+ 			getSteeringMessages: async () => {
+ 				if (this.#activeRunId !== runId) {
+ 					return [];
+diff --git a/agent-core/src/agent-loop.ts b/agent-core/src/agent-loop.ts
+--- a/agent-core/src/agent-loop.ts
++++ b/agent-core/src/agent-loop.ts
+@@ -4027,6 +4027,10 @@
+ 		// Inner loop: process tool calls and steering messages
+ 		while (hasMoreToolCalls || pendingMessages.length > 0) {
+ 			lastAttemptAcceptedFinalAssistantMessage = false;
++			// A completed-turn callback may have switched the session model; every
++			// provider call that follows it must use the live model.
++			const liveModel = config.getModel?.();
++			if (liveModel && liveModel !== config.model) config = { ...config, model: liveModel };
+ 			const scope =
+ 				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
+ 			initialScope = undefined;
+@@ -4680,6 +4684,12 @@
+ 
+ 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
+ 
++			// Completed-turn policy (opt-in). It runs before steering drains, so a
++			// steer or model switch made here applies to the turn that follows.
++			if (config.onCompletedTurn && !loopSignal.aborted) {
++				await config.onCompletedTurn({ message, toolResults, messages: currentContext.messages });
++			}
++
+ 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
+ 				// Same aborted-run guard as the drain below: the steer interrupt unwound
+ 				// the tools, and a user interrupt that landed during that unwind must not
 diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/session/agent-session.ts
 --- a/coding-agent/src/session/agent-session.ts
 +++ b/coding-agent/src/session/agent-session.ts
@@ -113,7 +118,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
 +			agent: this.agent,
 +			// The env is process-wide. Only the empty root session installs it.
 +			// A child has taskDepth > 0 and keeps its assigned model. A reopen already
-+			// has messages, so it does not install the plan hook again.
++			// has messages, so it does not install the plan nudge again.
 +			enabled:
 +				process.env.GAJAEWAY_LANE_SWITCH === "1" &&
 +				this.taskDepth === 0 &&
@@ -130,112 +135,234 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
 +				}
 +				return { model: resolved.model, thinkingLevel: resolved.thinkingLevel };
 +			},
++			waitForPersistence: () => this.sessionManager.flush(),
 +			commit: async (model, thinkingLevel) => {
-+				await this.sessionManager.flush();
 +				await this.setModelTemporary(model, thinkingLevel, {
 +					persistAsSessionDefault: true,
 +					cause: "user-selection",
-+				});
-+				const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-+				this.sessionManager.appendModelChange(selector, "default", {
-+					reason: `lane_model_switch ${selector}`,
-+					thinkingLevel: thinkingLevel ?? null,
++					metadata: { reason: `lane_model_switch ${model.provider}/${model.id}` },
 +				});
 +			},
++			currentModel: () => this.model,
++			currentThinkingLevel: () => this.thinkingLevel,
++			activeToolNames: () => this.getActiveToolNames(),
++			notify: message => logger.info(message),
 +			warn: message => logger.warn(message),
 +		});
 +
  		// Re-evaluate append-only context mode when the setting changes at runtime.
  		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
  		// SDK ToolSession callbacks capture the just-constructed session. Defer the
-diff --git a/coding-agent/src/session/client-bridge.ts b/coding-agent/src/session/client-bridge.ts
---- a/coding-agent/src/session/client-bridge.ts
-+++ b/coding-agent/src/session/client-bridge.ts
-@@ -83,3 +83,12 @@
- 		signal?: AbortSignal,
- 	): Promise<ClientBridgePermissionOutcome>;
- }
-+
-+export function withSdkHostTurnDeferral(bridge: ClientBridge | undefined): ClientBridge {
-+	if (bridge?.deferAgentInitiatedTurns === true) return bridge;
-+	return {
-+		...bridge,
-+		capabilities: bridge?.capabilities ?? {},
-+		deferAgentInitiatedTurns: true,
-+	};
-+}
+@@ -24064,7 +24101,12 @@
+ 	async #setSharedSessionDefaultModel(
+ 		model: Model,
+ 		thinkingLevel: ThinkingLevel | undefined,
+-		options: { signal?: AbortSignal; shouldMutate?: () => boolean; onMutationStarted?: () => void },
++		options: {
++			signal?: AbortSignal;
++			shouldMutate?: () => boolean;
++			onMutationStarted?: () => void;
++			metadata?: { reason?: string };
++		},
+ 	): Promise<void> {
+ 		const operation = "set session model";
+ 		const assertMode = this.#controlPublicationModeFence(operation);
+@@ -24129,7 +24171,9 @@
+ 			);
+ 			throw new ModelProfileApplyCommittedError(selector, committedOwnership!.version, error);
+ 		};
+-		const entries: SharedControlEntry[] = [{ type: "model_change", model: selector, role: "default" }];
++		const entries: SharedControlEntry[] = [
++			{ type: "model_change", model: selector, role: "default", metadata: options.metadata },
++		];
+ 		if (effectiveLevel !== this.#thinkingLevel)
+ 			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
+ 		entries.push({
+@@ -24325,6 +24369,8 @@
+ 			persistAsSessionDefault?: boolean;
+ 			cause?: ModelChangeCause;
+ 			reason?: TemporaryModelReason;
++			/** Recorded on the session-log model_change, so a marker survives replay. */
++			metadata?: { reason?: string };
+ 			providerSessionScope?: TemporaryProviderSessionScope;
+ 			signal?: AbortSignal;
+ 			shouldMutate?: () => boolean;
+@@ -24446,6 +24492,7 @@
+ 			this.sessionManager.appendModelChange(
+ 				`${model.provider}/${model.id}`,
+ 				options?.persistAsSessionDefault ? "default" : "temporary",
++				options?.metadata,
+ 			);
+ 			// A run-scoped CLI override and a rollback to a captured model are not usage
+ 			// choices. A profile activation records its DEFAULT only once the whole
 diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/session/lane-model-switch.ts
 --- a/coding-agent/src/session/lane-model-switch.ts
 +++ b/coding-agent/src/session/lane-model-switch.ts
-@@ -0,0 +1,71 @@
-+import type { Agent, AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
-+import type { Model } from "@gajae-code/ai/core";
+@@ -0,0 +1,167 @@
++import type { Agent, AgentMessage, CompletedTurnContext, ThinkingLevel } from "@gajae-code/agent-core";
++import type { Model, ToolResultMessage } from "@gajae-code/ai/core";
 +
-+export const LANE_PLAN = "Plan the change in text only. Do not call edit, write, apply_patch, or ast_edit yet.";
-+export const LANE_CHECKLIST = "Implementation model is active. Complete the remaining edits. Do not change the model.";
++export const PREWALK_PLAN = `STOP: In NEXT reply, before further exploration, write complete plan. Enough known; do not defer.
 +
-+/** Session policy only. The agent owns tool execution and follow-up delivery. */
-+export function installLaneModelSwitch(options: {
++Plan first; explicit, comprehensive; reference for remainder:
++- Remaining execution-order steps: exact files, symbols, commands, checks.
++- Risks, edge cases; verify each landed: specific commands, expected outputs. NEVER modify tests or verification assets to pass checks.
++- Already done, brief; prevent repetition.
++
++Thorough, concrete. Tools may verify details only after plan.
++
++Then, same reply and only after complete plan, use todo tool to capture 5–9 items: one per MEANINGFUL step; each concrete target + verification. Only code-changing or code-verifying steps; exclude reporting, bookkeeping, cleanup-ceremony, release-note items. Todo serves task, not reverse: reality/item conflict → fix actual problem, not checklist.
++
++Checkpoint, not final answer: after todo list, continue task; do not stop on plan alone.`;
++
++export const PREWALK_CONTINUE = "Continue task now; do not end turn here.";
++
++export const PREWALK_CHECKLIST = `Before task complete, verify:
++
++- Consistency: If a pattern, signature, or check changed in one place, grep every other call site or duplicate copy needing identical change. A fix at only some matching sites fails.
++- Scope: If diff exceeds the minimal issue-resolving change, confirm behavior unchanged outside the reported issue. Prefer the smallest correct diff over a broader rewrite.
++- Verification: Run the issue's full test module or file, not only the expected-to-flip test. A sibling-test-breaking change fails.
++
++Do not claim task complete until all three checks done.`;
++
++const PLAN_MESSAGE_TYPE = "prewalk-plan";
++const CONTINUE_MESSAGE_TYPE = "prewalk-continue";
++const CHECKLIST_MESSAGE_TYPE = "prewalk-checklist";
++
++/** Todo tool whose successful result opens the switch gate. */
++const TODO_TOOL = "todo_write";
++/**
++ * Tools whose successful result arms the switch. A plain shell run never does:
++ * GJC 0.21.1 carries no tool-command dispatch provenance, so `bash` is not an
++ * action.
++ */
++const IMPLEMENTATION_TOOLS: ReadonlySet<string> = new Set(["edit", "write", "apply_patch", "ast_edit"]);
++
++/** Capabilities the lane switch borrows from its owning session. */
++export interface LaneModelSwitchHost {
 +	agent: Agent;
-+	enabled: boolean;
++	/** Resolves the executor assignment, or undefined when the role is unset. */
 +	resolveExecutor: () => Promise<{ model: Model; thinkingLevel?: ThinkingLevel } | undefined>;
++	/** Resolves once the completed turn's assistant message and tool results are durable. */
++	waitForPersistence: () => Promise<void>;
++	/** Commits the session default model and publishes the `lane_model_switch` marker with it. */
 +	commit: (model: Model, thinkingLevel: ThinkingLevel | undefined) => Promise<void>;
++	currentModel: () => Model | undefined;
++	currentThinkingLevel: () => ThinkingLevel | undefined;
++	activeToolNames: () => readonly string[];
++	/** Info-level report: plan nudge injected, same-model skip, switch landed. */
++	notify: (message: string) => void;
 +	warn: (message: string) => void;
-+}): void {
++}
++
++/**
++ * One lane, one switch. The planning model keeps the lane until its first
++ * completed turn with no qualifying action; from there a hidden plan nudge asks
++ * for a plan and a todo list, the continue nudge keeps the lane moving, and the
++ * first successful edit-type result after `todo_write` hands the lane to the
++ * executor. Edits are never blocked, and the switch is attempted at most once.
++ */
++export function installLaneModelSwitch(options: LaneModelSwitchHost & { enabled: boolean }): void {
 +	if (!options.enabled) return;
 +	const { agent } = options;
-+	let todoSucceeded = false;
-+	let editSucceeded = false;
-+	let planSent = false;
-+	let firstReply = true;
-+	let finished = false;
-+	const user = (text: string): AgentMessage => ({
-+		role: "user",
-+		content: [{ type: "text", text }],
-+		timestamp: Date.now(),
-+	});
-+	agent.subscribe(event => {
-+		if (finished) return;
-+		if (event.type === "tool_execution_end" && !event.isError) {
-+			if (event.toolName === "todo_write") todoSucceeded = true;
-+			else if (todoSucceeded && ["edit", "write", "apply_patch", "ast_edit"].includes(event.toolName)) {
-+				editSucceeded = true;
-+			}
++	let armed = true;
++	let planInjected = false;
++	let continuePending = false;
++	let todoSeen = false;
++
++	const steer = (customType: string, content: string): void => {
++		agent.steer({
++			role: "custom",
++			customType,
++			content,
++			display: false,
++			attribution: "agent",
++			timestamp: Date.now(),
++		});
++	};
++
++	const isPlanNudge = (message: AgentMessage): boolean =>
++		message.role === "custom" && message.customType === PLAN_MESSAGE_TYPE;
++
++	/** Retract the plan nudge everywhere a later model call could still read it. */
++	const scrubPlanNudge = (liveMessages: AgentMessage[]): void => {
++		for (let index = liveMessages.length - 1; index >= 0; index--) {
++			if (isPlanNudge(liveMessages[index])) liveMessages.splice(index, 1);
 +		}
-+		if (planSent && firstReply && event.type === "message_end" && event.message.role === "assistant") {
-+			firstReply = false;
-+			if (!event.message.content.some(part => part.type === "toolCall")) agent.followUp(user("Continue."));
++		const stateMessages = agent.state.messages;
++		const filtered = stateMessages.filter(message => !isPlanNudge(message));
++		if (filtered.length !== stateMessages.length) {
++			// The rewrite drops the nudge from an append-only log too; without the
++			// history rewrite the cached prefix would keep serving it.
++			agent.replaceMessages(filtered, { historyRewrite: { reason: "lane_model_switch plan nudge scrub" } });
 +		}
-+	});
-+	agent.beforeModelCall = async messages => {
-+		if (finished) return;
-+		if (editSucceeded) {
-+			// One attempt only, including a rejected record. Never switch on a failed write.
-+			finished = true;
-+			try {
-+				const target = await options.resolveExecutor();
-+				if (!target) {
-+					options.warn("lane_model_switch executor assignment is missing; keeping the current model");
-+					return;
-+				}
-+				await options.commit(target.model, target.thinkingLevel);
-+				// Replace the committed plan in the actual provider context, not a queued steer.
-+				for (const message of messages) {
-+					if (message.role !== "user" || typeof message.content === "string") continue;
-+					for (const part of message.content) {
-+						if (part.type === "text" && part.text === LANE_PLAN) part.text = "Planning phase is complete.";
-+					}
-+				}
-+				return [user(LANE_CHECKLIST)];
-+			} catch (error) {
-+				options.warn(`lane_model_switch failed; keeping the current model: ${String(error)}`);
++		agent.removeQueuedMessages(isPlanNudge, "steering");
++	};
++
++	const implementationTool = (result: ToolResultMessage): string | undefined =>
++		!result.isError && IMPLEMENTATION_TOOLS.has(result.toolName) ? result.toolName : undefined;
++
++	const switchOnce = async (actionTool: string, turn: CompletedTurnContext): Promise<void> => {
++		// One-way: consume the arm before the attempt, so a same-model skip, a
++		// failure, or a successful switch all end the lane's planning phase.
++		armed = false;
++		try {
++			await options.waitForPersistence();
++			scrubPlanNudge(turn.messages);
++			const target = await options.resolveExecutor();
++			if (!target) {
++				options.warn("lane_model_switch executor assignment is missing; keeping the current model");
 +				return;
 +			}
++			const current = options.currentModel();
++			const sameModel = current?.provider === target.model.provider && current.id === target.model.id;
++			const sameThinking =
++				target.thinkingLevel === undefined || target.thinkingLevel === options.currentThinkingLevel();
++			if (sameModel && sameThinking) {
++				options.notify(
++					`lane_model_switch target ${target.model.provider}/${target.model.id} already matches the active model and thinking level; nothing to switch`,
++				);
++				return;
++			}
++			await options.commit(target.model, target.thinkingLevel);
++			steer(CHECKLIST_MESSAGE_TYPE, PREWALK_CHECKLIST);
++			options.notify(
++				`lane_model_switch switched to ${target.model.provider}/${target.model.id} after the first ${actionTool} result`,
++			);
++		} catch (error) {
++			options.warn(`lane_model_switch failed; keeping the current model: ${String(error)}`);
 +		}
-+		if (!planSent) {
-+			planSent = true;
-+			// Commit once at the call boundary; replace its restriction after switching.
-+			return [user(LANE_PLAN)];
++	};
++
++	agent.onCompletedTurn = async turn => {
++		if (!armed || turn.message.role !== "assistant") return;
++		if (turn.toolResults.some(result => result.toolName === TODO_TOOL && !result.isError)) todoSeen = true;
++
++		if (planInjected && turn.toolResults.length > 0) {
++			continuePending = true;
++		} else if (continuePending) {
++			continuePending = false;
++			steer(CONTINUE_MESSAGE_TYPE, PREWALK_CONTINUE);
 +		}
++
++		// The gate opens on a successful todo_write, or when the todo tool is not
++		// active at all. Before that, an edit is still just work: it never arms.
++		const todoGateOpen = todoSeen || !options.activeToolNames().includes(TODO_TOOL);
++		let actionTool: string | undefined;
++		if (todoGateOpen) {
++			for (const result of turn.toolResults) {
++				actionTool = implementationTool(result);
++				if (actionTool) break;
++			}
++		}
++		if (!actionTool) {
++			if (planInjected) return;
++			planInjected = true;
++			continuePending = true;
++			steer(PLAN_MESSAGE_TYPE, PREWALK_PLAN);
++			options.notify("lane_model_switch injected the plan nudge");
++			return;
++		}
++		await switchOnce(actionTool, turn);
 +	};
 +}

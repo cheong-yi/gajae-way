@@ -193,8 +193,8 @@ async function started(f: Awaited<ReturnType<typeof fixture>>, name = "a", paren
 	return result;
 }
 
-test("work.start asks for switchAfterEdit on the lane bind only when configured", async () => {
-	const enabled = await fixture({ switchAfterEdit: () => true });
+test("work.start asks for prewalk on the lane bind only when configured", async () => {
+	const enabled = await fixture({ prewalk: () => true });
 	const binds: SessionBindInput[] = [];
 	const bind = enabled.port.bind.bind(enabled.port);
 	enabled.port.bind = async (input) => {
@@ -203,7 +203,7 @@ test("work.start asks for switchAfterEdit on the lane bind only when configured"
 	};
 	await started(enabled);
 	expect(binds).toHaveLength(1);
-	expect(binds[0]).toMatchObject({ switchAfterEdit: true, codingRegister: true });
+	expect(binds[0]).toMatchObject({ prewalk: true, codingRegister: true });
 
 	const disabled = await fixture();
 	const disabledBinds: SessionBindInput[] = [];
@@ -214,7 +214,7 @@ test("work.start asks for switchAfterEdit on the lane bind only when configured"
 	};
 	await started(disabled);
 	expect(disabledBinds).toHaveLength(1);
-	expect(disabledBinds[0]?.switchAfterEdit).toBe(false);
+	expect(disabledBinds[0]?.prewalk).toBe(false);
 });
 
 test("work.start during a broker restart waits for broker readiness and starts the lane", async () => {
@@ -1701,6 +1701,50 @@ test("FirstMate mapped lane needs its owner decision for ordinary and idle retir
 	// Unmapped native lanes keep their ordinary retirement behavior.
 	f.db.transaction((tx) => f.db.bindings.bind(tx, workSessionKey("unmapped"), "unmapped-session"));
 	expect((await f.lanes.forceRetire("unmapped")).retired).toBe(true);
+});
+
+test("the mapped deadline abandons a settled lane and holds a dirty checkout", async () => {
+	const age = (f: Awaited<ReturnType<typeof releaseFixture>>) => {
+		const raw = new Database(join(f.directory, "gateway.db"));
+		try {
+			raw
+				.query("UPDATE sessions SET last_activity_at = ? WHERE origin_key = ?")
+				.run(new Date(Date.now() - 7 * 60 * 60_000).toISOString(), f.start.sessionKey);
+		} finally {
+			raw.close();
+		}
+	};
+	const clean = await releaseFixture();
+	expect(await clean.lanes.retire("a", "operator")).toMatchObject({
+		retired: false,
+		reason: "firstmate_scoped_release_required",
+	});
+	expect(await clean.manager.sweepFirstmate()).toEqual({ abandoned: [], held: [] });
+	age(clean);
+	expect(await clean.manager.sweepFirstmate()).toEqual({ abandoned: ["a"], held: [] });
+	expect(clean.owner.abandoned("a")).toBe(true);
+	expect(clean.owner.released("a")).toBe(false);
+	expect(clean.owner.assignment("a")).toEqual(clean.assignment);
+	expect(clean.db.bindings.getSessionRecord(clean.start.sessionKey)?.sessionId).toBe("");
+	expect((await lstat(clean.assignment.worktree.path)).isDirectory()).toBe(true);
+
+	const dirty = await releaseFixture();
+	await Bun.write(join(dirty.assignment.worktree.path, "unique-untracked"), "keep\n");
+	age(dirty);
+	const held = await dirty.manager.sweepFirstmate();
+	expect(held.abandoned).toEqual([]);
+	expect(held.held[0]?.name).toBe("a");
+	expect(held.held[0]?.reason).toContain(`dirty checkout at ${dirty.assignment.worktree.path}`);
+	expect(dirty.owner.abandoned("a")).toBe(false);
+	expect(dirty.owner.assignment("a")).toEqual(dirty.assignment);
+});
+
+test("an unsettled assignment is not abandoned by the mapped deadline", async () => {
+	const reserved = await firstmateFixture();
+	reserved.db.transaction((tx) => reserved.owner.recordAssignment(tx, reserved.assignment));
+	expect(await reserved.manager.sweepFirstmate(Date.now() + 24 * 60 * 60_000)).toEqual({ abandoned: [], held: [] });
+	expect(reserved.owner.abandoned("a")).toBe(false);
+	expect(reserved.owner.assignment("a")).toEqual(reserved.assignment);
 });
 
 for (const state of ["pending", "inflight", "failed_ambiguous", "expired", "missing"] as const) {

@@ -290,11 +290,12 @@ export interface SessionBindInput {
 	/** The SDK host's default coding register is retained when true. */
 	readonly codingRegister?: boolean;
 	/**
-	 * Lane binds only: the created host switches models after an edit. It is part
-	 * of the create request (an env entry), so a persona or monitor bind that
-	 * omits it never inherits the behaviour.
+	 * Lane binds only: the created host plans on its planning model, which also
+	 * makes the first edit batch once a todo list exists, then switches once to the
+	 * switch model. It is part of the create request (an env entry), so a persona
+	 * or monitor bind that omits it never inherits the behaviour.
 	 */
-	readonly switchAfterEdit?: boolean;
+	readonly prewalk?: boolean;
 	/** Internal recursion fence: one poisoned create key may advance to one fresh epoch per bind call. */
 	readonly epochRecovery?: boolean;
 }
@@ -827,7 +828,7 @@ export class BrokerSessionPort implements SessionPort {
 		let requestJson = sessionCreateInput(
 			input.repo,
 			input.model,
-			journaled ? createRequestEnv(journaled.requestJson) : switchAfterEditEnv(input.switchAfterEdit === true),
+			journaled ? createRequestEnv(journaled.requestJson) : prewalkEnv(input.prewalk === true),
 		);
 		let intent = this.#beginOperation(
 			"session.create",
@@ -871,7 +872,7 @@ export class BrokerSessionPort implements SessionPort {
 			}
 			// The replacement is a new session, so it takes the live flag rather than
 			// the retired create's env.
-			requestJson = sessionCreateInput(input.repo, input.model, switchAfterEditEnv(input.switchAfterEdit === true));
+			requestJson = sessionCreateInput(input.repo, input.model, prewalkEnv(input.prewalk === true));
 			intent = this.#beginOperation("session.create", createScope(input), `gw-bind-${randomUUID()}`, () => requestJson);
 			if (intent.requestJson !== requestJson) {
 				throw new Error(
@@ -3071,8 +3072,8 @@ function createRequestEnv(requestJson: string): Record<string, string> | undefin
 	}
 }
 
-function switchAfterEditEnv(switchAfterEdit: boolean): Record<string, string> | undefined {
-	return switchAfterEdit ? { GAJAEWAY_LANE_SWITCH: "1" } : undefined;
+function prewalkEnv(prewalk: boolean): Record<string, string> | undefined {
+	return prewalk ? { GAJAEWAY_LANE_SWITCH: "1" } : undefined;
 }
 
 function sessionCreateInput(

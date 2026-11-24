@@ -321,8 +321,8 @@ export interface WorkLaneManagerOptions {
 	readonly laneRoot?: string;
 	readonly ownerTarget?: () => OriginRef | undefined;
 	readonly allowNested?: () => boolean;
-	/** Lane creates only: ask the new host to switch models after an edit; never applied to persona binds. */
-	readonly switchAfterEdit?: () => boolean;
+	/** Lane creates only: ask the new host to prewalk, switching models after the first edit batch; never applied to persona binds. */
+	readonly prewalk?: () => boolean;
 	readonly personaHold?: (originKey: string) => string | undefined;
 	readonly notifyPersona?: (originKey: string) => void;
 	readonly deliverFallback?: (payload: ChatMessagePayload) => void;
@@ -1214,6 +1214,48 @@ export class WorkLaneManager {
 			return unavailable(String(detail?.reason ?? detail?.reasonCode ?? "inspection_state_unavailable"));
 		}
 	}
+	/**
+	 * Closes a mapped reservation on the same clocks as an ordinary lane.
+	 * The record is an abandonment, not a preserving release. An open attempt stays.
+	 * A dirty checkout is held. The assignment row and the worktree stay.
+	 */
+	async sweepFirstmate(now = this.#now()): Promise<{
+		abandoned: string[];
+		held: { name: string; reason: string }[];
+	}> {
+		if (this.#stopped) return { abandoned: [], held: [] };
+		const abandoned: string[] = [];
+		const held: { name: string; reason: string }[] = [];
+		for (const name of this.#db.work.firstmate.reservingNames()) {
+			if (!this.#firstmateSweepDue(name, now)) continue;
+			const result = await this.abandonFirstmate(name);
+			if (result.abandoned) abandoned.push(name);
+			else {
+				held.push({ name, reason: result.reason });
+				console.error(`firstmate_sweep_held name=${name} reason=${result.reason}`);
+			}
+		}
+		return { abandoned, held };
+	}
+
+	#firstmateSweepDue(name: string, now: number): boolean {
+		if (this.#options.lanes.activeLanes(now).some((lane) => lane.name === name))
+			return this.#options.lanes.boundSweepReason(name, now) !== undefined;
+		let job: LaneJobRecord | undefined;
+		try {
+			job = this.#job(name);
+		} catch {
+			return false;
+		}
+		if (job?.attempts.some((attempt) => attempt.endedAt === undefined)) return false;
+		if (job && (job.state === "done" || job.state === "aborted")) return true;
+		const clock = this.#db.bindings.sessionClock(workSessionKey(name));
+		const stamp = clock?.lastActivityAt ?? clock?.createdAt;
+		if (!stamp) return false;
+		const at = Date.parse(stamp);
+		return Number.isFinite(at) && now - at >= this.#options.lanes.idleRetireMs;
+	}
+
 	/**
 	 * Abandonment is the preserving release with no outcome to approve. It closes
 	 * the session through the same lock a scoped release uses, records the row
@@ -2815,7 +2857,7 @@ export class WorkLaneManager {
 								epoch: this.#db.bindings.getSessionRecord(sessionKey)?.epoch ?? 0,
 								repo: worktreePath,
 								codingRegister: true,
-								switchAfterEdit: this.#options.switchAfterEdit?.() === true,
+								prewalk: this.#options.prewalk?.() === true,
 								...((input.model ?? this.#options.sessionModel)
 									? { model: input.model ?? this.#options.sessionModel }
 									: {}),

@@ -682,6 +682,17 @@ export class FirstmateStore {
 			.run(tx, name, reason, at);
 	}
 
+	/** Assignments that still reserve a name. An abandonment or preserving release no longer does. */
+	reservingNames(): string[] {
+		return (
+			this.#db
+				.prepare(
+					`SELECT lane_name FROM firstmate_assignments WHERE lane_name NOT IN (SELECT lane_name FROM firstmate_abandonments) AND lane_name NOT IN (${RELEASED_LANES}) ORDER BY lane_name`,
+				)
+				.all() as { lane_name: string }[]
+		).map((row) => row.lane_name);
+	}
+
 	attempt(opRef: string): FirstmateAttempt | undefined {
 		const row = this.#db
 			.prepare("SELECT task_id, lane_name, ordinal, record_json FROM firstmate_attempts WHERE op_ref = ?")

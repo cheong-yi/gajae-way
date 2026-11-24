@@ -1,11 +1,11 @@
 ---
 name: verify-firstmate
-description: "Drive a FirstMate lane on the Gajaeway test home and prove the plan-then-switch path. Use after changing a lane-switch patch, work.switchAfterEdit, or the test home deployment, before claiming that path works."
+description: "Drive a FirstMate lane on the Gajaeway test home and prove the prewalk path. Use after changing a lane-switch patch, work.prewalk, or the test home deployment, before claiming that path works."
 ---
 
 # Verify FirstMate
 
-This skill drives the running FirstMate test home the way a mention does. It does not launch a gateway. It does not cover a second product called prewalk. It verifies the order where the secondmate pane opens first and its ordinary work start creates the lane. The plan and the switch are one path, and that path is the feature `plan-and-switch`.
+This skill drives the running FirstMate test home the way a mention does. It does not launch a gateway. The path it verifies is prewalk, the `work.prewalk` setting. It verifies the order where the secondmate pane opens first and its ordinary work start creates the lane. The plan and the switch are one path, and that path is the feature `plan-and-switch`.
 
 Two speeds. Never mix them.
 
@@ -30,7 +30,7 @@ Do not drive the home at `/home/cheongnet/gajaeway/state`. Do not start a second
 .gjc/skills/verify-firstmate/scripts/doctor-test-home.sh
 ```
 
-Exit 0 and a final line `doctor: ok` are the only pass. It checks `work.switchAfterEdit`, the patch receipt, the daemon binary, and that the daemon started after `config.json`.
+Exit 0 and a final line `doctor: ok` are the only pass. It checks `work.prewalk`, the patch receipt, the daemon binary, and that the daemon started after `config.json`.
 
 ## Deterministic command
 

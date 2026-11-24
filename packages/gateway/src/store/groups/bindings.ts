@@ -125,6 +125,16 @@ export class BindingsGroup {
 		return row ? { sessionId: row.gjc_session_id, epoch: row.epoch } : undefined;
 	}
 
+	/** Activity clock for a lane reservation, including one whose session id is already empty. */
+	sessionClock(originKey: string): { sessionId: string; lastActivityAt: string | null; createdAt: string } | undefined {
+		const row = this.#db
+			.prepare("SELECT gjc_session_id, last_activity_at, created_at FROM sessions WHERE origin_key = ?")
+			.get(originKey) as { gjc_session_id: string; last_activity_at: string | null; created_at: string } | null;
+		return row
+			? { sessionId: row.gjc_session_id, lastActivityAt: row.last_activity_at, createdAt: row.created_at }
+			: undefined;
+	}
+
 	getOriginByKey(originKey: string): Record<string, unknown> | undefined {
 		const row = this.#db.prepare("SELECT origin_ref_json FROM sessions WHERE origin_key = ?").get(originKey) as {
 			origin_ref_json: string | null;
