@@ -2598,6 +2598,9 @@ export function parseWorkerOutputResponse(
 			? { status: "unavailable", code: "output_unavailable", definitiveLoss: true }
 			: { status: "absent", code: "output_pending" };
 	}
+	// A truncated body is incomplete_body whatever else it carries (upstream contract).
+	// Only partial retention validates the full DTO first.
+	if (content.truncated === true && !input.includePartial) return { status: "unavailable", code: "incomplete_body" };
 	if (
 		content.version !== 1 ||
 		content.type !== "text" ||
@@ -2635,7 +2638,6 @@ export function parseWorkerOutputResponse(
 		},
 	};
 	if (content.truncated) {
-		if (!input.includePartial) return { status: "unavailable", code: "incomplete_body" };
 		// Bound display evidence too. Validate the full DTO before retaining any prefix.
 		const bytes = new TextEncoder().encode(content.text);
 		let end = Math.min(bytes.length, 16_384);

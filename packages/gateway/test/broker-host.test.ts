@@ -205,7 +205,10 @@ describe("foreground broker host", () => {
 	test("a verified minor or newer patch cannot bypass the production host's exact pin", async () => {
 		const f = await fixture();
 		await provision(f);
-		for (const version of ["0.19.1", "0.21.1", "0.23.0"]) {
+		// Derive from the pin: this fork pins a different gjc than upstream.
+		const [major, minor, patch] = readPinnedGjcVersion().split(".").map(Number) as [number, number, number];
+		const versions = [`${major}.${minor - 1}.0`, `${major}.${minor}.${patch + 1}`, `${major}.${minor + 1}.0`];
+		for (const version of versions) {
 			const fake = await installFakeGjc(f, { version });
 			expect(await runBrokerHost(await configFor(f))).toBe(1);
 			expect(await Bun.file(fake.argsPath).exists()).toBe(false);
