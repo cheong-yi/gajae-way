@@ -47,7 +47,7 @@ This proves the doctor and the disposable repository. It does not prove a lane.
 
 The map is `features/README.md`. Drive one feature file at a time. A pass on one file does not cover the others.
 
-`plan-and-switch` has a passing run on the 2026-11-19 deployment. Every other file stays uncovered until a run follows that file and its own evidence command passes. Do not report one file as verified from another file's run.
+`plan-and-switch` has a passing first run on the 2026-11-24 GJC 0.22.0 deployment. Its second run, the text-only plan, failed on that deployment. Every other file stays uncovered until a run follows that file and its own evidence command passes. Do not report one file as verified from another file's run.
 
 The current order: `gajaeway work start --firstmate FILE` records the assignment and opens the task's secondmate pane. It creates no lane and no session. That secondmate's ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. A pane that does not open is a held result. Do not treat the submission as a started lane.
 The explicit local check for that order is `.gjc/skills/verify-firstmate/scripts/pane-order-check.sh`. Exit 0 means the named unit tests passed. Exit 1 means one failed. That command does not post to Discord, and it does not prove the live thread `parent_id`.
@@ -62,7 +62,7 @@ Proof is the worker session JSONL and the public work status, not the Discord re
 .gjc/skills/verify-firstmate/scripts/live-evidence.sh --since "$SINCE"
 ```
 
-Exit codes: `0` pass, `1` the attempt ended with a missing or extra switch line, `2` warn line, `3` no worker session, `4` the attempt ended and the public end is missing or before the switch, `5` the attempt is still open, `64` usage. Exit `5` is not a result. A maintain pass waits, and does not record it as a failure.
+Exit codes: `0` pass, `1` the attempt ended with a missing or extra switch line, `2` warn line, `3` no worker session, `4` the attempt ended and the public end is missing or before the switch, `5` the attempt is still open, `6` an edit-type result came from the wrong model or before a successful `todo_write`, `7` the switch's `model_change` has no `thinkingLevel` or one that differs from the level the switch applied, `64` usage. Exit `5` is not a result. A maintain pass waits, and does not record it as a failure.
 
 Save the stdout at `$SCRATCH/evidence.txt`. The JSONL stays under `$TEST_HOME/broker/agent/sessions/` after cleanup.
 
