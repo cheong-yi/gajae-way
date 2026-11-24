@@ -189,7 +189,7 @@ test("the lane-model-switch hunk header count matches its added lines", () => {
 
 test("installing the lane never hooks or blocks tool execution", () => {
 	const laneRun = harness();
-	expect(laneRun.agent.beforeToolCall).toBeUndefined();
+	expect((laneRun.agent as Record<string, unknown>).beforeToolCall).toBeUndefined();
 	expect(source).not.toContain("beforeToolCall");
 	expect(source).not.toContain("block: true");
 	expect(source).not.toContain("EDIT_BLOCK_REASON");
