@@ -66,6 +66,10 @@ test("every conversation is told to stay responsive: no foreground waits, answer
 	expect(notice).toContain("internal report, not a chat post");
 	expect(notice).toContain("FirstMate must not use that ordinary start for an assignment");
 	expect(notice).toContain("The secondmate starts the lane");
+	// Owner decision 2026-11-27: a same-task follow-up is a correction into the settled bound lane; unrelated work gets a new secondmate.
+	expect(notice).toContain(
+		"For a follow-up on the same task, the secondmate sends `gajaeway work start --firstmate-correction` into the same lane when that lane is settled and still bound, which resumes the existing session in place. Only if the lane is gone does it start a new lane. Give unrelated work to a new secondmate.",
+	);
 	expect(notice).not.toContain("--notify");
 	// Only chat platforms get the gateway's 👀 acknowledgement, so only they are told about it.
 	expect(currentConversationNotice(channel)).toContain("The gateway already marks the message 👀");
