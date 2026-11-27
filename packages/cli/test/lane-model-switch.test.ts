@@ -22,7 +22,19 @@ function extractHunk(patch: string): { count: number; body: string[] } {
 	return { count: Number(match[1]), body };
 }
 
-const hunk = extractHunk(await readFile(patchPath, "utf8"));
+const patchText = await readFile(patchPath, "utf8");
+const hunk = extractHunk(patchText);
+
+/** The added and context lines the patch carries for one file, without the diff markers. */
+function patchedLines(path: string): string[] {
+	const sections = patchText.split(/^diff --git /m);
+	const section = sections.find(candidate => candidate.startsWith(`a/${path} b/${path}`));
+	if (!section) throw new Error(`patch has no section for ${path}`);
+	return section
+		.split("\n")
+		.filter(line => (line.startsWith("+") || line.startsWith(" ")) && !line.startsWith("+++"))
+		.map(line => line.slice(1));
+}
 const source = hunk.body.join("\n");
 const directory = await mkdtemp(join(tmpdir(), "lane-model-switch-"));
 const sourcePath = join(directory, "lane-model-switch.ts");
@@ -56,7 +68,8 @@ interface LaneModule {
 	PREWALK_PLAN: string;
 	PREWALK_CONTINUE: string;
 	PREWALK_CHECKLIST: string;
-	installLaneModelSwitch: (options: LaneOptions) => void;
+	LANE_STARTUP_TOOLS: readonly string[];
+	installLaneModelSwitch: (options: LaneOptions) => boolean;
 }
 
 const lane = (await import(pathToFileURL(sourcePath).href)) as LaneModule;
@@ -398,6 +411,39 @@ test("a session that does not enable the lane installs nothing (GAJAEWAY_LANE_SW
 	expect(laneRun.steers).toHaveLength(0);
 	expect(laneRun.notices).toHaveLength(0);
 	expect(laneRun.warns).toHaveLength(0);
+});
+
+test("an installed lane reports itself so the session activates todo_write before the first model call", () => {
+	const noop = async () => {};
+	const options = (enabled: boolean): LaneOptions => ({
+		agent: { onCompletedTurn: undefined },
+		enabled,
+		resolveExecutor: async () => undefined,
+		waitForPersistence: noop,
+		commit: noop,
+		currentModel: () => undefined,
+		currentThinkingLevel: () => undefined,
+		activeToolNames: () => [],
+		notify: () => {},
+		warn: () => {},
+	});
+	expect(lane.installLaneModelSwitch(options(true))).toBe(true);
+	expect(lane.installLaneModelSwitch(options(false))).toBe(false);
+	expect(lane.LANE_STARTUP_TOOLS).toEqual(["todo_write"]);
+
+	// The session keeps the install result and activates the startup tools through
+	// gjc's discovered-tool activation, the same path task.eager uses for `task`.
+	const session = patchedLines("coding-agent/src/session/agent-session.ts");
+	expect(session).toContain("\t\tthis.#laneModelSwitchInstalled = installLaneModelSwitch({");
+	expect(session).toContain("\t\tif (!this.#laneModelSwitchInstalled) return;");
+	expect(session).toContain("\t\tawait this.activateDiscoveredTools([...LANE_STARTUP_TOOLS]);");
+
+	// The SDK factory awaits the activation before it returns the session, so no
+	// prompt can reach the model with todo_write still hidden.
+	const factory = patchedLines("coding-agent/src/sdk/session.ts");
+	const restored = factory.indexOf("\t\tawait session.workflowGateToolRestoration;");
+	expect(restored).toBeGreaterThanOrEqual(0);
+	expect(factory[restored + 1]).toBe("\t\tawait session.activateLaneModelSwitchTools();");
 });
 
 test("the switch applies the executor role's configured thinking level and records it on the marker", async () => {

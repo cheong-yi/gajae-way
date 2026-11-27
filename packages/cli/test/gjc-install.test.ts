@@ -103,6 +103,7 @@ test("the embedded 0.22.0 lane-switch patch applies to pristine sources with GNU
 			"agent-core/src/agent.ts",
 			"agent-core/src/types.ts",
 			"coding-agent/src/session/agent-session.ts",
+			"coding-agent/src/sdk/session.ts",
 		];
 		for (const relative of installed) {
 			const destination = join(directory, "node_modules", "@gajae-code", relative);
@@ -138,6 +139,15 @@ test("the embedded 0.22.0 lane-switch patch applies to pristine sources with GNU
 		expect(session).toContain("metadata: marker,");
 		expect(session).toContain('{ type: "model_change", model: selector, role: "default", metadata: options.metadata }');
 		expect(session).toContain("metadata?: { reason?: string; thinkingLevel?: string | null };");
+		// A prewalk lane activates todo_write before the SDK factory returns the session.
+		expect(session).toContain("await this.activateDiscoveredTools([...LANE_STARTUP_TOOLS]);");
+		const factory = await readFile(
+			join(directory, "node_modules", "@gajae-code", "coding-agent", "src", "sdk", "session.ts"),
+			"utf8",
+		);
+		expect(factory).toContain(
+			"await session.workflowGateToolRestoration;\n\t\tawait session.activateLaneModelSwitchTools();\n",
+		);
 	} finally {
 		await rm(directory, { recursive: true, force: true });
 	}

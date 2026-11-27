@@ -106,7 +106,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  	FoldCoordinator,
  	type ForegroundFoldOutcome,
  } from "./fold-coordinator";
-+import { installLaneModelSwitch } from "./lane-model-switch";
++import { installLaneModelSwitch, LANE_STARTUP_TOOLS } from "./lane-model-switch";
  import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
  import {
  	type BashExecutionMessage,
@@ -114,7 +114,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  		// (session persistence, hooks, auto-compaction, retry logic)
  		this.#unsubscribeAgent = this.agent.subscribeCanonicalEvents(this.#trackAgentEvent);
  
-+		installLaneModelSwitch({
++		this.#laneModelSwitchInstalled = installLaneModelSwitch({
 +			agent: this.agent,
 +			// The env is process-wide. Only the empty root session installs it.
 +			// A child has taskDepth > 0 and keeps its assigned model. A reopen already
@@ -153,7 +153,28 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  		// Re-evaluate append-only context mode when the setting changes at runtime.
  		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
  		// SDK ToolSession callbacks capture the just-constructed session. Defer the
-@@ -24689,7 +24726,13 @@
+@@ -7313,6 +7350,20 @@
+ 	}
+ 
+ 	#workflowGateToolRestoration: Promise<void> = Promise.resolve();
++	#laneModelSwitchInstalled = false;
++
++	/**
++	 * Activates the lane switch's startup tools when this session installed it.
++	 * The SDK factory awaits this before returning the session, so the first
++	 * model call already sees `todo_write`, the way `task.eager` activates `task`.
++	 */
++	async activateLaneModelSwitchTools(): Promise<void> {
++		if (!this.#laneModelSwitchInstalled) return;
++		await this.activateDiscoveredTools([...LANE_STARTUP_TOOLS]);
++		const active = this.getActiveToolNames();
++		const missing = LANE_STARTUP_TOOLS.filter(name => !active.includes(name));
++		if (missing.length > 0) logger.warn(`lane_model_switch could not activate ${missing.join(", ")}`);
++	}
+ 
+ 	/**
+ 	 * Resolves when constructor-time workflow-gate tool restoration (ask
+@@ -24689,7 +24740,13 @@
  	async #setSharedSessionDefaultModel(
  		model: Model,
  		thinkingLevel: ThinkingLevel | undefined,
@@ -168,7 +189,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  	): Promise<void> {
  		const operation = "set session model";
  		const assertMode = this.#controlPublicationModeFence(operation);
-@@ -24754,7 +24797,9 @@
+@@ -24754,7 +24811,9 @@
  			);
  			throw new ModelProfileApplyCommittedError(selector, committedOwnership!.version, error);
  		};
@@ -179,7 +200,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  		if (effectiveLevel !== this.#thinkingLevel)
  			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
  		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
-@@ -24952,6 +24997,8 @@
+@@ -24952,6 +25011,8 @@
  			persistAsSessionDefault?: boolean;
  			cause?: ModelChangeCause;
  			reason?: TemporaryModelReason;
@@ -188,7 +209,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  			providerSessionScope?: TemporaryProviderSessionScope;
  			signal?: AbortSignal;
  			shouldMutate?: () => boolean;
-@@ -25073,6 +25120,7 @@
+@@ -25073,6 +25134,7 @@
  			this.sessionManager.appendModelChange(
  				`${model.provider}/${model.id}`,
  				options?.persistAsSessionDefault ? "default" : "temporary",
@@ -196,10 +217,21 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  			);
  			// A run-scoped CLI override and a rollback to a captured model are not usage
  			// choices. A profile activation records its DEFAULT only once the whole
+diff --git a/coding-agent/src/sdk/session.ts b/coding-agent/src/sdk/session.ts
+--- a/coding-agent/src/sdk/session.ts
++++ b/coding-agent/src/sdk/session.ts
+@@ -6529,6 +6529,7 @@
+ 		// microtask (the ToolSession closure needs `session` assigned). Await it
+ 		// so a resumed canonical workflow session returns with `ask` resident.
+ 		await session.workflowGateToolRestoration;
++		await session.activateLaneModelSwitchTools();
+ 		let startDeferredMcpConfig: (() => Promise<DeferredMcpConfigStartupResult>) | undefined;
+ 		if (deferredExactMcpConfig || deferredConventionalMcp) {
+ 			let cancelled = false;
 diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/session/lane-model-switch.ts
 --- a/coding-agent/src/session/lane-model-switch.ts
 +++ b/coding-agent/src/session/lane-model-switch.ts
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,191 @@
 +import type { Agent, AgentMessage, CompletedTurnContext, ThinkingLevel } from "@gajae-code/agent-core";
 +import type { Model, ToolResultMessage } from "@gajae-code/ai/core";
 +
@@ -232,6 +264,12 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 +
 +/** Todo tool whose successful result opens the switch gate. */
 +const TODO_TOOL = "todo_write";
++/**
++ * Tools an installed lane activates at session start, before the first model
++ * call. The plan nudge asks for `todo_write`; under tool discovery it is hidden
++ * until activated, and an inactive todo tool would leave the gate open.
++ */
++export const LANE_STARTUP_TOOLS: readonly string[] = [TODO_TOOL];
 +/**
 + * Tools whose successful result arms the switch. A plain shell run never does:
 + * GJC 0.22.0 carries no tool-command dispatch provenance, so `bash` is not an
@@ -279,8 +317,8 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 + * first successful edit-type result after `todo_write` hands the lane to the
 + * executor. Edits are never blocked, and the switch is attempted at most once.
 + */
-+export function installLaneModelSwitch(options: LaneModelSwitchHost & { enabled: boolean }): void {
-+	if (!options.enabled) return;
++export function installLaneModelSwitch(options: LaneModelSwitchHost & { enabled: boolean }): boolean {
++	if (!options.enabled) return false;
 +	const { agent } = options;
 +	let armed = true;
 +	let planInjected = false;
@@ -362,7 +400,9 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 +		}
 +
 +		// The gate opens on a successful todo_write, or when the todo tool is not
-+		// active at all. Before that, an edit is still just work: it never arms.
++		// active at all. The session activates LANE_STARTUP_TOOLS before the first
++		// model call, so an inactive todo tool means the session has none (todo
++		// disabled). Before that, an edit is still just work: it never arms.
 +		const todoGateOpen = todoSeen || !options.activeToolNames().includes(TODO_TOOL);
 +		let actionTool: string | undefined;
 +		if (todoGateOpen) {
@@ -381,4 +421,5 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 +		}
 +		await switchOnce(actionTool, turn);
 +	};
++	return true;
 +}
