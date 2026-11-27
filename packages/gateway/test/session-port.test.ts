@@ -113,6 +113,44 @@ test("worker output validates exact attribution before exposing truncated origin
 	expect("partial" in withoutPartial).toBe(false);
 });
 
+test("default mode reports any truncated body as incomplete_body before DTO validation, never as invalid evidence", () => {
+	// No includePartial: the ordinary worker-output read used by lane settlement.
+	const input = { sessionId: "session-a", repo: "/assigned", opRef: "op-a", notBeforeMs: 100 };
+	const result = {
+		kind: "prompt",
+		status: "terminal_ok",
+		clientRef: "op-a",
+		terminalAt: 200,
+		receiptState: "present",
+		content: { version: 1, type: "text", text: "prefix", byteLength: 6, truncated: true },
+	};
+	const parse = (value: unknown) =>
+		parseWorkerOutputResponse(
+			input,
+			{ exitCode: 0, stdout: JSON.stringify({ ok: true, result: value }), stderr: "" },
+			300,
+		);
+	// A well-formed truncated body, and truncated bodies whose other fields would fail validation,
+	// all answer incomplete_body with no retained fragment (the upstream contract).
+	for (const content of [
+		result.content,
+		{ ...result.content, byteLength: 1 },
+		{ ...result.content, version: 2 },
+		{ ...result.content, text: 1 },
+		{ truncated: true },
+	]) {
+		const parsed = parse({ ...result, content });
+		expect(parsed).toEqual({ status: "unavailable", code: "incomplete_body" });
+		expect("partial" in parsed).toBe(false);
+	}
+	// The same body untruncated is proven original output.
+	expect(parse({ ...result, content: { ...result.content, truncated: false } })).toMatchObject({
+		status: "proven",
+		text: "prefix",
+		provenance: { fullness: "original" },
+	});
+});
+
 test("worker partial display respects UTF-8 cap without promoting it to complete-output proof", () => {
 	const text = "가".repeat(6_000);
 	const bytes = new TextEncoder().encode(text);

@@ -106,10 +106,12 @@ import {
 	managedLaneBranchName,
 	managedLaneRepositoryPath,
 	managedLaneWorktreePath,
+	type SweepNomination,
 	workSessionKey,
 } from "./lane-governor";
 import { sanitizeDiagnostic } from "./rebind";
 import {
+	isSessionBusy,
 	isSessionUnavailable,
 	type SessionLiveness,
 	type SessionPort,
@@ -1227,8 +1229,9 @@ export class WorkLaneManager {
 		const abandoned: string[] = [];
 		const held: { name: string; reason: string }[] = [];
 		for (const name of this.#db.work.firstmate.reservingNames()) {
-			if (!this.#firstmateSweepDue(name, now)) continue;
-			const result = await this.abandonFirstmate(name);
+			const due = this.#firstmateSweepDue(name, now);
+			if (!due) continue;
+			const result = await this.abandonFirstmate(name, due === true ? undefined : due);
 			if (result.abandoned) abandoned.push(name);
 			else {
 				held.push({ name, reason: result.reason });
@@ -1238,9 +1241,17 @@ export class WorkLaneManager {
 		return { abandoned, held };
 	}
 
-	#firstmateSweepDue(name: string, now: number): boolean {
-		if (this.#options.lanes.activeLanes(now).some((lane) => lane.name === name))
-			return this.#options.lanes.boundSweepReason(name, now) !== undefined;
+	/**
+	 * A bound lane is due on the ordinary sweep predicate and returns that nomination, so
+	 * native retire re-proves it under the lane lock. An unbound reservation has nothing to
+	 * close and is due on its job state or its session clock.
+	 */
+	#firstmateSweepDue(name: string, now: number): SweepNomination | boolean {
+		const lane = this.#options.lanes.activeLanes(now).find((candidate) => candidate.name === name);
+		if (lane) {
+			const reason = this.#options.lanes.boundSweepReason(name, now);
+			return reason === undefined ? false : { sessionId: lane.sessionId, reason, now };
+		}
 		let job: LaneJobRecord | undefined;
 		try {
 			job = this.#job(name);
@@ -1257,13 +1268,19 @@ export class WorkLaneManager {
 	}
 
 	/**
-	 * Abandonment is the preserving release with no outcome to approve. It closes
-	 * the session through the same lock a scoped release uses, records the row
-	 * that frees the reservation, and aborts the job in that same transaction.
-	 * A job that already landed stays done. The worktree stays; the assignment stays.
+	 * Abandonment is the preserving release with no outcome to approve. The pane closes
+	 * first, then the one native retire closes the worker under the lane lock. The row
+	 * that frees the reservation and the aborted job are written in the transaction that
+	 * retires the binding, so a close that fails or is refused while busy leaves the
+	 * reservation in place for the next sweep. A job that already landed stays done.
+	 * The worktree stays; the assignment stays.
+	 *
+	 * `nomination` is the sweep's observation of a bound lane; native retire re-proves it
+	 * under the lock and leaves a lane that was reused or rebound meanwhile alone.
 	 */
 	async abandonFirstmate(
 		name: string,
+		nomination?: SweepNomination,
 	): Promise<{ abandoned: true; name: string } | { abandoned: false; reason: string }> {
 		const held = (reason: string): { abandoned: false; reason: string } => ({ abandoned: false, reason });
 		try {
@@ -1281,43 +1298,24 @@ export class WorkLaneManager {
 			// Abandonment never discards checkout work.
 			const dirty = await dirtyCheckout(assignment.worktree.path);
 			if (dirty) return held(dirty);
-			// No outcome and the aborted end: upstream has no such end, so FirstMate records it, through
-			// the native checks settlement when a cycle is still open.
-			const effects = await this.#port.runExclusive(workSessionKey(name), async () => {
-				this.#live();
-				if (!settled()) return held("abandon requires a settled attempt");
-				const at = this.#at();
-				const abort = (tx: WriteTx, record: LaneJobRecord | undefined): LaneJobRecord | undefined => {
-					owner.recordAbandonment(tx, name, "no_outcome", at);
-					// An aborted job never keeps an open checks cycle.
-					return record && clearAwaitingChecks(abortJob({ record, at, note: "no outcome" }));
-				};
-				const job = this.#job(name);
-				if (job?.state === "awaiting_checks")
-					return this.#settleChecks(
-						name,
-						job,
-						{ kind: "ended", reason: "lane abandoned before checks settled" },
-						undefined,
-						at,
-						(tx, record) => abort(tx, record)!,
-					);
-				this.#db.transaction((tx) => {
-					const aborted = abort(tx, job);
-					if (aborted && aborted !== job) this.#putJob(name, aborted, tx);
-				});
-				return undefined;
-			});
-			if (effects && "abandoned" in effects) return effects;
-			if (effects) await this.#dispatchChecksEffects(effects);
-			await this.#options.closePane?.(name);
-			// The one native retire closes the session; abandonment is only the decision in front of it.
-			const outcome = await this.#options.lanes.retire(name, "firstmate_abandoned", undefined, {
+			const paneHeld = await this.#closePane(name);
+			if (paneHeld) return held(paneHeld);
+			// The one native retire closes the session and settles an open checks cycle. No outcome
+			// and the aborted end have no upstream equivalent, so FirstMate records them in its commit.
+			const outcome = await this.#options.lanes.retire(name, "firstmate_abandoned", nomination, {
 				prepare: async () => {
-					if (!owner.abandoned(name)) return "abandonment_missing";
+					if (!settled()) return "abandon requires a settled attempt";
 					return await dirtyCheckout(assignment.worktree.path);
 				},
-				commit: () => {},
+				commit: (tx) => {
+					const at = this.#at();
+					owner.recordAbandonment(tx, name, "no_outcome", at);
+					const job = this.#job(name);
+					if (!job) return;
+					// An aborted job never keeps an open checks cycle.
+					const aborted = clearAwaitingChecks(abortJob({ record: job, at, note: "no outcome" }));
+					if (aborted !== job) this.#putJob(name, aborted, tx);
+				},
 			});
 			return outcome.retired ? { abandoned: true, name } : held(outcome.reason);
 		} catch (error) {
@@ -1329,6 +1327,21 @@ export class WorkLaneManager {
 						(error instanceof BrokerAuthorityError ? "broker_authority_unavailable" : failureReason(error)),
 				),
 			);
+		}
+	}
+
+	/**
+	 * Closes the task's secondmate pane with gjc's idle-fenced close. A busy pane refuses,
+	 * stays live, and returns the held reason, so the caller records nothing and a later
+	 * sweep or retried release closes it. There is no forced fallback.
+	 */
+	async #closePane(name: string): Promise<string | undefined> {
+		try {
+			await this.#options.closePane?.(name);
+			return undefined;
+		} catch (error) {
+			if (isSessionBusy(error)) return "pane_session_busy";
+			throw error;
 		}
 	}
 
@@ -1405,7 +1418,8 @@ export class WorkLaneManager {
 				);
 				const completed = owner.releaseReceipt(previous.releaseId);
 				if (completed) {
-					await this.#options.closePane?.(request.name);
+					const paneHeld = await this.#closePane(request.name);
+					if (paneHeld) return held(paneHeld);
 					return { retired: true, release: completed };
 				}
 			}
@@ -1505,7 +1519,8 @@ export class WorkLaneManager {
 			const dirty = await dirtyCheckout(assignment.worktree.path);
 			if (dirty) return held(dirty);
 			check();
-			await this.#options.closePane?.(request.name);
+			const paneHeld = await this.#closePane(request.name);
+			if (paneHeld) return held(paneHeld);
 			// The decision sits in front of the one native retire: its recovery gate, quarantine,
 			// settlement proof, close and checks settlement are the upstream ones.
 			const outcome = await this.#options.lanes.retire(request.name, "firstmate_released", undefined, {
@@ -4370,8 +4385,6 @@ export class WorkLaneManager {
 		outcome: ChecksSettlement,
 		facts: Awaited<ReturnType<typeof collectRepoFacts>>,
 		at = this.#at(),
-		/** A later decision written in this same settlement transaction (FirstMate abandonment). */
-		amend?: (tx: WriteTx, settled: LaneJobRecord) => LaneJobRecord,
 	): ChecksReportEffects {
 		const cycle = job.awaitingChecks!;
 		const settled = settleAwaitingChecks(job, at, outcome);
@@ -4392,7 +4405,7 @@ export class WorkLaneManager {
 		const reportId = workAttemptReportId(this.#db.instanceId, job.jobId, reportRef);
 		const deliveryId = workAttemptDeliveryId(this.#db.instanceId, job.jobId, reportRef);
 		const effects = this.#db.transaction((tx): ChecksReportEffects => {
-			this.#putJob(name, amend ? amend(tx, settled) : settled, tx);
+			this.#putJob(name, settled, tx);
 			if (parent?.kind === "persona") {
 				// FirstMate records which native route carried this outcome; it never chooses another one.
 				const record = (route: "persona" | "fallback") => {

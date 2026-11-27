@@ -130,8 +130,9 @@ test("an owner decision enters the one native retire: recovery gate, lane lock, 
 	expect(recoveries).toBe(1);
 	expect(keys).toEqual(["work/task/a"]);
 	expect(database.bindings.getSessionRecord("work/task/a")?.sessionId).toBe("");
-	// The decision never discards the task checkout the way an operator retire of a managed lane does.
-	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo" }]);
+	// The decision never discards the task checkout the way an operator retire of a managed lane does,
+	// and it closes with the idle fence, never forced.
+	expect(port.closes).toEqual([{ sessionId: "sess-a", repo: "/tmp/worker-repo", ifIdle: true }]);
 });
 
 test("an owner decision holds before close, and a live session that will not close holds without commit", async () => {

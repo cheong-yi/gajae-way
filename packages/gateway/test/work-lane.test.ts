@@ -794,8 +794,13 @@ async function approvalInput(
 }
 
 /** `personaBound` decides the native report route: the pane persona inbox, or its fallback delivery. */
-async function approvalFixture(text = "done", unavailable = false, personaBound = true) {
-	const f = await firstmateFixture();
+async function approvalFixture(
+	text = "done",
+	unavailable = false,
+	personaBound = true,
+	options: Partial<WorkLaneManagerOptions> = {},
+) {
+	const f = await firstmateFixture(options);
 	if (personaBound)
 		f.db.transaction((tx) => f.db.bindings.bind(tx, originKey(f.assignment.thread), crypto.randomUUID()));
 	Object.assign(f.assignment.mandate, { checkRetries: false });
@@ -1225,7 +1230,7 @@ test("FirstMate separate release refuses a dirty checkout, preserves Git and ret
 	const result = await f.manager.retireFirstmate(f.request);
 	expect(result.retired).toBe(true);
 	if (!result.retired) throw new Error(result.reason);
-	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path }]);
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
 	// The release is a decision in front of the native retire, so its recovery gate runs.
 	expect(recover).toHaveBeenCalledTimes(1);
 	recover.mockRestore();
@@ -1289,7 +1294,7 @@ test("FirstMate abandonment refuses a dirty checkout without touching it and aba
 	expect(status()).toBe("");
 	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
 	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
-	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: path }]);
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: path, ifIdle: true }]);
 	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
 	expect(f.job().state).toBe("aborted");
 	expect(f.git("-C", path, "rev-parse", "HEAD")).toBe(head);
@@ -1314,7 +1319,7 @@ test("FirstMate abandonment settles an open checks cycle through the native repo
 	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
 	expect(f.job().state).toBe("aborted");
 	expect(f.job().awaitingChecks).toBeUndefined();
-	expect(f.port.closes).toEqual([{ sessionId: start.sessionId, repo: f.assignment.worktree.path }]);
+	expect(f.port.closes).toEqual([{ sessionId: start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
 	expect(f.db.bindings.getSessionRecord(start.sessionKey)?.sessionId).toBe("");
 	// The checks outcome is one native persona report; nothing is posted beside it.
 	const reports = f.db.core
@@ -1323,7 +1328,8 @@ test("FirstMate abandonment settles an open checks cycle through the native repo
 		.all(parentKey) as { message_id: string; body: string }[];
 	const checksReports = reports.filter((row) => row.body.includes("checks=ended"));
 	expect(checksReports).toHaveLength(1);
-	expect(checksReports[0]!.body).toContain("lane abandoned before checks settled");
+	// Native retire settles the cycle with its own wording; abandonment is only the decision.
+	expect(checksReports[0]!.body).toContain("lane retired before checks settled");
 	expect(f.db.outbox.rows().filter((row) => row.payload_json.includes("checks=ended"))).toHaveLength(0);
 });
 
@@ -1444,7 +1450,7 @@ async function releaseClosedWithoutReceipt() {
 	} finally {
 		receipt.mockRestore();
 	}
-	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path }]);
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
 	const pending = f.owner.releaseForAttempt(f.start.opRef)!;
 	expect(pending).toBeDefined();
 	expect(f.owner.releaseReceipt(pending.releaseId)).toBeUndefined();
@@ -1745,6 +1751,82 @@ test("an unsettled assignment is not abandoned by the mapped deadline", async ()
 	expect(await reserved.manager.sweepFirstmate(Date.now() + 24 * 60 * 60_000)).toEqual({ abandoned: [], held: [] });
 	expect(reserved.owner.abandoned("a")).toBe(false);
 	expect(reserved.owner.assignment("a")).toEqual(reserved.assignment);
+});
+
+test("FirstMate abandonment records nothing until the idle-fenced worker close lands, and a later sweep retries it", async () => {
+	const f = await approvalFixture();
+	const busy = () => new GjcCliError("refused", 0, "", { code: "busy" });
+	f.port.closeOutcomes.set(f.start.sessionId, [busy()]);
+	const binding = f.db.bindings.getSessionRecord(f.start.sessionKey);
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: false, reason: "session_busy" });
+	// The busy worker refused the idle-fenced close and stays bound; the reservation stays.
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
+	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
+	expect(f.owner.reservingNames()).toContain(f.assignment.name);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)).toEqual(binding);
+	expect(f.job().state).not.toBe("aborted");
+	// The next attempt closes the idle worker and only then records the abandonment.
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
+	expect(f.port.closes).toHaveLength(2);
+	expect(f.port.closes.every((close) => close.ifIdle === true)).toBe(true);
+	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
+	expect(f.owner.reservingNames()).not.toContain(f.assignment.name);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+	expect(f.job().state).toBe("aborted");
+});
+
+test("FirstMate abandonment and release hold while the secondmate pane refuses its idle-fenced close", async () => {
+	let paneBusy = true;
+	const paneCloses: string[] = [];
+	const f = await approvalFixture("done", false, true, {
+		closePane: async (name) => {
+			paneCloses.push(name);
+			if (paneBusy) throw new GjcCliError("refused", 0, "", { code: "busy" });
+		},
+	});
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({
+		abandoned: false,
+		reason: "pane_session_busy",
+	});
+	// Nothing closed the worker and nothing was recorded while the pane was busy.
+	expect(paneCloses).toEqual([f.assignment.name]);
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
+	paneBusy = false;
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
+	expect(paneCloses).toEqual([f.assignment.name, f.assignment.name]);
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
+});
+
+test("the mapped deadline passes its nomination to native retire, which leaves a lane rebound since then alone", async () => {
+	const f = await releaseFixture();
+	const raw = new Database(join(f.directory, "gateway.db"));
+	try {
+		raw
+			.query("UPDATE sessions SET last_activity_at = ? WHERE origin_key = ?")
+			.run(new Date(Date.now() - 7 * 60 * 60_000).toISOString(), f.start.sessionKey);
+	} finally {
+		raw.close();
+	}
+	// A nomination for a session the lane no longer has is re-proven under the lock and refused.
+	const stale = { sessionId: "an-earlier-session", reason: "idle" as const, now: Date.now() };
+	const refused = await f.manager.abandonFirstmate(f.assignment.name, stale);
+	expect(refused.abandoned).toBe(false);
+	if (refused.abandoned) throw new Error("a stale nomination abandoned the lane");
+	expect(refused.reason).toContain(`lane was rebound to ${f.start.sessionId}`);
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
+	// The sweep hands native retire exactly what it observed.
+	const retire = spyOn(f.lanes, "retire");
+	try {
+		const now = Date.now();
+		expect(await f.manager.sweepFirstmate(now)).toEqual({ abandoned: [f.assignment.name], held: [] });
+		expect(retire).toHaveBeenCalledTimes(1);
+		expect(retire.mock.calls[0]![2]).toEqual({ sessionId: f.start.sessionId, reason: "idle", now });
+	} finally {
+		retire.mockRestore();
+	}
+	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
 });
 
 for (const state of ["pending", "inflight", "failed_ambiguous", "expired", "missing"] as const) {

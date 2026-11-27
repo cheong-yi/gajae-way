@@ -8,7 +8,7 @@ import type { Store } from "../store";
 import type { WriteTx } from "../store/tx";
 import { runGit } from "./git-command";
 import { sanitizeDiagnostic } from "./rebind";
-import type { SessionPort } from "./session-port";
+import { isSessionBusy, type SessionPort } from "./session-port";
 
 export const WORK_LANE_PREFIX = "work/task/";
 
@@ -92,6 +92,8 @@ type ForceRetireSettlement = (name: string, opRef: string, reason: LaneForceReti
 /**
  * An owner's decision in front of the one native retire, for a lane native retire would
  * otherwise refuse (a FirstMate-mapped lane). It decides; it never closes or settles.
+ * Native retire closes a decided lane with gjc's idle-fenced close: a busy host refuses,
+ * stays live, and the lane is held for a later attempt with no forced fallback.
  */
 export interface LaneOwnerDecision {
 	/**
@@ -341,7 +343,7 @@ export class LaneGovernor {
 				if (held) return { retired: false, sessionKey, reason: held };
 				if (this.#stopped) return { retired: false, sessionKey, reason: "gateway is stopping" };
 			}
-			const proof = await this.#closeOwnedSession(name, lane.sessionId, repo);
+			const proof = await this.#closeOwnedSession(name, lane.sessionId, repo, decision !== undefined);
 			if (!proof.released) return { retired: false, sessionKey, reason: proof.reason };
 			const closed = proof.closed;
 			// A settled attempt can still own an open checks cycle. Left open, the checks
@@ -779,11 +781,17 @@ export class LaneGovernor {
 		name: string,
 		sessionId: string,
 		repo: string,
+		ifIdle = false,
 	): Promise<{ released: true; closed: boolean } | { released: false; reason: string }> {
 		try {
-			await this.#port.close({ sessionId, repo });
+			await this.#port.close(ifIdle ? { sessionId, repo, ifIdle } : { sessionId, repo });
 			return { released: true, closed: true };
 		} catch (error) {
+			if (ifIdle && isSessionBusy(error)) {
+				// Not applied and retryable: the host stays live and nothing is retired.
+				this.#log(`lane_close_held name=${name} session=${sessionId} reason=session_busy`, "info");
+				return { released: false, reason: "session_busy" };
+			}
 			const detail = sanitizeDiagnostic(diagnostic(error));
 			const proof = await this.#safeLiveness(sessionId, repo);
 			const released = proof.live === false || proof.disowned;

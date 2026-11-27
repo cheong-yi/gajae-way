@@ -3008,7 +3008,10 @@ class OriginActor {
 		const sessionId = database.bindings.getSessionRecord(this.originKey)?.sessionId;
 		if (!sessionId) return true;
 		try {
-			await this.#manager.port.close({ sessionId, repo: this.#manager.repo });
+			// gjc's idle-fenced close: work the gateway cannot see (a host job, a turn that
+			// started after the drain) makes it refuse with `busy` instead of being aborted.
+			// That refusal propagates, the session stays bound, and the caller retries later.
+			await this.#manager.port.close({ sessionId, repo: this.#manager.repo, ifIdle: true });
 		} catch (error) {
 			if (sdkStatusErrorCode(error) !== "session_unavailable") throw error;
 		}
