@@ -153,7 +153,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  		// Re-evaluate append-only context mode when the setting changes at runtime.
  		this.#unsubscribeAppendOnly = onAppendOnlyModeChanged(_value => this.#syncAppendOnlyContext(this.model));
  		// SDK ToolSession callbacks capture the just-constructed session. Defer the
-@@ -7313,6 +7350,20 @@
+@@ -7313,6 +7350,21 @@
  	}
  
  	#workflowGateToolRestoration: Promise<void> = Promise.resolve();
@@ -163,9 +163,10 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
 +	 * Activates the lane switch's startup tools when this session installed it.
 +	 * The SDK factory awaits this before returning the session, so the first
 +	 * model call already sees `todo_write`, the way `task.eager` activates `task`.
++	 * An explicit empty tool selection stays empty, as it does for `task.eager`.
 +	 */
 +	async activateLaneModelSwitchTools(): Promise<void> {
-+		if (!this.#laneModelSwitchInstalled) return;
++		if (!this.#laneModelSwitchInstalled || this.#explicitEmptyToolSelection) return;
 +		await this.activateDiscoveredTools([...LANE_STARTUP_TOOLS]);
 +		const active = this.getActiveToolNames();
 +		const missing = LANE_STARTUP_TOOLS.filter(name => !active.includes(name));
@@ -174,7 +175,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  
  	/**
  	 * Resolves when constructor-time workflow-gate tool restoration (ask
-@@ -24689,7 +24740,13 @@
+@@ -24689,7 +24741,13 @@
  	async #setSharedSessionDefaultModel(
  		model: Model,
  		thinkingLevel: ThinkingLevel | undefined,
@@ -189,7 +190,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  	): Promise<void> {
  		const operation = "set session model";
  		const assertMode = this.#controlPublicationModeFence(operation);
-@@ -24754,7 +24811,9 @@
+@@ -24754,7 +24812,9 @@
  			);
  			throw new ModelProfileApplyCommittedError(selector, committedOwnership!.version, error);
  		};
@@ -200,7 +201,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  		if (effectiveLevel !== this.#thinkingLevel)
  			entries.push({ type: "thinking_level_change", level: effectiveLevel, operatorIntent: false });
  		const origin = options.cause === "startup-override" ? "startup-override" : "model_selection";
-@@ -24952,6 +25011,8 @@
+@@ -24952,6 +25012,8 @@
  			persistAsSessionDefault?: boolean;
  			cause?: ModelChangeCause;
  			reason?: TemporaryModelReason;
@@ -209,7 +210,7 @@ diff --git a/coding-agent/src/session/agent-session.ts b/coding-agent/src/sessio
  			providerSessionScope?: TemporaryProviderSessionScope;
  			signal?: AbortSignal;
  			shouldMutate?: () => boolean;
-@@ -25073,6 +25134,7 @@
+@@ -25073,6 +25135,7 @@
  			this.sessionManager.appendModelChange(
  				`${model.provider}/${model.id}`,
  				options?.persistAsSessionDefault ? "default" : "temporary",
@@ -401,8 +402,8 @@ diff --git a/coding-agent/src/session/lane-model-switch.ts b/coding-agent/src/se
 +
 +		// The gate opens on a successful todo_write, or when the todo tool is not
 +		// active at all. The session activates LANE_STARTUP_TOOLS before the first
-+		// model call, so an inactive todo tool means the session has none (todo
-+		// disabled). Before that, an edit is still just work: it never arms.
++		// model call and warns when todo_write stays inactive. Before that, an edit
++		// is still just work: it never arms.
 +		const todoGateOpen = todoSeen || !options.activeToolNames().includes(TODO_TOOL);
 +		let actionTool: string | undefined;
 +		if (todoGateOpen) {

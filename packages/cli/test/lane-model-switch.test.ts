@@ -435,7 +435,8 @@ test("an installed lane reports itself so the session activates todo_write befor
 	// gjc's discovered-tool activation, the same path task.eager uses for `task`.
 	const session = patchedLines("coding-agent/src/session/agent-session.ts");
 	expect(session).toContain("\t\tthis.#laneModelSwitchInstalled = installLaneModelSwitch({");
-	expect(session).toContain("\t\tif (!this.#laneModelSwitchInstalled) return;");
+	// An explicit empty tool selection stays empty, as it does for task.eager.
+	expect(session).toContain("\t\tif (!this.#laneModelSwitchInstalled || this.#explicitEmptyToolSelection) return;");
 	expect(session).toContain("\t\tawait this.activateDiscoveredTools([...LANE_STARTUP_TOOLS]);");
 
 	// The SDK factory awaits the activation before it returns the session, so no
