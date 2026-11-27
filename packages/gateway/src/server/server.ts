@@ -3065,12 +3065,13 @@ export function firstmateChildNotice(store: Store, origin: OriginRef): string | 
 	].join("\n");
 }
 
-async function closeFirstmatePane(runtime: Runtime, store: Store, name: string): Promise<void> {
+/** True when the pane is closed or absent; false when its persona is still busy. */
+async function closeFirstmatePane(runtime: Runtime, store: Store, name: string): Promise<boolean> {
 	const pane = readLanePane(store, name);
-	if (!pane) return;
-	// Record the close before unbinding, so a message that arrives during close is already refused.
-	markPaneClosed(store, pane);
-	await runtime.personaSessions.close(originKey(pane.childOrigin));
+	if (!pane) return true;
+	// Record the close before unbinding, once the pane is idle, so a message that arrives
+	// during close is already refused and a busy pane is never fenced.
+	return await runtime.personaSessions.closeIfIdle(originKey(pane.childOrigin), () => markPaneClosed(store, pane));
 }
 
 /**

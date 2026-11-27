@@ -80,6 +80,7 @@ export type SweepReason = "idle" | "job_done" | "job_aborted";
 
 /** What a sweep observed when it nominated a lane; re-proven under the lane lock. */
 export interface SweepNomination {
+	/** The bound session observed, or "" for an owner's unbound reservation; a lane bound since is refused. */
 	readonly sessionId: string;
 	readonly reason: SweepReason;
 	/** The sweep's clock; the locked recheck evaluates fresh state at this time or later. */
@@ -305,6 +306,9 @@ export class LaneGovernor {
 			const lane = this.activeLanes(expected ? Math.max(expected.now, this.#now()) : undefined).find(
 				(candidate) => candidate.name === name,
 			);
+			// A nomination of a bound session never retires the name once it is unbound.
+			if (!lane && expected && expected.sessionId !== "")
+				return { retired: false, sessionKey, reason: "lane is no longer bound since it was selected" };
 			if (!lane && decision) return this.#retireUnbound(name, decision);
 			if (!lane) return { retired: false, sessionKey, reason: "no bound lane for that name" };
 			if (expected && lane.sessionId !== expected.sessionId)

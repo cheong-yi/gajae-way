@@ -1178,8 +1178,13 @@ function settleReportDelivery(f: Awaited<ReturnType<typeof firstmateFixture>>, o
 	return { turnId: runtime.opRef, deliveryId: runtime.deliveryId, reportId: runtime.reportId };
 }
 
-async function releaseFixture(delivered = true, unavailable = false, personaBound = true) {
-	const f = await approvalFixture("done", unavailable, personaBound);
+async function releaseFixture(
+	delivered = true,
+	unavailable = false,
+	personaBound = true,
+	options: Partial<WorkLaneManagerOptions> = {},
+) {
+	const f = await approvalFixture("done", unavailable, personaBound, options);
 	const input = await approvalInput(f, f.start.opRef);
 	const approved = await f.manager.approveFirstmate(input);
 	if (!approved.recorded) throw new Error(approved.reason);
@@ -1775,31 +1780,19 @@ test("FirstMate abandonment records nothing until the idle-fenced worker close l
 	expect(f.job().state).toBe("aborted");
 });
 
-test("FirstMate abandonment and release hold while the secondmate pane refuses its idle-fenced close", async () => {
-	let paneBusy = true;
-	const paneCloses: string[] = [];
-	const f = await approvalFixture("done", false, true, {
-		closePane: async (name) => {
-			paneCloses.push(name);
-			if (paneBusy) throw new GjcCliError("refused", 0, "", { code: "busy" });
+/** A pane close the test controls: `busy` makes each attempt refuse, every attempt is recorded. */
+function scriptedPane() {
+	const pane = { busy: true, closes: [] as string[] };
+	return {
+		pane,
+		closePane: async (name: string) => {
+			pane.closes.push(name);
+			return !pane.busy;
 		},
-	});
-	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({
-		abandoned: false,
-		reason: "pane_session_busy",
-	});
-	// Nothing closed the worker and nothing was recorded while the pane was busy.
-	expect(paneCloses).toEqual([f.assignment.name]);
-	expect(f.port.closes).toHaveLength(0);
-	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
-	paneBusy = false;
-	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
-	expect(paneCloses).toEqual([f.assignment.name, f.assignment.name]);
-	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
-});
+	};
+}
 
-test("the mapped deadline passes its nomination to native retire, which leaves a lane rebound since then alone", async () => {
-	const f = await releaseFixture();
+function ageWorker(f: Awaited<ReturnType<typeof releaseFixture>>): void {
 	const raw = new Database(join(f.directory, "gateway.db"));
 	try {
 		raw
@@ -1808,25 +1801,122 @@ test("the mapped deadline passes its nomination to native retire, which leaves a
 	} finally {
 		raw.close();
 	}
-	// A nomination for a session the lane no longer has is re-proven under the lock and refused.
-	const stale = { sessionId: "an-earlier-session", reason: "idle" as const, now: Date.now() };
-	const refused = await f.manager.abandonFirstmate(f.assignment.name, stale);
-	expect(refused.abandoned).toBe(false);
-	if (refused.abandoned) throw new Error("a stale nomination abandoned the lane");
-	expect(refused.reason).toContain(`lane was rebound to ${f.start.sessionId}`);
+}
+
+test("FirstMate abandonment holds while the secondmate pane is busy, and closes the worker only after the pane", async () => {
+	const { pane, closePane } = scriptedPane();
+	const f = await approvalFixture("done", false, true, { closePane });
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({
+		abandoned: false,
+		reason: "pane_session_busy",
+	});
+	// Nothing closed the worker and nothing was recorded while the pane was busy.
+	expect(pane.closes).toEqual([f.assignment.name]);
 	expect(f.port.closes).toHaveLength(0);
 	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
-	// The sweep hands native retire exactly what it observed.
+	pane.busy = false;
+	expect(await f.manager.abandonFirstmate(f.assignment.name)).toEqual({ abandoned: true, name: f.assignment.name });
+	expect(pane.closes).toEqual([f.assignment.name, f.assignment.name]);
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
+});
+
+test("FirstMate release holds while the secondmate pane is busy, records no intent, and a retry releases", async () => {
+	const { pane, closePane } = scriptedPane();
+	const f = await releaseFixture(true, false, true, { closePane });
+	const held = await f.manager.retireFirstmate(f.request);
+	expect(held).toMatchObject({ retired: false, held: true, reason: "pane_session_busy" });
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.owner.releaseForAttempt(f.start.opRef)).toBeUndefined();
+	expect(f.owner.released(f.assignment.name)).toBe(false);
+	pane.busy = false;
+	expect((await f.manager.retireFirstmate(f.request)).retired).toBe(true);
+	expect(pane.closes).toEqual([f.assignment.name, f.assignment.name]);
+	expect(f.port.closes).toEqual([{ sessionId: f.start.sessionId, repo: f.assignment.worktree.path, ifIdle: true }]);
+	expect(f.owner.released(f.assignment.name)).toBe(true);
+});
+
+test("a recorded release intent whose worker close was refused is never overtaken by the mapped deadline", async () => {
+	const f = await releaseFixture();
+	f.port.closeOutcomes.set(f.start.sessionId, [new GjcCliError("refused", 0, "", { code: "busy" })]);
+	expect(await f.manager.retireFirstmate(f.request)).toMatchObject({ retired: false, reason: "session_busy" });
+	// The intent is durable and the worker is still bound.
+	expect(f.owner.releaseForAttempt(f.start.opRef)).toBeDefined();
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe(f.start.sessionId);
+	ageWorker(f);
+	// The worker is idle now, but the sweep refuses to abandon a task with a pending release.
+	expect(await f.manager.sweepFirstmate()).toEqual({
+		abandoned: [],
+		held: [{ name: f.assignment.name, reason: "release_pending" }],
+	});
+	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
+	expect(f.port.closes).toHaveLength(1);
+	expect(f.job().state).not.toBe("aborted");
+	// The original release retries and completes.
+	expect((await f.manager.retireFirstmate(f.request)).retired).toBe(true);
+	expect(f.owner.released(f.assignment.name)).toBe(true);
+	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
+});
+
+test("native retire re-proves the abandonment nomination under the lock before the pane or worker closes", async () => {
+	const { pane, closePane } = scriptedPane();
+	pane.busy = false;
+	const f = await releaseFixture(true, false, true, { closePane });
+	ageWorker(f);
+	const now = Date.now();
+	// A nomination for a session the lane no longer has.
+	const rebound = await f.manager.abandonFirstmate(f.assignment.name, { sessionId: "earlier", reason: "idle", now });
+	expect(rebound.abandoned).toBe(false);
+	if (rebound.abandoned) throw new Error("a stale nomination abandoned the lane");
+	expect(rebound.reason).toContain(`lane was rebound to ${f.start.sessionId}`);
+	// A nomination of an unbound reservation, while a lane is bound.
+	expect((await f.manager.abandonFirstmate(f.assignment.name, { sessionId: "", reason: "idle", now })).abandoned).toBe(
+		false,
+	);
+	// Neither stale nomination fenced the pane or closed anything.
+	expect(pane.closes).toHaveLength(0);
+	expect(f.port.closes).toHaveLength(0);
+	expect(f.owner.abandoned(f.assignment.name)).toBe(false);
+	// The sweep hands native retire exactly what it observed, and that abandons.
 	const retire = spyOn(f.lanes, "retire");
 	try {
-		const now = Date.now();
 		expect(await f.manager.sweepFirstmate(now)).toEqual({ abandoned: [f.assignment.name], held: [] });
 		expect(retire).toHaveBeenCalledTimes(1);
 		expect(retire.mock.calls[0]![2]).toEqual({ sessionId: f.start.sessionId, reason: "idle", now });
 	} finally {
 		retire.mockRestore();
 	}
+	expect(pane.closes).toEqual([f.assignment.name]);
 	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
+	// The lane is unbound now; a nomination of its old bound session never retires the name again.
+	const stale = { sessionId: f.start.sessionId, reason: "idle" as const, now };
+	const decision = {
+		prepare: async () => undefined,
+		commit: () => {
+			throw new Error("a bound nomination committed against an unbound lane");
+		},
+	};
+	expect(await f.lanes.retire(f.assignment.name, "firstmate_abandoned", stale, decision)).toMatchObject({
+		retired: false,
+		reason: "lane is no longer bound since it was selected",
+	});
+});
+
+test("an unbound reservation is abandoned on its own nomination", async () => {
+	const f = await releaseFixture();
+	// The worker session is reclaimed: the reservation stays with no bound lane.
+	f.port.liveness = async () => ({ live: false, disowned: false });
+	expect((await f.lanes.retireAllDead()).names).toEqual([f.assignment.name]);
+	expect(f.db.bindings.getSessionRecord(f.start.sessionKey)?.sessionId).toBe("");
+	const later = Date.now() + 7 * 60 * 60_000;
+	const retire = spyOn(f.lanes, "retire");
+	try {
+		expect(await f.manager.sweepFirstmate(later)).toEqual({ abandoned: [f.assignment.name], held: [] });
+		expect(retire.mock.calls[0]![2]).toMatchObject({ sessionId: "", now: later });
+	} finally {
+		retire.mockRestore();
+	}
+	expect(f.owner.abandoned(f.assignment.name)).toBe(true);
+	expect(f.port.closes).toHaveLength(1);
 });
 
 for (const state of ["pending", "inflight", "failed_ambiguous", "expired", "missing"] as const) {

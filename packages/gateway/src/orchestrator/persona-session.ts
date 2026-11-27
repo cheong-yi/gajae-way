@@ -1415,16 +1415,21 @@ export class PersonaSessionManager {
 		return this.#actors.get(originKey)?.state ?? "idle";
 	}
 
-	/** Close only after accepted turns settle, with admission fenced in the origin mailbox. */
-	async close(originKey: string): Promise<void> {
+	/**
+	 * One idle-fenced close attempt, with admission fenced in the origin mailbox. False when
+	 * an accepted turn or observer is still open; nothing is closed and the caller retries
+	 * later. It never waits for the origin to go idle, so a caller may hold another lock.
+	 * `beforeClose` runs in the mailbox once the origin is idle, before the session closes.
+	 */
+	async closeIfIdle(originKey: string, beforeClose?: () => void): Promise<boolean> {
+		if (this.#stopped) throw new Error("persona manager stopped before session close");
 		const actor = this.#actor(originKey);
 		await actor.enqueue(async () => actor.beginClose());
 		try {
-			while (!this.#stopped) {
-				if (await actor.enqueue(async () => await actor.closeWhenIdle())) return;
-				await Bun.sleep(10);
-			}
-			throw new Error("persona manager stopped before session close");
+			const closed = await actor.enqueue(async () => await actor.closeWhenIdle(beforeClose));
+			// A stopped actor ran nothing: the session was not closed.
+			if (closed === undefined) throw new Error("persona manager stopped before session close");
+			return closed;
 		} finally {
 			await actor.enqueue(async () => actor.endClose());
 		}
@@ -2999,11 +3004,12 @@ class OriginActor {
 		this.#closing--;
 	}
 
-	async closeWhenIdle(): Promise<boolean> {
+	async closeWhenIdle(beforeClose?: () => void): Promise<boolean> {
 		if (!this.#recoveryScanned) await this.recover();
 		if (await this.drain()) return false;
 		await this.sweepObserver(this.#manager.now());
 		if (this.#observer?.active) return false;
+		beforeClose?.();
 		const database = this.#manager.database;
 		const sessionId = database.bindings.getSessionRecord(this.originKey)?.sessionId;
 		if (!sessionId) return true;
