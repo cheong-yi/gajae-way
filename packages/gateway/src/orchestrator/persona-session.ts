@@ -1416,6 +1416,24 @@ export class PersonaSessionManager {
 	}
 
 	/**
+	 * Waits, with admission fenced, until the origin's accepted turns and observer settle.
+	 * Closes nothing. Never call it under a lock the origin's own turns may need.
+	 */
+	async waitIdle(originKey: string): Promise<void> {
+		const actor = this.#actor(originKey);
+		await actor.enqueue(async () => actor.beginClose());
+		try {
+			while (!this.#stopped) {
+				if (await actor.enqueue(async () => await actor.idle())) return;
+				await Bun.sleep(10);
+			}
+			throw new Error("persona manager stopped before the origin went idle");
+		} finally {
+			await actor.enqueue(async () => actor.endClose());
+		}
+	}
+
+	/**
 	 * One idle-fenced close attempt, with admission fenced in the origin mailbox. False when
 	 * an accepted turn or observer is still open; nothing is closed and the caller retries
 	 * later. It never waits for the origin to go idle, so a caller may hold another lock.
@@ -3004,11 +3022,16 @@ class OriginActor {
 		this.#closing--;
 	}
 
-	async closeWhenIdle(beforeClose?: () => void): Promise<boolean> {
+	/** True once accepted turns are reconciled and the run observer is closed. */
+	async idle(): Promise<boolean> {
 		if (!this.#recoveryScanned) await this.recover();
 		if (await this.drain()) return false;
 		await this.sweepObserver(this.#manager.now());
-		if (this.#observer?.active) return false;
+		return !this.#observer?.active;
+	}
+
+	async closeWhenIdle(beforeClose?: () => void): Promise<boolean> {
+		if (!(await this.idle())) return false;
 		beforeClose?.();
 		const database = this.#manager.database;
 		const sessionId = database.bindings.getSessionRecord(this.originKey)?.sessionId;

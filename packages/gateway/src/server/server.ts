@@ -1353,6 +1353,10 @@ function createRuntime(options: GatewayServerOptions): Runtime {
 		deliverFallback: (payload) => broadcastDelivery(runtime, payload),
 		checkStatusClient: ghCheckStatusClient(),
 		closePane: (name) => closeFirstmatePane(runtime, options.database, name),
+		awaitPaneIdle: async (name) => {
+			const pane = readLanePane(options.database, name);
+			if (pane) await runtime.personaSessions.waitIdle(originKey(pane.childOrigin));
+		},
 	});
 	const originSilent = new OriginSilentAlerter(options.database, () => runtime.config.ownerTarget?.origin);
 	const reconcileTimer = setInterval(() => {

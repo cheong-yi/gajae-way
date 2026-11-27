@@ -338,6 +338,11 @@ export interface WorkLaneManagerOptions {
 	/** Closes a FirstMate lane's pane before its owner decision reaches the native retire. */
 	/** One idle-fenced pane close attempt: true when closed or absent, false when the pane is busy. */
 	readonly closePane?: (name: string) => Promise<boolean>;
+	/**
+	 * Waits until the task's pane has no running turn, closing nothing. An explicit release
+	 * calls it before the lane lock, because a pane turn may itself need that lock.
+	 */
+	readonly awaitPaneIdle?: (name: string) => Promise<void>;
 	/** The `gh` executable the gateway's own FirstMate merge runs; defaults to `gh` on PATH. */
 	readonly ghExecutable?: string;
 	/** Bounded wait for a restarting broker before a lane bind fails; defaults to {@link WORK_BIND_BROKER_WAIT}. */
@@ -1261,7 +1266,8 @@ export class WorkLaneManager {
 			return undefined;
 		}
 		if (job?.attempts.some((attempt) => attempt.endedAt === undefined)) return undefined;
-		if (job && (job.state === "done" || job.state === "aborted")) return { sessionId: "", reason: job.state === "done" ? "job_done" : "job_aborted", now };
+		if (job && (job.state === "done" || job.state === "aborted"))
+			return { sessionId: "", reason: job.state === "done" ? "job_done" : "job_aborted", now };
 		const clock = this.#db.bindings.sessionClock(workSessionKey(name));
 		const stamp = clock?.lastActivityAt ?? clock?.createdAt;
 		if (!stamp) return undefined;
@@ -1310,7 +1316,10 @@ export class WorkLaneManager {
 					if (!settled()) return "abandon requires a settled attempt";
 					// A preserving release that is already recorded owns this task; abandonment never overtakes it.
 					const current = owner.assignment(name);
-					if (current && owner.attemptsForTask(current.taskId).some((attempt) => owner.releaseForAttempt(attempt.opRef)))
+					if (
+						current &&
+						owner.attemptsForTask(current.taskId).some((attempt) => owner.releaseForAttempt(attempt.opRef))
+					)
 						return "release_pending";
 					// An unbound reservation has no native predicate; re-prove FirstMate's own under the lock.
 					if (nomination?.sessionId === "" && this.#firstmateSweepDue(name, nomination.now)?.sessionId !== "")
@@ -1531,6 +1540,10 @@ export class WorkLaneManager {
 			// worktree has tracked or untracked changes. Nothing is reset, deleted or merged.
 			const dirty = await dirtyCheckout(assignment.worktree.path);
 			if (dirty) return held(dirty);
+			check();
+			// An explicit release waits for a running pane turn instead of refusing it. The wait is
+			// outside the lane lock; the single fenced pane close happens under it, below.
+			await this.#options.awaitPaneIdle?.(request.name);
 			check();
 			// The decision sits in front of the one native retire: its recovery gate, quarantine,
 			// settlement proof, close and checks settlement are the upstream ones.
