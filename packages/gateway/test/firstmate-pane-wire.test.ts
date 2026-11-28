@@ -331,7 +331,10 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		expect(preamble).toContain("never run `work start --firstmate`, `work approve` or `work retire --firstmate`");
 		expect(preamble).toContain("never approve or ask for approval here");
 		expect(preamble).not.toContain("`work start --firstmate-correction`, `work approve`");
-		expect(preamble).toContain("You send same-task corrections into this lane.");
+		expect(preamble).toContain("Correcting this task is your standing job.");
+		expect(preamble).toContain(`You are not FirstMate: FirstMate is ${originKey(assignment.thread)}`);
+		// A wake back into the chain that started this turn is refused, so a refusal is reported in the pane.
+		expect(preamble).toContain("A refused or held correction is a result. Report it here with its reason");
 		expect(preamble).toContain("Then run `gajaeway work start --firstmate-correction <file>`.");
 		expect(preamble).toContain("When the latest attempt has settled completed and the lane is still bound");
 		expect(preamble).toContain("While an attempt is open, you may steer it with `gajaeway work steer pane");
