@@ -47,7 +47,7 @@ Do this in order:
 
 ### Second run: a text-only plan gets the continue nudge
 
-This run proves the text-only plan path. The mandate asks for the plan in a reply with no tool call and never names `todo_write`. That reply gets the hidden continue nudge, and the lane still switches only after the first edit batch once a successful `todo_write` has opened the gate. Use a second repository and evidence path, `$RUN-noplan`.
+This run proves the text-only plan path. The mandate makes the first two replies text only and never names `todo_write`. The first text-only reply ends a turn with no edit, so it gets the hidden plan nudge. The next text-only reply, the answer to that nudge, gets the hidden continue nudge. A reply after the plan nudge that calls a tool does not get it. The lane then calls `todo_write`, and it switches only after the first edit batch once that `todo_write` has opened the gate. Use a second repository and evidence path, `$RUN-noplan`.
 
 - **Doctor.** Run `.gjc/skills/verify-firstmate/scripts/doctor-test-home.sh` against the same test home. The last line is `doctor: ok`.
 - **Repository.** Run `.gjc/skills/verify-firstmate/scripts/disposable-repo.sh create /home/cheongnet/gajaeway/verify-scratch/$RUN-noplan/repo`. The output reads `created <path> head=<sha> branch=main remotes=none`.
@@ -59,22 +59,30 @@ This run proves the text-only plan path. The mandate asks for the plan in a repl
 ```text
 Start one work lane on the local repository <repo>.
 
-Do the work in that lane session. Do not call the task tool. Do not start another agent. Reply with the plan in text only, with no tool call in that reply. Then continue in the same session without another prompt. Do not stop until the commit exists. Do not push.
+Use the text from here to the end as the lane mandate, word for word.
 
-Do this in order:
+Do the work in that lane session. Do not call the task tool. Do not start another agent. Do not push.
+
+This lane tests its planning turns. Follow these reply rules exactly.
+- Reply 1 is text only. Write the plan from this message alone. Call no tool in reply 1, not even to read a file or look at the repository. End reply 1 after the plan.
+- Reply 2 is text only. When a message asks you for a plan and a todo list, write the todo list as a numbered list in text and call no tool. End reply 2 after the list.
+- From reply 3 on, use the tools that message asked for, then do the steps below with tools. Do not stop until the commit exists.
+
+The steps:
 1. Add smoke_check.py. It reads README.md and exits 0 only if that file contains the exact line "smoke: <run>". Otherwise it exits 1.
 2. Add a Smoke section to README.md that contains that exact line and says to run python3 smoke_check.py.
 3. Run python3 smoke_check.py, then commit those files.
 4. Stop only after that commit exists.
 ```
 
-- **Evidence.** After the lane stops, run `.gjc/skills/verify-firstmate/scripts/live-evidence.sh --since "$SINCE" | tee /home/cheongnet/gajaeway/verify-scratch/$RUN-noplan/evidence.txt`. Exit code `0`. Stdout contains one `PASS model_change` line, one `PASS edits first on planning model` line, and one `PASS public end` line whose time is after the switch. A missing switch is exit `1`, which is a failure.
+- **Evidence.** After the lane stops, run `.gjc/skills/verify-firstmate/scripts/live-evidence.sh --since "$SINCE" --expect-continue | tee /home/cheongnet/gajaeway/verify-scratch/$RUN-noplan/evidence.txt`. Exit code `0`. The `NUDGES` line names a `plan` index, a `continue` index, a `todo_write` index and a `switch` index, and ends with `order=continue<todo_write<switch`. Exit `8` means the continue nudge did not fire before the first successful `todo_write`, which is a failure of this run. Stdout contains one `PASS model_change` line, one `PASS edits first on planning model` line, and one `PASS public end` line whose time is after the switch. A missing switch is exit `1`, which is a failure.
 - **Commit.** The worktree has a second commit and no remote. The setup commit is still the first commit.
 
 ## Gotchas
 
 - The switch fires only on a successful `edit`, `write`, `apply_patch` or `ast_edit` result after a successful `todo_write`. A run that never edits never switches. The first run names `todo_write` as a coached step.
-- The second run has no planning tool call. A reply with no tool calls no longer ends planning: it gets the continue nudge, and the lane still switches only after the first edit batch following `todo_write`.
+- The second run has no planning tool call. A reply with no tool calls no longer ends planning. The first turn with no edit gets the plan nudge, whether it is text or a `bash` call. The continue nudge fires only on a later text-only reply before the switch. The lane still switches only after the first edit batch following `todo_write`.
+- The first mate writes the lane mandate from the mention. The mention asks it to pass the text word for word. Check the lane's first user message in the worker JSONL. A paraphrased mandate is a failed setup, not a nudge result.
 - Edits are not blocked. An edit before `todo_write` is allowed and does not switch the model.
 - Exit `6` means the first successful edit-type result did not come from the planning model after a successful `todo_write`, a result before the switch line came from the switch model, or a result after the switch line came from the planning model. File changes before the switch line are the first batch. The switch line is written after that turn finishes.
 - A child `task` call can stop the lane before the switch. This journey forbids that call. A run that uses `task` is a failure of this feature even if a later wake switches.

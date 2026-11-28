@@ -3,11 +3,19 @@
 # for the lane model switch smoke.
 #
 #   disposable-repo.sh create  <path>   fresh repo, no remotes, one setup commit, /.worktrees ignored
-#   disposable-repo.sh destroy <path>   remove its worktrees, then the repo itself
+#   disposable-repo.sh create --local-origin <path>
+#                                       the same, plus remote origin = an empty bare repo at <path>.origin.git
+#   disposable-repo.sh destroy <path>   remove its worktrees, the repo itself, and its local origin if any
 #
 # Both subcommands refuse a path inside this checkout, inside the shared source
-# checkout, inside the test home, or inside any git repository that has a remote.
-# destroy also refuses a repository that create did not make.
+# checkout, inside the test home, or inside any git repository that has a remote
+# other than its own helper-made local origin. destroy also refuses a repository
+# that create did not make.
+#
+# The local origin exists for the correction drive. With no origin at all the
+# gateway starts an awaiting_checks wait (pushed unknown), and a correction is
+# refused until that wait ends. An empty local origin reports the lane branch as
+# not pushed, so a completed attempt settles without that wait. Nothing is pushed.
 set -euo pipefail
 
 SOURCE_ROOT=/home/cheongnet/gajaeway/state/workspace/source
@@ -20,10 +28,15 @@ die() {
 }
 
 usage() {
-	echo "usage: $0 create|destroy <absolute-path>" >&2
+	echo "usage: $0 create [--local-origin]|destroy <absolute-path>" >&2
 	exit 64
 }
 
+local_origin=0
+if [[ $# -eq 3 && $1 == create && $2 == --local-origin ]]; then
+	local_origin=1
+	set -- "$1" "$3"
+fi
 [[ $# -eq 2 ]] || usage
 command=$1
 [[ $2 == /* ]] || die "path must be absolute: $2"
@@ -49,8 +62,15 @@ refuse_protected() {
 	while [[ ! -e $probe ]]; do probe=$(dirname -- "$probe"); done
 	[[ -d $probe ]] || die "nearest existing ancestor is not a directory: $probe"
 	if git -C "$probe" rev-parse --git-dir >/dev/null 2>&1; then
-		local remotes
+		local remotes top
 		remotes=$(git -C "$probe" remote)
+		# A linked worktree shares the main repository's remotes, so compare against that repository.
+		top=$(dirname -- "$(realpath -m -- "$(git -C "$probe" rev-parse --path-format=absolute --git-common-dir)")")
+		# The only remote allowed is this helper's own empty bare origin beside the repository.
+		if [[ $remotes == origin && $(git -C "$probe" remote get-url --all origin) == "$top.origin.git" &&
+			-f $top.origin.git/$MARKER_NAME ]]; then
+			return 0
+		fi
 		[[ -z $remotes ]] || die "refusing a path in a repository with remotes ($remotes): $path"
 	fi
 	return 0
@@ -76,7 +96,18 @@ create() {
 	[[ -z $(git -C "$target" remote) ]] || die "post-check: remote present"
 	[[ $(git -C "$target" rev-list --count HEAD) == 1 ]] || die "post-check: expected exactly one commit"
 	git -C "$target" check-ignore -q .worktrees/probe || die "post-check: /.worktrees is not ignored"
-	echo "created $target head=$(git -C "$target" rev-parse --short HEAD) branch=main remotes=none"
+	local remotes=none
+	if ((local_origin)); then
+		local origin=$target.origin.git
+		refuse_protected "$origin"
+		[[ ! -e $origin ]] || die "local origin already exists: $origin"
+		git init --quiet --bare -- "$origin"
+		date -u +%Y-%m-%dT%H:%M:%SZ >"$origin/$MARKER_NAME"
+		git -C "$target" remote add origin "$origin"
+		[[ -z $(git -C "$origin" for-each-ref) ]] || die "post-check: local origin is not empty"
+		remotes="origin=$origin(empty)"
+	fi
+	echo "created $target head=$(git -C "$target" rev-parse --short HEAD) branch=main remotes=$remotes"
 }
 
 destroy() {
@@ -108,6 +139,10 @@ destroy() {
 	git -C "$target" worktree prune
 	rm -rf -- "$target"
 	echo "destroyed $target"
+	if [[ -f $target.origin.git/$MARKER_NAME ]]; then
+		rm -rf -- "$target.origin.git"
+		echo "destroyed $target.origin.git"
+	fi
 }
 
 case $command in

@@ -2,7 +2,11 @@
 # Live speed only. Run after the trigger, never as part of the deterministic
 # command. Makes no model call. Read-only except the work status query.
 #
-#   live-evidence.sh --since <UTC ISO time> [test-home]
+#   live-evidence.sh --since <UTC ISO time> [--expect-continue] [test-home]
+#
+# Every worker with one switch prints one NUDGES line: the session-log index and time of the
+# prewalk-plan nudge, the prewalk-continue nudge, the first successful
+# todo_write result and the lane_model_switch, or none for each.
 #
 # Exit codes:
 #   0  one lane_model_switch line, no warn line, and the public attempt ended after that switch
@@ -17,17 +21,26 @@
 #      first batch: the switch is recorded after that turn finishes.
 #   7  the switch's model_change thinkingLevel is missing or differs from the level that switch
 #      applied, the level suffix on the next default configured_model_chain entry
+#   8  --expect-continue only: no prewalk-continue nudge, or it is not before the first
+#      successful todo_write, or that todo_write is not before the switch
 #  64  usage
 set -uo pipefail
 
 usage() {
-	echo "usage: $0 --since <UTC ISO time, e.g. 2026-11-11T07:58:33Z> [test-home]" >&2
+	echo "usage: $0 --since <UTC ISO time, e.g. 2026-11-11T07:58:33Z> [--expect-continue] [test-home]" >&2
 	exit 64
 }
 
 [[ $# -ge 2 && $1 == --since ]] || usage
 since=$(date -u -d "$2" +%s 2>/dev/null) || usage
-TEST_HOME=$(realpath -m -- "${3:-${VERIFY_GAJAEWAY_TEST_HOME:-/home/cheongnet/gajaeway/test-state-firstmate-20261015}}")
+shift 2
+expect_continue=0
+if [[ ${1:-} == --expect-continue ]]; then
+	expect_continue=1
+	shift
+fi
+[[ $# -le 1 ]] || usage
+TEST_HOME=$(realpath -m -- "${1:-${VERIFY_GAJAEWAY_TEST_HOME:-/home/cheongnet/gajaeway/test-state-firstmate-20261015}}")
 SESSIONS=$TEST_HOME/broker/agent/sessions
 LANES=$TEST_HOME/lanes
 SCRATCH_ROOT=/home/cheongnet/gajaeway/verify-scratch
@@ -43,6 +56,7 @@ pending=0
 late=0
 edits=0
 thinking=0
+nudges=0
 for file in "$SESSIONS"/*/*.jsonl; do
 	[[ -f $file ]] || continue
 	header=$(head -n 1 -- "$file" | jq -r --argjson since "$since" '
@@ -74,6 +88,26 @@ for file in "$SESSIONS"/*/*.jsonl; do
 		continue
 	fi
 	echo "PASS model_change $switches"
+	nudge_line=$(jq -s -r '
+		. as $entries
+		| def at(f): ([$entries | to_entries[] | select(.value | f)] | first
+			| if . == null then null else {index: .key, timestamp: .value.timestamp} end);
+		def show(x): if x == null then "none" else "\(x.index)@\(x.timestamp)" end;
+		at(.type == "custom_message" and .customType == "prewalk-plan") as $plan
+		| at(.type == "custom_message" and .customType == "prewalk-continue") as $continue
+		| at(.type == "message" and .message.role == "toolResult" and .message.toolName == "todo_write"
+			and .message.isError == false) as $todo
+		| at(.type == "model_change" and ((.reason // "") | startswith("lane_model_switch "))) as $switch
+		| "NUDGES plan=\(show($plan)) continue=\(show($continue)) todo_write=\(show($todo)) switch=\(show($switch))"
+			+ (if $continue != null and $todo != null and $switch != null
+				and $continue.index < $todo.index and $todo.index < $switch.index
+				then " order=continue<todo_write<switch" else " order=incomplete" end)
+	' -- "$file" 2>/dev/null)
+	echo "$nudge_line"
+	if ((expect_continue)) && [[ $nudge_line != *" order=continue<todo_write<switch" ]]; then
+		echo "FAIL expected a prewalk-continue nudge, then a successful todo_write, then the switch"
+		nudges=$((nudges + 1))
+	fi
 	thinking_report=$(jq -s -r '
 		. as $entries
 		| ([$entries | to_entries[]
@@ -228,6 +262,8 @@ elif ((edits > 0)); then
 	exit 6
 elif ((thinking > 0)); then
 	exit 7
+elif ((nudges > 0)); then
+	exit 8
 elif ((late > 0)); then
 	exit 4
 elif ((pending > 0)); then

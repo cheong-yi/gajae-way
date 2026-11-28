@@ -62,7 +62,7 @@ Proof is the worker session JSONL and the public work status, not the Discord re
 .gjc/skills/verify-firstmate/scripts/live-evidence.sh --since "$SINCE"
 ```
 
-Exit codes: `0` pass, `1` the attempt ended with a missing or extra switch line, `2` warn line, `3` no worker session, `4` the attempt ended and the public end is missing or before the switch, `5` the attempt is still open, `6` an edit-type result came from the wrong model or before a successful `todo_write`, `7` the switch's `model_change` has no `thinkingLevel` or one that differs from the level the switch applied, `64` usage. Exit `5` is not a result. A maintain pass waits, and does not record it as a failure.
+Exit codes: `0` pass, `1` the attempt ended with a missing or extra switch line, `2` warn line, `3` no worker session, `4` the attempt ended and the public end is missing or before the switch, `5` the attempt is still open, `6` an edit-type result came from the wrong model or before a successful `todo_write`, `7` the switch's `model_change` has no `thinkingLevel` or one that differs from the level the switch applied, `8` with `--expect-continue` only, no continue nudge before the first successful `todo_write` or no switch after it, `64` usage. Every worker with one switch prints a `NUDGES` line with the session-log index and time of the plan nudge, the continue nudge, the first successful `todo_write` and the switch. Exit `5` is not a result. A maintain pass waits, and does not record it as a failure.
 
 Save the stdout at `$SCRATCH/evidence.txt`. The JSONL stays under `$TEST_HOME/broker/agent/sessions/` after cleanup.
 
@@ -79,7 +79,8 @@ Cleanup removes the disposable repository and the worktrees it registered. It do
 All are executable and live in `.gjc/skills/verify-firstmate/scripts/`.
 
 - `doctor-test-home.sh [test-home]` reads the deployment and writes nothing.
-- `disposable-repo.sh create <absolute-path>` creates a repository with no remotes and one setup commit. `destroy` removes only a repository this helper created.
+- `disposable-repo.sh create [--local-origin] <absolute-path>` creates a repository with no remotes and one setup commit. `--local-origin` adds an empty bare `origin` at `<path>.origin.git`, for the correction drive. `destroy` removes only a repository this helper created, and its local origin.
+- `correction-evidence.sh --lane NAME --session ID --prior OP_REF --since <UTC ISO>` checks that a correction kept the session id, appended a new attempt to the same JSONL, and created no replacement session. Exit codes are in the script header.
 - `live-evidence.sh --since <UTC ISO> [test-home]` reads session logs and work status.
 - `pane-order-check.sh` runs the local pane-order and pane-parent unit tests. Exit 0 is those tests. It does not prove a live Discord `parent_id`.
 
