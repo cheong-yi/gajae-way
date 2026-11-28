@@ -10,7 +10,11 @@
 # correction was asked for.
 #
 # Exit codes:
-#   0  same session id, a new attempt after --since that ended completed with end_turn,
+# It does not check who submitted the correction, the pane report, the pane's binary,
+# the commit, or the local origin. The feature file records those separately.
+#
+#   0  same session id, a new attempt after --since that ended completed with end_turn
+#      (or with no op reason once work status no longer includes the op),
 #      a user message appended to that session's JSONL after --since, and no other
 #      session JSONL for the lane's cwd since --since
 #   1  work status names another session, or its attempt is still OP_REF or started before --since

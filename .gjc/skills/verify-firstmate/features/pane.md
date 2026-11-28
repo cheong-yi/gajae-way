@@ -1,6 +1,6 @@
 # Pane
 
-The pane is the secondmate persona that starts and then watches one running lane. `gajaeway work start --firstmate FILE` opens it and creates no lane. Its own ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. It can then inspect and report. It does not edit the worktree, and it does not decide the lane outcome.
+The pane is the secondmate persona that starts and then watches one running lane. `gajaeway work start --firstmate FILE` opens it and creates no lane. Its own ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. It can then steer an open attempt, inspect and report, and send a same-task correction that the first mate relays to it. That correction path is the feature `secondmate-correction`. It does not edit the worktree, and it does not approve or decide the lane outcome.
 
 ## Sub-features
 

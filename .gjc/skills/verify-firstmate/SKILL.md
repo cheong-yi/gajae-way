@@ -47,7 +47,7 @@ This proves the doctor and the disposable repository. It does not prove a lane.
 
 The map is `features/README.md`. Drive one feature file at a time. A pass on one file does not cover the others.
 
-`plan-and-switch` passed both runs on the 2026-11-27 GJC 0.22.0 deployment, whose patch activates `todo_write` at session start. Every other file stays uncovered until a run follows that file and its own evidence command passes. Do not report one file as verified from another file's run.
+`plan-and-switch` passed both runs on 2026-11-28 on GJC 0.22.0, whose patch activates `todo_write` at session start, and the text-only run showed the continue nudge before `todo_write`. `secondmate-correction` passed one run the same day. Every other file stays uncovered until a run follows that file and its own evidence command passes. Do not report one file as verified from another file's run.
 
 The current order: `gajaeway work start --firstmate FILE` records the assignment and opens the task's secondmate pane. It creates no lane and no session. That secondmate's ordinary `gajaeway work start NAME --cwd WORKTREE "<mandate text>"` creates the lane, with the pane as parent. A pane that does not open is a held result. Do not treat the submission as a started lane.
 The explicit local check for that order is `.gjc/skills/verify-firstmate/scripts/pane-order-check.sh`. Exit 0 means the named unit tests passed. Exit 1 means one failed. That command does not post to Discord, and it does not prove the live thread `parent_id`.

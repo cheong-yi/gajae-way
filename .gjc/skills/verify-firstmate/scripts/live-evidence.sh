@@ -21,8 +21,9 @@
 #      first batch: the switch is recorded after that turn finishes.
 #   7  the switch's model_change thinkingLevel is missing or differs from the level that switch
 #      applied, the level suffix on the next default configured_model_chain entry
-#   8  --expect-continue only: no prewalk-continue nudge, or it is not before the first
-#      successful todo_write, or that todo_write is not before the switch
+#   8  --expect-continue only: the plan nudge, the continue nudge, the first successful
+#      todo_write and the switch are not all present in that order. The text-only shape of
+#      the replies before them is read from the session order by hand.
 #  64  usage
 set -uo pipefail
 
@@ -39,7 +40,7 @@ if [[ ${1:-} == --expect-continue ]]; then
 	expect_continue=1
 	shift
 fi
-[[ $# -le 1 ]] || usage
+[[ $# -le 1 && ${1:-} != -* ]] || usage
 TEST_HOME=$(realpath -m -- "${1:-${VERIFY_GAJAEWAY_TEST_HOME:-/home/cheongnet/gajaeway/test-state-firstmate-20261015}}")
 SESSIONS=$TEST_HOME/broker/agent/sessions
 LANES=$TEST_HOME/lanes
@@ -99,13 +100,13 @@ for file in "$SESSIONS"/*/*.jsonl; do
 			and .message.isError == false) as $todo
 		| at(.type == "model_change" and ((.reason // "") | startswith("lane_model_switch "))) as $switch
 		| "NUDGES plan=\(show($plan)) continue=\(show($continue)) todo_write=\(show($todo)) switch=\(show($switch))"
-			+ (if $continue != null and $todo != null and $switch != null
-				and $continue.index < $todo.index and $todo.index < $switch.index
-				then " order=continue<todo_write<switch" else " order=incomplete" end)
+			+ (if $plan != null and $continue != null and $todo != null and $switch != null
+				and $plan.index < $continue.index and $continue.index < $todo.index and $todo.index < $switch.index
+				then " order=plan<continue<todo_write<switch" else " order=incomplete" end)
 	' -- "$file" 2>/dev/null)
 	echo "$nudge_line"
-	if ((expect_continue)) && [[ $nudge_line != *" order=continue<todo_write<switch" ]]; then
-		echo "FAIL expected a prewalk-continue nudge, then a successful todo_write, then the switch"
+	if ((expect_continue)) && [[ $nudge_line != *" order=plan<continue<todo_write<switch" ]]; then
+		echo "FAIL expected the plan nudge, then the continue nudge, then a successful todo_write, then the switch"
 		nudges=$((nudges + 1))
 	fi
 	thinking_report=$(jq -s -r '

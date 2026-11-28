@@ -52,6 +52,16 @@ inside() {
 	[[ $1 == "$2" || $1 == "$2"/* ]]
 }
 
+helper_origin() {
+	# helper_origin <repo root>: true when the repository's only fetch and push URL is the
+	# marked, bare, remote-free origin this helper created beside it.
+	local root=$1 origin=$1.origin.git
+	[[ $(git -C "$root" remote get-url --all origin) == "$origin" ]] || return 1
+	[[ $(git -C "$root" remote get-url --push --all origin) == "$origin" ]] || return 1
+	[[ -f $origin/$MARKER_NAME && $(git -C "$origin" rev-parse --is-bare-repository 2>/dev/null) == true ]] || return 1
+	[[ -z $(git -C "$origin" remote) ]] || return 1
+}
+
 refuse_protected() {
 	local path=$1
 	inside "$path" "$checkout" && die "refusing a path inside this checkout ($checkout): $path"
@@ -67,8 +77,7 @@ refuse_protected() {
 		# A linked worktree shares the main repository's remotes, so compare against that repository.
 		top=$(dirname -- "$(realpath -m -- "$(git -C "$probe" rev-parse --path-format=absolute --git-common-dir)")")
 		# The only remote allowed is this helper's own empty bare origin beside the repository.
-		if [[ $remotes == origin && $(git -C "$probe" remote get-url --all origin) == "$top.origin.git" &&
-			-f $top.origin.git/$MARKER_NAME ]]; then
+		if [[ $remotes == origin ]] && helper_origin "$top"; then
 			return 0
 		fi
 		[[ -z $remotes ]] || die "refusing a path in a repository with remotes ($remotes): $path"
@@ -140,6 +149,8 @@ destroy() {
 	rm -rf -- "$target"
 	echo "destroyed $target"
 	if [[ -f $target.origin.git/$MARKER_NAME ]]; then
+		[[ $(git -C "$target.origin.git" rev-parse --is-bare-repository 2>/dev/null) == true &&
+			-z $(git -C "$target.origin.git" remote) ]] || die "local origin is no longer a bare remote-free repository: $target.origin.git"
 		rm -rf -- "$target.origin.git"
 		echo "destroyed $target.origin.git"
 	fi
