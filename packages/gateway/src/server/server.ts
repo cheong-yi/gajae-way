@@ -2050,8 +2050,9 @@ async function handleRequest(
 						type: "response",
 						id: request.id,
 						// The assignment is already recorded; a pane that did not open is a visible hold.
+						// FirstMate relays to its secondmate through this pane key.
 						result: pane.opened
-							? result
+							? { ...result, paneOriginKey: pane.paneOriginKey }
 							: {
 									started: false as const,
 									held: true as const,
@@ -3055,6 +3056,17 @@ export function firstmateChildNotice(store: Store, origin: OriginRef): string | 
 	const started = store.work.firstmate.initial(assignment.taskId) !== undefined;
 	const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 	const startCommand = `gajaeway work start ${lane} --cwd ${quote(assignment.worktree.path)} ${quote(assignment.mandate.text)}`;
+	// The exact WorkFirstmateCorrectionParams identity that admission compares against the assignment.
+	const correctionTemplate = JSON.stringify({
+		name: lane,
+		taskId: assignment.taskId,
+		ownerId: assignment.ownerId,
+		messageId: "<wake source message id>",
+		thread: assignment.thread,
+		mandateId: assignment.mandate.id,
+		priorOpRef: "<latest completed opRef>",
+		text: "<correction>",
+	});
 	return [
 		"## FirstMate secondmate pane",
 		`You are the secondmate: the pane persona for exactly one FirstMate task, task ${assignment.taskId}, lane \`${lane}\`, worktree ${assignment.worktree.path} on branch ${assignment.worktree.branch}. The lane is the worker; you drive it and never edit that worktree yourself.`,
@@ -3064,8 +3076,10 @@ export function firstmateChildNotice(store: Store, origin: OriginRef): string | 
 					`The lane does not exist yet. Start it here with one ordinary command, exactly: ${startCommand}`,
 					"That start is the only way this pane opens the worker: the same lane name and the same worktree, with this pane as its parent. Any other name or cwd is refused.",
 				]),
-		`You may steer it (\`gajaeway work steer ${lane} "<input>"\`, one message per steer), inspect it (\`gajaeway work status ${lane}\`, \`gajaeway work inspect ${lane} --task ${assignment.taskId} --op <opRef>\`), and report here. Touch no other lane.`,
-		`Correction and approval stay with FirstMate in ${pane.personaOriginKey}: never run \`work start --firstmate\`, \`work start --firstmate-correction\`, \`work approve\` or \`work retire --firstmate\`, and never ask for approval here. When someone here changes the ask, do not steer it in: relay it to FirstMate with [WAKE:${pane.personaOriginKey}] <one-line summary of the changed ask>.`,
+		`While an attempt is open, you may steer it with \`gajaeway work steer ${lane} "<input>"\`, one message per steer. Inspect it with \`gajaeway work status ${lane}\` and \`gajaeway work inspect ${lane} --task ${assignment.taskId} --op <opRef>\`, and report here. Touch no other lane.`,
+		`You send same-task corrections into this lane. FirstMate in ${pane.personaOriginKey} relays a review finding or an owner addition to you as a wake, and that wake is your instruction to correct. When the latest attempt has settled completed and the lane is still bound, write this JSON to a file: ${correctionTemplate}. Set messageId to the wake's source message id, priorOpRef to that latest completed opRef, and text to the correction within the unchanged mandate. Then run \`gajaeway work start --firstmate-correction <file>\`. It resumes the same session in place and appends a new attempt, and that attempt's result comes back here. Report it.`,
+		`A refused or held correction is a result. Report its reason to FirstMate with [WAKE:${pane.personaOriginKey}], and never retry it under a new messageId. If the lane is gone, tell FirstMate the same way.`,
+		`Approval stays with FirstMate: never run \`work start --firstmate\`, \`work approve\` or \`work retire --firstmate\`, and never approve or ask for approval here. When someone here changes the ask, do not steer or correct it in: relay it to FirstMate with [WAKE:${pane.personaOriginKey}] <one-line summary of the changed ask>.`,
 	].join("\n");
 }
 
@@ -3103,7 +3117,9 @@ async function originRepoSlug(worktreePath: string): Promise<string | undefined>
 }
 
 /** A timed-out creation is held, never silently repeated against Discord. */
-type PaneOpen = { readonly opened: true } | { readonly opened: false; readonly reason: string };
+type PaneOpen =
+	| { readonly opened: true; readonly paneOriginKey: string }
+	| { readonly opened: false; readonly reason: string };
 
 /**
  * Opens the pane persona once. A requested open that never reported back stays requested:
@@ -3129,10 +3145,12 @@ async function openFirstmatePane(
 		}
 	}
 	// Only a confirmed pane (thread plus kickoff) is reusable; a recorded-but-unconfirmed one is a hold.
-	if (lanePaneRecorded(store, assignment.name))
-		return intentState === "opened"
-			? { opened: true }
+	if (lanePaneRecorded(store, assignment.name)) {
+		const recorded = readLanePane(store, assignment.name);
+		return intentState === "opened" && recorded
+			? { opened: true, paneOriginKey: originKey(recorded.childOrigin) }
 			: { opened: false, reason: `pane_kickoff_${intentState}_not_retried` };
+	}
 	if (intent !== undefined) return { opened: false, reason: `pane_open_${intentState}_not_retried` };
 	const adapter = [...runtime.connections].find(
 		(connection) => connection.negotiated && connection.client?.name === "adapter-discord",
@@ -3182,7 +3200,10 @@ async function openFirstmatePane(
 		const noticeTurnId = crypto.randomUUID();
 		const payload = runtime.delivery.prepare(noticeTurnId, childOrigin, notice);
 		if (!payload) {
-			store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "notice_unprepared" }));
+			store.core.metaSet(
+				intentKey,
+				JSON.stringify({ requestId, taskId: assignment.taskId, state: "notice_unprepared" }),
+			);
 			console.error(`firstmate_pane_unavailable name=${assignment.name} reason=pane_notice_unprepared`);
 			return { opened: false, reason: "pane_notice_unprepared" };
 		}
@@ -3196,14 +3217,17 @@ async function openFirstmatePane(
 			}),
 		);
 		if (!enqueued) {
-			store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "kickoff_unrecorded" }));
+			store.core.metaSet(
+				intentKey,
+				JSON.stringify({ requestId, taskId: assignment.taskId, state: "kickoff_unrecorded" }),
+			);
 			console.error(`firstmate_pane_unavailable name=${assignment.name} reason=pane_kickoff_unrecorded`);
 			return { opened: false, reason: "pane_kickoff_unrecorded" };
 		}
 		store.core.metaSet(intentKey, JSON.stringify({ requestId, taskId: assignment.taskId, state: "opened" }));
 		broadcastDelivery(runtime, payload);
 		await runtime.personaSessions.notifyInbound(originKey(childOrigin));
-		return { opened: true };
+		return { opened: true, paneOriginKey: originKey(childOrigin) };
 	} catch (error) {
 		// Pane failure never tears down or relaunches its headless lane.
 		const reason = diagnostic(error) || "pane_open_failed";
@@ -5624,9 +5648,9 @@ export function currentConversationNotice(origin: OriginRef): string {
 		// A conversation turn is the owner's line to the persona; it must not be
 		// spent waiting. Waits are backgrounded or handed to a lane that reports to its parent.
 		"## Staying responsive while you work",
-		"FirstMate panes are gateway-created child threads with durable task and owning-persona provenance, not ordinary session bindings. Only that owning persona may POST, WAKE or WATCH its recorded pane. Each pane is that task's secondmate: its own ordinary persona session, scoped to that one task and worktree. The secondmate starts the lane with one ordinary `gajaeway work start NAME --cwd WORKTREE \"<mandate text>\"`, then steers, inspects and reports on it, and relays a changed ask to you as a wake. A pane message never approves an outcome or silently resumes a dead lane: correction and approval stay with you, under their existing exact task/session/epoch requirements. Running transcript stays in the pane; the lane's parent is the secondmate, which receives one gateway-authored state-and-pointers outcome per terminal event, and preserving release waits for that specific outcome's confirmed delivery. For a follow-up on the same task, the secondmate sends `gajaeway work start --firstmate-correction` into the same lane when that lane is settled and still bound, which resumes the existing session in place. Only if the lane is gone does it start a new lane. Give unrelated work to a new secondmate.",
+		"FirstMate panes are gateway-created child threads with durable task and owning-persona provenance, not ordinary session bindings. Only that owning persona may POST, WAKE or WATCH its recorded pane. Each pane is that task's secondmate: its own ordinary persona session, scoped to that one task and worktree. The secondmate starts the lane with one ordinary `gajaeway work start NAME --cwd WORKTREE \"<mandate text>\"`, then steers an open attempt, inspects and reports on it, sends same-task corrections into it, and relays a changed ask to you as a wake. You route work to the secondmate and never reach past it into the lane. A pane message never approves an outcome or silently resumes a dead lane. Approval, `work approve`, `work start --firstmate` and `work retire --firstmate` stay with you, under their existing exact task/session/epoch requirements; the secondmate never approves. Running transcript stays in the pane; the lane's parent is the secondmate, which receives one gateway-authored state-and-pointers outcome per terminal event, and preserving release waits for that specific outcome's confirmed delivery. For a follow-up on the same task, relay the review finding or owner addition to the secondmate with [WAKE:<paneOriginKey>], the key the `work start --firstmate` result returned; do not submit the correction yourself. The secondmate sends `gajaeway work start --firstmate-correction` into the same lane when that lane is settled and still bound, which resumes the existing session in place. Only if the lane is gone does a new lane start. Give unrelated work to a new secondmate.",
 		"Explicit trusted-local outcome decisions use `gajaeway work approve --firstmate APPROVAL_JSON_FILE`: provide the exact WorkApproveParams identity, owner/message/thread/mandate, scope, decision and inspected evidence including reasons. Complete or partial evidence can be accepted with its exact limits; unavailable evidence permits acknowledgement only, never outcome approval. Native success alone is not approval. A recorded receipt neither releases the session nor grants publication or deletion authority. Scoped FirstMate release is not available through this approval command.",
-		"Trusted local FirstMate submission: `gajaeway work start --firstmate ASSIGNMENT_JSON_FILE` transports an explicit immutable owner/message/thread/mandate and registered worktree assignment; it does not infer authority or map chat automatically. It records the assignment and opens that task's secondmate pane; it creates no lane and no session. The secondmate's ordinary `gajaeway work start NAME --cwd WORKTREE \"<mandate text>\"` creates the lane, with the secondmate as its parent, and only then does the name/taskId/opRef association exist. Use `gajaeway work inspect NAME --task TASK_ID --op OP_REF [--native]` for exact evidence, not latest status. Preserve complete/partial/unavailable labels, provenance and reasons; lifecycle is separate and execution is not evaluated. Native reads are opt-in and best-effort, with no original-output guarantee above 16KiB or after release. Ordinary `work status` is a lane observation, not exact result inspection; `work steer` does not correct mapped tasks. Explicit trusted-local correction uses `gajaeway work start --firstmate-correction CORRECTION_JSON_FILE` with name, taskId, ownerId, a new messageId, the same thread, mandateId, the exact latest completed priorOpRef, and text within the unchanged mandate. It preserves the task/worktree/session and appends an independent attempt; a result or native done state is not owner approval. Exact duplicates return the original accepted correction or hold unproven acceptance without replay. Never bypass a hold with a new message, invent correction authority, or treat correction as approval, publication or closeout.",
+		"Trusted local FirstMate submission: `gajaeway work start --firstmate ASSIGNMENT_JSON_FILE` transports an explicit immutable owner/message/thread/mandate and registered worktree assignment; it does not infer authority or map chat automatically. It records the assignment and opens that task's secondmate pane; it creates no lane and no session. The secondmate's ordinary `gajaeway work start NAME --cwd WORKTREE \"<mandate text>\"` creates the lane, with the secondmate as its parent, and only then does the name/taskId/opRef association exist. Use `gajaeway work inspect NAME --task TASK_ID --op OP_REF [--native]` for exact evidence, not latest status. Preserve complete/partial/unavailable labels, provenance and reasons; lifecycle is separate and execution is not evaluated. Native reads are opt-in and best-effort, with no original-output guarantee above 16KiB or after release. Ordinary `work status` is a lane observation, not exact result inspection; `work steer` does not correct mapped tasks. The secondmate's trusted-local correction uses `gajaeway work start --firstmate-correction CORRECTION_JSON_FILE` with name, taskId, ownerId, a new messageId, the same thread, mandateId, the exact latest completed priorOpRef, and text within the unchanged mandate. It preserves the task/worktree/session and appends an independent attempt; a result or native done state is not owner approval. Exact duplicates return the original accepted correction or hold unproven acceptance without replay. Never bypass a hold with a new message, invent correction authority, or treat correction as approval, publication or closeout.",
 		'Answer in words first. Never block a conversation turn on a foreground wait: no `gh run watch`, `gh pr checks --watch`, `sleep N; <poll>` loops, or repeated `gajaeway work jobs` / `work status` polling. Run a long wait as a background job (bash with async), or delegate to a lane with `gajaeway work start <name> --cwd "$PWD" "<task>"` from the target checkout, or use `--repo <path-or-url>` to create an isolated repository worktree. Its result returns here as an internal report, not a chat post. Say what you started and end the turn. FirstMate must not use that ordinary start for an assignment. `gajaeway work start --firstmate` records the assignment and opens the pane. The secondmate starts the lane.',
 		`When a new message arrives while you are working, it interrupts you: any foreground command is moved to the background so you can answer. Always answer it in words, right away; a reaction alone is never the whole answer to a message from the owner.${isChatPlatform(origin.platform) ? " The gateway already marks the message 👀 when it lands, so do not spend your reply on another reaction." : ""}`,
 	].join("\n");

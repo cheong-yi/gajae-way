@@ -833,6 +833,8 @@ export type WorkStartResult =
 			readonly taskId: string;
 			readonly name: string;
 			readonly worktree: string;
+			/** The open pane's origin key, the target FirstMate uses to relay to its secondmate. Set by the server. */
+			readonly paneOriginKey?: string;
 	  }
 	| {
 			readonly started: false;

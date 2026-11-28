@@ -244,6 +244,7 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 			taskId: "pane-task",
 			name: "pane",
 			worktree: path,
+			paneOriginKey: originKey(child),
 		});
 		expect(db.bindings.getSessionRecord("work/task/pane")).toBeUndefined();
 		expect(opens).toBe(1);
@@ -269,7 +270,9 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		expect(kickoff?.source).toBe("lane_report");
 		expect(kickoff?.engagement_json).toBeNull();
 		expect(
-			db.outbox.rows().filter((row) => row.origin_key === originKey(child) && JSON.parse(row.payload_json).text === kickoffText),
+			db.outbox
+				.rows()
+				.filter((row) => row.origin_key === originKey(child) && JSON.parse(row.payload_json).text === kickoffText),
 		).toHaveLength(1);
 		const personaDirective = (where: OriginRef, messageId: string) =>
 			client!.request("chat.send", {
@@ -324,9 +327,27 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		expect(preamble).toContain("FirstMate secondmate pane");
 		expect(preamble).toContain("task pane-task, lane `pane`");
 		expect(preamble).toContain(`[WAKE:${originKey(assignment.thread)}]`);
-		expect(preamble).toContain("never run `work start --firstmate`");
-		expect(preamble).toContain("work start --firstmate-correction");
-		expect(preamble).toContain("work approve");
+		// Owner decision 2026-11-28: the secondmate sends the same-task correction; approval stays with FirstMate.
+		expect(preamble).toContain("never run `work start --firstmate`, `work approve` or `work retire --firstmate`");
+		expect(preamble).toContain("never approve or ask for approval here");
+		expect(preamble).not.toContain("`work start --firstmate-correction`, `work approve`");
+		expect(preamble).toContain("You send same-task corrections into this lane.");
+		expect(preamble).toContain("Then run `gajaeway work start --firstmate-correction <file>`.");
+		expect(preamble).toContain("When the latest attempt has settled completed and the lane is still bound");
+		expect(preamble).toContain("While an attempt is open, you may steer it with `gajaeway work steer pane");
+		// The correction identity admission compares against the assignment, ready to fill in.
+		expect(preamble).toContain(
+			JSON.stringify({
+				name: "pane",
+				taskId: assignment.taskId,
+				ownerId: assignment.ownerId,
+				messageId: "<wake source message id>",
+				thread: assignment.thread,
+				mandateId: assignment.mandate.id,
+				priorOpRef: "<latest completed opRef>",
+				text: "<correction>",
+			}),
+		);
 		// The pane notice hands over one ordinary start, nothing about the lane exists yet.
 		expect(preamble).toContain("The lane does not exist yet");
 		expect(preamble).toContain(`gajaeway work start pane --cwd '${path}' '${assignment.mandate.text}'`);
@@ -360,7 +381,9 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		expect(opens).toBe(1);
 		// Repeat open never posts the notice again.
 		expect(
-			db.outbox.rows().filter((row) => row.origin_key === originKey(child) && JSON.parse(row.payload_json).text === kickoffText),
+			db.outbox
+				.rows()
+				.filter((row) => row.origin_key === originKey(child) && JSON.parse(row.payload_json).text === kickoffText),
 		).toHaveLength(1);
 		expect((await send("after-restart", "Status?")).engaged).toBe(true);
 		await until(() => childSends().length === 4);
@@ -382,10 +405,46 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 			body: expect.stringContaining(`inspect: work inspect pane --task pane-task --op ${start.opRef}`),
 		});
 		await until(() => db.inbox.reportConsumed(originKey(child), attempt.reportId));
+		// The secondmate's correction: the notice's template, filled in, is admitted into the same lane.
+		const template = JSON.parse(/write this JSON to a file: (\{.*\})\. Set messageId/.exec(preamble)![1]!);
+		const bindsBeforeCorrection = port.binds.length;
+		const laneBinding = db.bindings.getSessionRecord(start.sessionKey);
+		const correction = await client.workStart({
+			firstmateCorrection: {
+				...template,
+				messageId: "finding-wake-source",
+				priorOpRef: start.opRef,
+				text: "Also handle empty input.",
+			},
+		});
+		if (!correction.started) throw new Error("held" in correction ? correction.reason : "unexpected persona open");
+		// Same session resumed in place: native bind reuses the lane's session at the same epoch, one
+		// appended attempt, and the pane is its parent.
+		expect(correction.sessionId).toBe(start.sessionId);
+		expect(correction.opRef).not.toBe(start.opRef);
+		expect(db.bindings.getSessionRecord(start.sessionKey)).toEqual(laneBinding);
+		for (const bind of port.binds.slice(bindsBeforeCorrection))
+			expect(bind).toMatchObject({ originKey: start.sessionKey, epoch: laneBinding!.epoch });
+		expect(db.work.firstmate.attemptsForTask(assignment.taskId)).toHaveLength(2);
+		expect(db.work.workAttemptGet(correction.opRef)?.parent).toEqual({
+			kind: "persona",
+			originKey: originKey(child),
+			origin: child,
+		});
+		port.complete(correction.opRef, "final local result");
+		await until(() => Boolean(db.work.workAttemptGet(correction.opRef)?.settledAt));
+		await port.runExclusive(start.sessionKey, async () => {});
+		const corrected = db.work.workAttemptGet(correction.opRef)!;
+		// The correction's result is reported to the pane.
+		expect(db.inbox.messageDisposition(originKey(child), corrected.reportId)?.message).toMatchObject({
+			source: "lane_report",
+			body: expect.stringContaining(`inspect: work inspect pane --task pane-task --op ${correction.opRef}`),
+		});
+		await until(() => db.inbox.reportConsumed(originKey(child), corrected.reportId));
 		const observed = await client.workInspect({
 			name: assignment.name,
 			taskId: assignment.taskId,
-			opRef: start.opRef,
+			opRef: correction.opRef,
 		});
 		expect(observed.evidence.completeness).toBe("complete");
 		const evidence = observed.evidence;
@@ -447,7 +506,8 @@ test("pane wire records gateway creation, kicks off the child persona once, and 
 		expect(paneClosed(db, child)).toBe(true);
 		expect((await send("after-retire")).engaged).toBe(false);
 		expect(db.bindings.getSessionRecord(originKey(child))?.sessionId).toBeFalsy();
-		expect(childTurns()).toBe(6);
+		// One more pane turn than before: the correction's report.
+		expect(childTurns()).toBe(7);
 		expect(port.steers).toHaveLength(0);
 	} finally {
 		await client?.close();
@@ -571,6 +631,7 @@ test("FirstMate journey without Discord: assign, child message, close, follow-up
 			taskId: "journey-task",
 			name: "journey",
 			worktree: path,
+			paneOriginKey: originKey(child),
 		});
 		expect(db.bindings.getSessionRecord("work/task/journey")).toBeUndefined();
 		expect(readLanePane(db, "journey")).toMatchObject({ taskId: "journey-task", childOrigin: child });

@@ -126,7 +126,7 @@ Discord·Slack·Telegram의 정적 PNG/JPEG 첨부파일을 모델의 이미지 
 
 로컬 FirstMate 명령은 권한을 가진 신뢰된 호출자가 제공한 명시적 불변 할당을 사용하며, Discord 메시지를 자동으로 해석하여 할당하지 않습니다:
 
-- `gajaeway work start --firstmate FILE`은 할당 JSON을 제출하고 전체 결과 JSON을 출력합니다. 보류 시 종료 코드는 0이 아닙니다. 할당을 기록하고 해당 작업의 secondmate pane 페르소나를 열며, 레인이나 세션은 만들지 않습니다. 그 secondmate가 실행하는 일반 `gajaeway work start NAME --cwd WORKTREE "<mandate text>"`가 pane을 부모로 레인을 만들고, 그때에야 `name`/`taskId`/`opRef`가 존재합니다. pane을 열 수 없으면 보이는 보류 결과를 반환하며, 요청된 Discord 스레드 생성은 무작정 재시도하지 않습니다. 일반 start 인수와 혼용하지 않습니다.
+- `gajaeway work start --firstmate FILE`은 할당 JSON을 제출하고 전체 결과 JSON을 출력합니다. 보류 시 종료 코드는 0이 아닙니다. 할당을 기록하고 해당 작업의 secondmate pane 페르소나를 열며, 레인이나 세션은 만들지 않습니다. 그 secondmate가 실행하는 일반 `gajaeway work start NAME --cwd WORKTREE "<mandate text>"`가 pane을 부모로 레인을 만들고, 그때에야 `name`/`taskId`/`opRef`가 존재합니다. 열린 결과에는 `paneOriginKey`가 있으며, FirstMate는 같은 작업의 지적 사항을 그 pane으로 전달하고 수정 제출은 secondmate가 합니다. pane을 열 수 없으면 보이는 보류 결과를 반환하며, 요청된 Discord 스레드 생성은 무작정 재시도하지 않습니다. 일반 start 인수와 혼용하지 않습니다.
 - `gajaeway --socket PATH work start --firstmate-correction CORRECTION_JSON_FILE`은 신뢰된 로컬 호출자의 동일 작업 수정을 제출합니다. 필드는 `name`, `taskId`, `ownerId`, `messageId`, `thread`, `mandateId`, `priorOpRef`, `text`이며, 할당 또는 일반 명령 플래그와 혼용할 수 없습니다. 수락/보류 JSON 형식은 동일합니다. 선행 결과는 `done` 또는 `attempt_ended` 상태의 가장 최근 시도 중 귀속이 확인되고 수락·정산된 정확한 `end_turn`이어야 합니다. 새 독립 시도를 추가하면서 task/worktree/thread/mandate/session/epoch와 이전의 최선 노력 증거를 유지합니다.
 - `gajaeway work inspect NAME --task TASK_ID --op OP_REF [--native]`은 정확히 지정한 결과의 전체 JSON을 출력하며, identity/lifecycle과 complete/partial/unavailable 증거, provenance, reasons, `execution: "not_evaluated"`를 구분합니다. 기본값은 보존된 증거만 읽습니다. `--native`는 해당 작업의 제한된 조회만 허용하며 실행이나 재전송을 하지 않습니다.
 
